@@ -5,19 +5,21 @@ import os
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-def get_currency_id(code):
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    r = requests.get(f"{SUPABASE_URL}/rest/v1/currencies?code=eq.{code}", headers=headers)
-    if r.status_code == 200 and r.json():
-        return r.json()[0]["id"]
-    return None
+# Currency ID'leri (manuel)
+CURRENCY_IDS = {
+    "TRY": "15b5ffc5-7a00-45c2-9f67-db19b15c41ed",
+    "USD": "d5fb9bb6-cc98-4e04-8783-db5b9b595a4b",
+    "EUR": "edfd835c-2217-492f-98ae-2e545bd06f82",
+    "GBP": "4d39b3b4-16d8-4ab8-92e5-4e5031fb7e37",
+    "JPY": "125fe17d-0381-4be4-afa8-90f12fd1353b",
+}
 
 def save_rate(from_code, to_code, rate):
-    from_id = get_currency_id(from_code)
-    to_id = get_currency_id(to_code)
+    from_id = CURRENCY_IDS.get(from_code)
+    to_id = CURRENCY_IDS.get(to_code)
     if not from_id or not to_id:
-        print(f"❌ {from_code} veya {to_code} bulunamadı")
-        return
+        print(f"❌ {from_code} veya {to_code} ID'si bulunamadı")
+        return False
     
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
     data = {
@@ -28,7 +30,7 @@ def save_rate(from_code, to_code, rate):
         "recorded_at": datetime.now().isoformat()
     }
     r = requests.post(f"{SUPABASE_URL}/rest/v1/exchange_rates", headers=headers, json=data)
-    print(f"✅ {from_code}/{to_code}: {rate} (status: {r.status_code})")
+    return r.status_code in [200, 201, 204]
 
 print("📡 Döviz kurları çekiliyor...")
 
@@ -40,8 +42,11 @@ for from_curr, to_curr in pairs:
         response = requests.get(url)
         data = response.json()
         rate = data["rates"][to_curr]
-        save_rate(from_curr, to_curr, rate)
+        if save_rate(from_curr, to_curr, rate):
+            print(f"✅ {from_curr}/{to_curr}: {rate}")
+        else:
+            print(f"❌ {from_curr}/{to_curr}: kayıt hatası")
     except Exception as e:
-        print(f"❌ {from_curr}/{to_curr} hatası: {e}")
+        print(f"❌ {from_curr}/{to_curr}: {e}")
 
 print("🎉 İşlem tamamlandı!")
