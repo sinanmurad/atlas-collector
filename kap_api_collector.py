@@ -5,8 +5,12 @@ SUPABASE_URL = "https://ogiooilwfeowymgdphuk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9naW9vaWx3ZmVvd3ltZ2RwaHVrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA2NjczNDgsImV4cCI6MjA5NjI0MzM0OH0.cSo83jEk6JdEfxnPmf7HwGbRr--tEu2WFH7H1n6Aanc"
 
 def save_disclosure(item):
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
-    
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
     data = {
         "disclosure_index": item.get("disclosureIndex"),
         "publish_date": item.get("publishDate"),
@@ -20,9 +24,13 @@ def save_disclosure(item):
         "raw_data": item,
         "collected_at": datetime.now().isoformat()
     }
-    
-    r = requests.post(f"{SUPABASE_URL}/rest/v1/disclosures", headers=headers, json=data)
-    print(f"   Supabase cevabı: {r.status_code} - {r.text[:100]}")
+
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/disclosures",
+        headers=headers,
+        json=data
+    )
+    print(f"   Supabase cevabı: {r.status_code} - {r.text[:200]}")
     return r.status_code in [200, 201, 204]
 
 url = "https://www.kap.org.tr/tr/api/disclosure/members/byCriteria"
@@ -61,7 +69,7 @@ if response.status_code != 200:
 data = response.json()
 if isinstance(data, list):
     print(f"✅ {len(data)} bildirim bulundu.")
-    for i, item in enumerate(data[:3]):  # İlk 3'ü test et
+    for i, item in enumerate(data[:3]):  # İlk 3 bildirimi test et
         print(f"   [{i+1}] {item.get('disclosureIndex')}")
         save_disclosure(item)
 else:
