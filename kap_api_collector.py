@@ -21,15 +21,9 @@ def save_disclosure(item):
         "collected_at": datetime.now().isoformat()
     }
     
-    try:
-        r = requests.post(f"{SUPABASE_URL}/rest/v1/disclosures", headers=headers, json=data)
-        if r.status_code not in [200, 201, 204]:
-            print(f"   HATA KODU: {r.status_code}")
-            print(f"   HATA MESAJI: {r.text[:200]}")
-        return r.status_code in [200, 201, 204]
-    except Exception as e:
-        print(f"   EXCEPTION: {e}")
-        return False
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/disclosures", headers=headers, json=data)
+    print(f"   Supabase cevabı: {r.status_code} - {r.text[:100]}")
+    return r.status_code in [200, 201, 204]
 
 url = "https://www.kap.org.tr/tr/api/disclosure/members/byCriteria"
 payload = {
@@ -62,21 +56,13 @@ response = requests.post(url, json=payload)
 
 if response.status_code != 200:
     print(f"❌ API Hatası: {response.status_code}")
-    print(f"   {response.text[:200]}")
     exit()
 
 data = response.json()
-
 if isinstance(data, list):
     print(f"✅ {len(data)} bildirim bulundu.")
-    kaydedilen = 0
-    for i, item in enumerate(data):
-        print(f"   [{i+1}] {item.get('disclosureIndex')} - {(item.get('kapTitle') or '')[:40]}...")
-        if save_disclosure(item):
-            kaydedilen += 1
-            print(f"       ✅")
-        else:
-            print(f"       ❌")
-    print(f"\n🎉 {kaydedilen}/{len(data)} bildirim kaydedildi!")
+    for i, item in enumerate(data[:3]):  # İlk 3'ü test et
+        print(f"   [{i+1}] {item.get('disclosureIndex')}")
+        save_disclosure(item)
 else:
-    print(f"❌ Beklenmeyen veri formatı: {str(data)[:200]}")
+    print(f"❌ Beklenmeyen veri formatı")
