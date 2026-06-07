@@ -69,7 +69,7 @@ if response.status_code != 200:
 data = response.json()
 if isinstance(data, list):
     print(f"✅ {len(data)} bildirim bulundu.")
-    for i, item in enumerate(data[:3]):  # İlk 3 bildirimi test et
+    for i, item in enumerate(data[:3]):  # İlk 3'ü test et
         print(f"   [{i+1}] {item.get('disclosureIndex')}")
         save_disclosure(item)
 else:
