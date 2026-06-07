@@ -1,8 +1,8 @@
 name: KAP Collector
 on:
   schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
+    - cron: '*/30 * * * *'   # Her 30 dakikada bir çalışır
+  workflow_dispatch:          # Manuel çalıştırma imkanı
 jobs:
   collect:
     runs-on: ubuntu-latest
