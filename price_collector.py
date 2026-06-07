@@ -1,4 +1,4 @@
-# price_collector.py - Tüm hisseler için
+# price_collector.py - sadece BIST hisseleri (.IS ekle)
 import requests
 import os
 from datetime import datetime
@@ -6,23 +6,18 @@ from datetime import datetime
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-def get_all_symbols():
-    """Supabase'den tüm hisse kodlarını al"""
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    url = f"{SUPABASE_URL}/rest/v1/assets?select=symbol&asset_type=eq.STOCK&is_active=eq.true"
-    response = requests.get(url, headers=headers)
-    return [item['symbol'] for item in response.json()]
+# BIST hisseleri için geçerli semboller (sadece BIST)
+bist_symbols = ['THYAO', 'KUVVA', 'BJKAS', 'BRYAT', 'AKBNK', 'GARAN', 'SISE', 'KCHOL']
 
 def get_price(symbol):
-    """Yahoo Finance'den hisse fiyatını çek"""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.IS"
     try:
         response = requests.get(url, timeout=10)
         data = response.json()
-        
+        if 'chart' not in data or 'result' not in data['chart'] or not data['chart']['result']:
+            return None
         result = data['chart']['result'][0]
         meta = result['meta']
-        
         return {
             'symbol': symbol,
             'price': meta['regularMarketPrice'],
@@ -38,27 +33,19 @@ def get_price(symbol):
         return None
 
 def save_price(data):
-    """Supabase'e kaydet"""
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
     url = f"{SUPABASE_URL}/rest/v1/stock_prices"
-    
     check = requests.get(f"{url}?symbol=eq.{data['symbol']}", headers=headers)
     if check.status_code == 200 and check.json():
         r = requests.patch(f"{url}?symbol=eq.{data['symbol']}", headers=headers, json=data)
     else:
         r = requests.post(url, headers=headers, json=data)
-    
     return r.status_code in [200, 201, 204]
 
-print("📡 Tüm hisse fiyatları çekiliyor...")
-
-# Tüm hisseleri al
-symbols = get_all_symbols()
-print(f"✅ {len(symbols)} hisse bulundu.")
-
+print("📡 BIST hisse fiyatları çekiliyor...")
 basari = 0
-for i, symbol in enumerate(symbols):
-    print(f"  [{i+1}/{len(symbols)}] {symbol}...", end=" ")
+for symbol in bist_symbols:
+    print(f"  {symbol}...", end=" ")
     price_data = get_price(symbol)
     if price_data and save_price(price_data):
         print(f"✅ {price_data['price']} TL")
@@ -66,4 +53,4 @@ for i, symbol in enumerate(symbols):
     else:
         print("❌")
 
-print(f"\n🎉 {basari}/{len(symbols)} hisse güncellendi!")
+print(f"\n🎉 {basari}/{len(bist_symbols)} hisse güncellendi!")
