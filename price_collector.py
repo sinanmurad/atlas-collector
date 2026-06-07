@@ -1,4 +1,4 @@
-# price_collector.py - Akıllı Yahoo Finance
+# price_collector.py - TÜM HİSSELER İÇİN
 import requests
 import os
 import time
@@ -7,17 +7,19 @@ from datetime import datetime
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-bist_symbols = ['THYAO', 'KUVVA', 'BJKAS', 'BRYAT', 'AKBNK', 'GARAN', 'SISE', 'KCHOL']
+def get_all_symbols():
+    """Supabase'den tüm hisse kodlarını al"""
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    url = f"{SUPABASE_URL}/rest/v1/assets?select=symbol&asset_type=eq.STOCK&is_active=eq.true"
+    response = requests.get(url, headers=headers)
+    return [item['symbol'] for item in response.json()]
 
 def get_price(symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.IS"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 429:
-            print(f"   Rate limit, 5 saniye bekleniyor...")
             time.sleep(5)
             response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
@@ -45,16 +47,19 @@ def save_price(data):
     r = requests.post(url, headers=headers, json=data)
     return r.status_code in [200, 201, 204]
 
-print(f"📡 {len(bist_symbols)} hisse çekiliyor (Yahoo Finance)...")
+print("📡 Tüm hisse fiyatları çekiliyor...")
+symbols = get_all_symbols()
+print(f"✅ {len(symbols)} hisse bulundu.")
+
 success = 0
-for i, symbol in enumerate(bist_symbols):
-    print(f"  [{i+1}/{len(bist_symbols)}] {symbol}...", end=" ")
+for i, symbol in enumerate(symbols):
+    print(f"  [{i+1}/{len(symbols)}] {symbol}...", end=" ")
     price_data = get_price(symbol)
     if price_data and save_price(price_data):
         print(f"✅ {price_data['price']} TL")
         success += 1
     else:
         print("❌")
-    time.sleep(2)  # 2 saniye bekle, rate limit'i aşmak için
+    time.sleep(1)  # Rate limit koruması
 
-print(f"\n🎉 {success}/{len(bist_symbols)} hisse güncellendi!")
+print(f"\n🎉 {success}/{len(symbols)} hisse güncellendi!")
