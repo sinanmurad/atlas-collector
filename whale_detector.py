@@ -56,18 +56,17 @@ def get_quote(symbol):
         return None
 
 def get_avg_volume(symbol):
-    """30 günlük ortalama hacim — Finnhub candles"""
+    """Finnhub metric endpoint — free plan'da çalışıyor"""
     try:
-        to_ts = int(datetime.now(timezone.utc).timestamp())
-        from_ts = to_ts - (30 * 24 * 3600)
         r = requests.get(
-            f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=D&from={from_ts}&to={to_ts}&token={FINNHUB_KEY}",
+            f"https://finnhub.io/api/v1/stock/metric?symbol={symbol}&metric=all&token={FINNHUB_KEY}",
             timeout=5
         )
         data = r.json()
-        volumes = data.get("v", [])
-        if volumes and len(volumes) > 5:
-            return sum(volumes) / len(volumes)
+        # 10 günlük ortalama hacim
+        avg_vol = data.get("metric", {}).get("10DayAverageTradingVolume", 0)
+        if avg_vol:
+            return avg_vol * 1_000_000  # milyon cinsinden geliyor
         return 0
     except:
         return 0
