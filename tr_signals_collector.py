@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from supabase import create_client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -9,41 +9,49 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-# BIST hisse listesi — price_collector'dan geliyor zaten
+last_signal_time = {}
+
+# BIST 30 — dev firmalar, bunlara bakma
+EXCLUDED = [
+    "THYAO", "AKBNK", "GARAN", "EREGL", "SISE", "KCHOL",
+    "TUPRS", "BIMAS", "ASELS", "FROTO", "TOASO", "PGSUS",
+    "SAHOL", "YKBNK", "HALKB", "VAKBN", "TTKOM", "TCELL",
+    "ARCLK", "PETKM", "KOZAL", "KRDMD", "MGROS", "TAVHL",
+    "EKGYO", "ENKAI", "ISCTR", "LOGO", "ODAS", "SOKM"
+]
+
 def get_bist_symbols():
     try:
         response = supabase.table("stock_prices").select("symbol").execute()
-        symbols = [r["symbol"] for r in response.data]
-        print(f"✅ {len(symbols)} BIST hissesi yüklendi")
+        symbols = [r["symbol"] for r in response.data if r["symbol"] not in EXCLUDED]
+        print(f"✅ {len(symbols)} BIST hissesi yüklendi (dev firmalar elendi)")
         return symbols
     except Exception as e:
-        print(f"⚠️ Hisse listesi hatası: {e}")
-        return ["THYAO", "AKBNK", "GARAN", "ASELS", "KCHOL", "SISE", "EREGL", "BIMAS", "TUPRS", "PGSUS"]
+        print(f"⚠️ Hata: {e}")
+        return []
 
 def get_price_data(symbol):
-    """Yahoo Finance'den fiyat + hacim çek"""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.IS"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        data = r.json()["chart"]["result"][0]["meta"]
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        result = r.json()["chart"]["result"][0]["meta"]
         return {
-            "price": data.get("regularMarketPrice", 0),
-            "prev_close": data.get("previousClose", 0),
-            "volume": data.get("regularMarketVolume", 0),
-            "avg_volume": data.get("averageDailyVolume3Month", 0),
+            "price": result.get("regularMarketPrice", 0),
+            "prev_close": result.get("previousClose", 0),
         }
     except:
         return None
 
-def get_kap_news(symbol):
-    """KAP'tan son bildirimi çek"""
+def get_kap_news_today(symbol):
+    """Bugün KAP'ta bildirim var mı?"""
     try:
+        today = date.today().isoformat()
         response = supabase.table("disclosures") \
             .select("title, publish_date") \
             .ilike("stock_codes", f"%{symbol}%") \
+            .gte("publish_date", today) \
             .order("disclosure_index", ascending=False) \
             .limit(1) \
             .execute()
@@ -53,20 +61,15 @@ def get_kap_news(symbol):
     except:
         return ""
 
-def get_ai_explanation(symbol, price, price_change, volume_ratio, kap_news):
-    """Groq AI ile Acemi/Usta/Pro açıklama"""
+def get_ai_explanation(symbol, price, price_change, kap_news):
     try:
-        context = f"""
-Hisse: {symbol} (Borsa İstanbul)
-Fiyat: {price:.2f} TL
-Fiyat değişimi: %{price_change:.1f}
-Hacim: normalin {volume_ratio:.1f} katı
-Son KAP bildirimi: {kap_news if kap_news else 'Yok'}
-"""
         prompt = f"""
 Sen bir Türk finans asistanısın. Aşağıdaki veriye göre 3 seviyede Türkçe açıkla:
 
-{context}
+Hisse: {symbol} (Borsa İstanbul)
+Fiyat: {price:.2f} TL
+Fiyat değişimi: %{price_change:.1f}
+Bugünkü KAP bildirimi: {kap_news if kap_news else 'Yok'}
 
 ===ACEMİ=== (1-2 cümle, hiç finans bilmeyene sade Türkçe)
 ===USTA=== (teknik terimlerle, orta düzey yatırımcıya)
@@ -104,52 +107,52 @@ def parse_ai_levels(ai_text):
         pass
     return acemi, usta, pro
 
-def process_symbols():
-    symbols = get_bist_symbols()
+def scan_once(symbols):
     signals_found = 0
-
     for symbol in symbols:
         try:
             data = get_price_data(symbol)
             if not data:
+                time.sleep(0.1)
                 continue
 
             price = data["price"]
             prev_close = data["prev_close"]
-            volume = data["volume"]
-            avg_volume = data["avg_volume"]
 
             if not price or not prev_close or prev_close == 0:
+                time.sleep(0.1)
                 continue
 
-            # Fiyat değişimi
             price_change = ((price - prev_close) / prev_close) * 100
 
-            # Hacim oranı
-            volume_ratio = (volume / avg_volume) if avg_volume > 0 else 0
+            # Bugün KAP bildirimi var mı?
+            kap_news = get_kap_news_today(symbol)
 
-            # Sinyal kriterleri
-            is_momentum = abs(price_change) >= 10 and volume_ratio >= 3
-            is_volume_spike = volume_ratio >= 5
+            # Sinyal kriterleri:
+            # 1. Güçlü hareket (KAP olsun olmasın)
+            # 2. Orta hareket + KAP bildirimi (anlamlı sinyal)
+            is_strong = abs(price_change) >= 7
+            is_with_kap = abs(price_change) >= 3 and kap_news != ""
 
-            if not is_momentum and not is_volume_spike:
-                time.sleep(0.2)
+            if not is_strong and not is_with_kap:
+                time.sleep(0.1)
                 continue
 
-            signal_type = "momentum" if is_momentum else "volume_spike"
+            # Spam kontrolü
+            now = time.time()
+            if symbol in last_signal_time:
+                if now - last_signal_time[symbol] < 1800:
+                    continue
 
-            print(f"🎯 SİNYAL: {symbol} | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x")
+            signal_type = "momentum" if is_strong else "kap_momentum"
+            print(f"🎯 {symbol} | %{price_change:.1f} | {'KAP var' if kap_news else 'KAP yok'} | {signal_type}")
 
-            # KAP haberi çek
-            kap_news = get_kap_news(symbol)
-
-            # AI açıklama
-            ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, kap_news)
+            ai_text = get_ai_explanation(symbol, price, price_change, kap_news)
             acemi, usta, pro = parse_ai_levels(ai_text)
 
-            description = f"{'🚀' if is_momentum else '📊'} {symbol} | {price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x"
+            description = f"{'🚀' if is_strong else '📰'} {symbol} | {price:.2f} TL | %{price_change:.1f}"
             if kap_news:
-                description += f" | 📰 {kap_news[:80]}"
+                description += f" | KAP: {kap_news[:80]}"
 
             signal = {
                 "symbol": symbol,
@@ -160,23 +163,40 @@ def process_symbols():
                 "usta_explanation": usta,
                 "pro_explanation": pro,
                 "price": price,
-                "volume_ratio": round(volume_ratio, 2),
+                "volume_ratio": 0,
                 "market": "BIST",
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
 
             supabase.table("tr_signals").insert(signal).execute()
+            last_signal_time[symbol] = now
             print(f"✅ KAYDEDİLDİ: {description}")
             signals_found += 1
-
             time.sleep(0.5)
 
         except Exception as e:
-            print(f"❌ {symbol} hatası: {e}")
+            print(f"❌ {symbol}: {e}")
             continue
 
-    print(f"✅ Tamamlandı. {signals_found} sinyal kaydedildi.")
+    return signals_found
+
+def main():
+    print("🚀 Atlas TR Gerçek Zamanlı Sinyal Motoru başlatıldı...")
+    symbols = get_bist_symbols()
+
+    while True:
+        now = datetime.now()
+        hour = now.hour
+
+        # BIST: 10:00-18:00 Türkiye = 07:00-15:00 UTC
+        if 7 <= hour < 15:
+            print(f"📡 Tarama başlıyor... {now.strftime('%H:%M:%S')} UTC")
+            found = scan_once(symbols)
+            print(f"✅ Tarama bitti. {found} sinyal. 2 dk bekleniyor...")
+            time.sleep(120)
+        else:
+            print(f"💤 Borsa kapalı. Bekleniyor... {now.strftime('%H:%M:%S')} UTC")
+            time.sleep(300)
 
 if __name__ == "__main__":
-    print("🚀 Atlas TR Sinyal Motoru başlatıldı...")
-    process_symbols()
+    main()
