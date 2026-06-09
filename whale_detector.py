@@ -21,14 +21,20 @@ FALLBACK = [
     "DAVE", "SIGA", "OCGN", "NVAX", "MVIS", "IDEX"
 ]
 
-# Son sinyal zamanı — aynı hisseden spam gelmesin
 last_signal_time = {}
 
 def get_active_symbols():
     try:
         url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_KEY}"
         r = requests.get(url, timeout=10)
-        all_symbols = [s["symbol"] for s in r.json() if "." not in s["symbol"]]
+        data = r.json()
+        if not isinstance(data, list):
+            print("⚠️ Beklenmeyen format, fallback devreye girdi")
+            return FALLBACK
+        all_symbols = [
+            s["symbol"] for s in data
+            if isinstance(s, dict) and "." not in s.get("symbol", "")
+        ]
         filtered = []
         for symbol in all_symbols[:500]:
             try:
@@ -51,24 +57,21 @@ def get_active_symbols():
         return FALLBACK
 
 def get_news(symbol):
-    """Finnhub'dan son haberleri çek"""
     try:
         url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from=2026-06-01&to=2026-06-09&token={FINNHUB_KEY}"
         r = requests.get(url, timeout=5)
         news = r.json()
-        if news:
+        if isinstance(news, list) and news:
             return news[0].get("headline", "")
         return ""
     except:
         return ""
 
 def get_insider(symbol):
-    """SEC Form 4 — insider alım/satım"""
     try:
         url = f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={symbol}&token={FINNHUB_KEY}"
         r = requests.get(url, timeout=5)
         data = r.json().get("data", [])
-        # Son 30 gün içinde alım var mı?
         for t in data[:5]:
             if t.get("transactionCode") == "P-Purchase":
                 return f"{t.get('name')} {t.get('share', 0):,} hisse aldı"
@@ -77,22 +80,18 @@ def get_insider(symbol):
         return ""
 
 def get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider):
-    """Groq AI ile neden hareketleniyor açıklaması"""
     try:
-        context = f"""
-Hisse: {symbol}
+        prompt = f"""
+Sen bir finans asistanısın. Aşağıdaki veriye göre 3 seviyede İngilizce açıkla:
+
+Hisse: {symbol} (ABD Borsası)
 Fiyat: ${price:.4f}
 Fiyat değişimi: %{price_change:.1f}
 Hacim: normalin {volume_ratio:.1f} katı
 Son haber: {news if news else 'Yok'}
 Insider alım: {insider if insider else 'Yok'}
-"""
-        prompt = f"""
-Sen bir finans asistanısın. Aşağıdaki veriye göre 3 seviyede açıkla:
 
-{context}
-
-===ACEMİ=== (1-2 cümle, hiç finans bilmeyene)
+===ACEMİ=== (1-2 cümle, hiç finans bilmeyene sade dil)
 ===USTA=== (teknik terimlerle)
 ===PRO=== (profesyonel analiz diliyle)
 
@@ -116,7 +115,6 @@ Sadece bu formatı kullan, başka bir şey yazma.
         return ""
 
 def parse_ai_levels(ai_text):
-    """AI metnini seviyelere böl"""
     acemi, usta, pro = "", "", ""
     try:
         if "===ACEMİ===" in ai_text:
@@ -146,20 +144,18 @@ class VolumeTracker:
         volumes = self.volumes.get(symbol, [])
         if len(volumes) < 5:
             return None
-
         avg = sum(volumes[:-1]) / len(volumes[:-1])
         if avg == 0:
             return None
-
         ratio = current_volume / avg
         open_price = self.open_prices.get(symbol, current_price)
         price_change = ((current_price - open_price) / open_price * 100) if open_price else 0
 
-        # Fiyat filtresi — WebSocket'te de kontrol et
+        # Fiyat filtresi
         if not (0.001 <= current_price <= 20):
             return None
 
-        # Spam kontrolü — aynı hisseden 30 dk içinde sinyal gelmesin
+        # Spam kontrolü
         now = time.time()
         if symbol in last_signal_time:
             if now - last_signal_time[symbol] < 1800:
@@ -193,7 +189,6 @@ tracker = VolumeTracker()
 active_symbols = []
 
 def process_signal(raw_signal):
-    """Sinyal geldi — haber, insider, AI çek ve kaydet"""
     symbol = raw_signal["symbol"]
     price = raw_signal["price"]
     price_change = raw_signal["price_change"]
@@ -201,11 +196,8 @@ def process_signal(raw_signal):
 
     print(f"🔍 {symbol} araştırılıyor...")
 
-    # Paralel veri çek
     news = get_news(symbol)
     insider = get_insider(symbol)
-
-    # AI açıklama
     ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider)
     acemi, usta, pro = parse_ai_levels(ai_text)
 
@@ -229,6 +221,7 @@ def process_signal(raw_signal):
     }
 
     try:
+        # ABD sinyalleri us_signals tablosuna gidiyor
         supabase.table("us_signals").insert(signal).execute()
         print(f"✅ KAYDEDİLDİ: {description}")
     except Exception as e:
