@@ -80,23 +80,23 @@ def get_kap_news(symbol):
 
 def get_ai_explanation(symbol, price, price_change, volume_ratio, kap_news, day_high, day_low):
     try:
-        prompt = f"""
-Sen bir Türk finans asistanısın. Aşağıdaki veriye göre 3 seviyede Türkçe açıkla:
+        prompt = f"""Sen bir Türk finans asistanısın. Aşağıdaki hisse için 3 seviyede açıklama yaz.
 
-Hisse: {symbol} (Borsa İstanbul)
+Hisse: {symbol}
 Fiyat: {price:.2f} TL
-Açılıştan değişim: %{price_change:.1f}
-Gün içi yüksek: {day_high:.2f} TL
-Gün içi düşük: {day_low:.2f} TL
-Hacim: normalin {volume_ratio:.1f} katı
-Son KAP bildirimi: {kap_news if kap_news else 'Yok'}
+Değişim: %{price_change:.1f}
+Hacim: {volume_ratio:.1f}x
+KAP: {kap_news if kap_news else 'Yok'}
+Yüksek: {day_high:.2f} TL
+Düşük: {day_low:.2f} TL
 
-===ACEMİ=== (1-2 cümle, hiç finans bilmeyene sade Türkçe)
-===USTA=== (teknik terimlerle, orta düzey yatırımcıya)
-===PRO=== (profesyonel analiz diliyle, tam teknik)
+===ACEMİ===
+[1-2 cümle, sade Türkçe]
+===USTA===
+[teknik analiz, orta düzey]
+===PRO===
+[profesyonel analiz]"""
 
-Sadece bu formatı kullan, başka bir şey yazma.
-"""
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -105,13 +105,23 @@ Sadece bu formatı kullan, başka bir şey yazma.
             },
             json={
                 "model": "llama3-8b-8192",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 500
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Sen bir finans asistanısın. Sadece verilen formatı kullan. ===ACEMİ===, ===USTA===, ===PRO=== başlıklarını değiştirme."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 600,
+                "temperature": 0.3
             },
-            timeout=10
+            timeout=15
         )
-        return response.json()["choices"][0]["message"]["content"]
-    except:
+        result = response.json()["choices"][0]["message"]["content"]
+        print(f"✅ AI açıklama: {result[:50]}...")
+        return result
+    except Exception as e:
+        print(f"⚠️ AI hatası: {e}")
         return ""
 
 def parse_ai_levels(ai_text):
