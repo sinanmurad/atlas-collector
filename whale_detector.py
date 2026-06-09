@@ -102,20 +102,21 @@ def get_insider(symbol):
 
 def get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider):
     try:
-        prompt = f"""You are a financial analyst. Explain this signal at 3 levels:
+        prompt = f"""You are a financial analyst. Write 3-level explanation for this signal.
 
-Stock: {symbol} (US Market)
+Stock: {symbol}
 Price: ${price:.2f}
-Change from open: {price_change:+.1f}%
+Change: {price_change:+.1f}%
 Volume: {volume_ratio:.1f}x above average
 News: {news if news else 'None'}
 Insider: {insider if insider else 'None'}
 
-===BEGINNER=== (1-2 sentences, plain language for someone who knows nothing about investing)
-===INTERMEDIATE=== (technical terms, for experienced investor)
-===PRO=== (professional analysis, full technical)
-
-Use only this format, nothing else."""
+===BEGINNER===
+[1-2 sentences, plain language]
+===INTERMEDIATE===
+[technical analysis]
+===PRO===
+[professional analysis]"""
 
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -125,12 +126,21 @@ Use only this format, nothing else."""
             },
             json={
                 "model": "llama3-8b-8192",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 600
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a financial analyst. Use only the given format. Never change ===BEGINNER===, ===INTERMEDIATE===, ===PRO=== headers."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 600,
+                "temperature": 0.3
             },
             timeout=15
         )
-        return response.json()["choices"][0]["message"]["content"]
+        result = response.json()["choices"][0]["message"]["content"]
+        print(f"✅ AI: {result[:50]}...")
+        return result
     except Exception as e:
         print(f"⚠️ AI hatası: {e}")
         return ""
