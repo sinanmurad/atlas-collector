@@ -39,7 +39,6 @@ def get_avg_volume_from_db(symbol):
        if not r.data:
            return 0
 
-       # Güne göre grupla, her günün maksimum hacmini al
        daily_max = {}
        for row in r.data:
            day = row["updated_at"][:10]
@@ -57,8 +56,21 @@ def get_avg_volume_from_db(symbol):
 
 def get_bist_symbols():
    try:
-       r = supabase.table("stock_prices").select("symbol").execute()
-       symbols = list(set([row["symbol"] for row in r.data]))
+       all_symbols = set()
+       offset = 0
+       while True:
+           r = supabase.table("stock_prices") \
+               .select("symbol") \
+               .range(offset, offset + 999) \
+               .execute()
+           if not r.data:
+               break
+           for row in r.data:
+               all_symbols.add(row["symbol"])
+           if len(r.data) < 1000:
+               break
+           offset += 1000
+       symbols = list(all_symbols)
        print(f"✅ {len(symbols)} BIST hissesi yüklendi")
        return symbols
    except Exception as e:
@@ -257,8 +269,6 @@ def main():
    for symbol in symbols:
        avg_vol = get_avg_volume_from_db(symbol)
        avg_volumes[symbol] = avg_vol
-       if avg_vol > 0:
-           print(f"  {symbol}: {avg_vol:,.0f}")
 
    loaded = sum(1 for v in avg_volumes.values() if v > 0)
    print(f"✅ {loaded}/{len(symbols)} hisse için hacim verisi yüklendi")
