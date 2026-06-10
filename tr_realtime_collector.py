@@ -174,7 +174,11 @@ Gün düşük: {day_low:.2f} TL
            },
            timeout=15
        )
-       result = r.json()["choices"][0]["message"]["content"]
+       response_json = r.json()
+       if "choices" not in response_json:
+           print(f"⚠️ Groq yanıt hatası: {response_json.get('error', {}).get('message', str(response_json))}")
+           return ""
+       result = response_json["choices"][0]["message"]["content"]
        print(f"✅ AI: {result[:60]}...")
        return result
    except Exception as e:
@@ -196,10 +200,20 @@ def parse_ai_levels(ai_text):
    return acemi, usta, pro
 
 
+# RAM'de spam kontrolü — Supabase'e ek yük bindirme
+signal_cache = {}
+
 def scan_once(symbols, avg_volumes):
    signals_found = 0
+   now = time.time()
+
    for symbol in symbols:
        try:
+           # RAM'de son sinyal zamanı kontrol et
+           if symbol in signal_cache:
+               if now - signal_cache[symbol] < 3600:
+                   continue
+
            data = get_price_data(symbol)
            if not data:
                time.sleep(0.05)
@@ -234,8 +248,10 @@ def scan_once(symbols, avg_volumes):
                time.sleep(0.05)
                continue
 
+           # Supabase'den de kontrol et — restart güvencesi
            last_time = get_last_signal_time(symbol)
-           if time.time() - last_time < 3600:
+           if now - last_time < 3600:
+               signal_cache[symbol] = last_time
                continue
 
            signal_type = "momentum" if is_momentum else "volume_spike"
@@ -263,6 +279,7 @@ def scan_once(symbols, avg_volumes):
                "created_at": datetime.now(timezone.utc).isoformat()
            }).execute()
 
+           signal_cache[symbol] = now
            print(f"✅ KAYDEDİLDİ: {description}")
            signals_found += 1
            time.sleep(0.5)
@@ -278,6 +295,14 @@ def main():
    print("🚀 Atlas TR Gerçek Zamanlı Sinyal Motoru başlatıldı...")
    symbols = get_bist_symbols()
    avg_volumes = load_all_avg_volumes()
+
+   # Başlangıçta mevcut sinyalleri cache'e yükle
+   print("🔄 Mevcut sinyaller cache'e yükleniyor...")
+   for symbol in symbols:
+       last_time = get_last_signal_time(symbol)
+       if last_time > 0:
+           signal_cache[symbol] = last_time
+   print(f"✅ {len(signal_cache)} sembol cache'e yüklendi")
 
    while True:
        now = datetime.now()
