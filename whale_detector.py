@@ -6,11 +6,14 @@ import websocket
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
+FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -18,7 +21,49 @@ signal_cache = {}
 avg_volumes = {}
 active_symbols = []
 news_cache = {}
-last_price_update = {}  # Canlı fiyat güncelleme zamanı
+last_price_update = {}
+
+# Firebase başlat — sadece bir kez
+try:
+    if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
+        cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin başlatıldı")
+except Exception as e:
+    print(f"⚠️ Firebase başlatma hatası: {e}")
+
+
+def send_push_notification(title, body, market="US"):
+    try:
+        profiles = supabase.table("profiles") \
+            .select("fcm_token") \
+            .not_.is_("fcm_token", "null") \
+            .execute()
+
+        if not profiles.data:
+            return
+
+        tokens = [p["fcm_token"] for p in profiles.data if p.get("fcm_token")]
+        if not tokens:
+            return
+
+        for token in tokens:
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title=title,
+                        body=body,
+                    ),
+                    data={"market": market},
+                    token=token,
+                )
+                messaging.send(message)
+            except Exception as e:
+                print(f"⚠️ Push hatası: {e}")
+
+        print(f"📱 Push gönderildi: {len(tokens)} kullanıcı")
+    except Exception as e:
+        print(f"❌ Push notification hatası: {e}")
 
 
 def is_market_open():
@@ -137,10 +182,7 @@ Insider: {insider if insider else 'None'}
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_KEY}",
-                "Content-Type": "application/json"
-            },
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [
@@ -198,7 +240,6 @@ def get_last_signal_time(symbol):
 
 
 def update_live_price(symbol, price):
-    """Canlı fiyatı Supabase'e yaz — 60 saniyede bir"""
     now = time.time()
     if symbol in last_price_update and now - last_price_update[symbol] < 60:
         return
@@ -295,6 +336,13 @@ def process_signal(symbol, signal_type, price, price_change, volume_ratio):
         supabase.table("us_signals").insert(signal).execute()
         signal_cache[symbol] = now
         print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
+
+        # Push notification gönder
+        send_push_notification(
+            title=f"{emoji} {symbol} Sinyali",
+            body=f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}",
+            market="US"
+        )
     except Exception as e:
         print(f"❌ Kayıt hatası: {e}")
 
@@ -313,7 +361,6 @@ def on_message(ws, message):
 
             tracker.update(symbol, price, volume)
 
-            # Canlı fiyat güncelle — 60 saniyede bir
             if symbol in avg_volumes:
                 update_live_price(symbol, price)
 
@@ -386,8 +433,6 @@ def build_watchlist():
                     if 1.0 <= price <= 20.0 and vol >= 500_000:
                         candidates.append(symbol)
                         avg_volumes[symbol] = vol
-
-                        # Supabase'e kaydet
                         try:
                             supabase.table("us_watchlist").upsert({
                                 "symbol": symbol,
@@ -397,7 +442,6 @@ def build_watchlist():
                             }).execute()
                         except:
                             pass
-
                         print(f"  ✅ {symbol}: ${price:.2f} | avg_vol={vol:,.0f}")
                 except:
                     continue
