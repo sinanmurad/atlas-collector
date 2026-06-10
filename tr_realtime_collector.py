@@ -3,6 +3,8 @@ import time
 import requests
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
