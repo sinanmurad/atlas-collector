@@ -155,9 +155,18 @@ def scan_once(symbols):
             day_low = data["day_low"]
 
             # Geçersiz veri filtresi
-            if not price or not open_price or open_price == 0:
-                time.sleep(0.05)
-                continue
+            # Geçersiz veri filtresi
+if not price or price == 0:
+    time.sleep(0.05)
+    continue
+
+if not open_price or open_price == 0:
+    open_price = prev_close if prev_close else 0
+
+if open_price == 0:
+    time.sleep(0.05)
+    continue
+
 
             if avg_volume < 10000:
                 time.sleep(0.05)
