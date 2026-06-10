@@ -11,7 +11,6 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-# Spam kontrolü — Supabase'den oku, Railway restart'ta sıfırlanmasın
 def get_last_signal_time(symbol):
     try:
         r = supabase.table("tr_signals") \
@@ -45,10 +44,8 @@ def get_price_data(symbol):
         data = r.json()["chart"]["result"][0]
         meta = data["meta"]
 
-        # Açılış fiyatını al — gün içi hareket için doğru referans
         open_price = meta.get("regularMarketOpen", 0)
         if not open_price:
-            # Fallback: ilk işlem fiyatı
             opens = data.get("indicators", {}).get("quote", [{}])[0].get("open", [])
             open_price = next((x for x in opens if x), 0)
 
@@ -155,30 +152,24 @@ def scan_once(symbols):
             day_low = data["day_low"]
 
             # Geçersiz veri filtresi
-            # Geçersiz veri filtresi
-if not price or price == 0:
-    time.sleep(0.05)
-    continue
+            if not price or price == 0:
+                time.sleep(0.05)
+                continue
 
-if not open_price or open_price == 0:
-    open_price = prev_close if prev_close else 0
+            if not open_price or open_price == 0:
+                open_price = prev_close if prev_close else 0
 
-if open_price == 0:
-    time.sleep(0.05)
-    continue
-
+            if open_price == 0:
+                time.sleep(0.05)
+                continue
 
             if avg_volume < 10000:
                 time.sleep(0.05)
                 continue
 
-            # Açılış fiyatından değişim — kapanış değil!
             price_change = ((price - open_price) / open_price) * 100
-
-            # Hacim oranı
             volume_ratio = volume / avg_volume if avg_volume > 0 else 0
 
-            # Sahte sinyal filtresi
             if volume_ratio > 500:
                 time.sleep(0.05)
                 continue
@@ -190,10 +181,9 @@ if open_price == 0:
                 time.sleep(0.05)
                 continue
 
-            # Spam kontrolü — Supabase'den oku
             last_time = get_last_signal_time(symbol)
             now = time.time()
-            if now - last_time < 3600:  # 1 saat
+            if now - last_time < 3600:
                 continue
 
             signal_type = "momentum" if is_momentum else "volume_spike"
@@ -240,7 +230,6 @@ def main():
         now = datetime.now()
         hour = now.hour
 
-        # BIST saatleri: 10:00-18:00 Türkiye (UTC+3 = 07:00-15:00 UTC)
         if 7 <= hour < 15:
             print(f"📡 Tarama başlıyor... {now.strftime('%H:%M:%S')} UTC")
             found = scan_once(symbols)
