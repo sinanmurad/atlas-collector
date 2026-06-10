@@ -1,6 +1,7 @@
 import os
 import time
 import requests
+import json
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
 import firebase_admin
@@ -9,10 +10,54 @@ from firebase_admin import credentials, messaging
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
+FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 signal_cache = {}
+
+# Firebase başlat
+try:
+    if FIREBASE_SERVICE_ACCOUNT:
+        cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin başlatıldı")
+except Exception as e:
+    print(f"⚠️ Firebase başlatma hatası: {e}")
+
+
+def send_push_notification(title, body, market="BIST"):
+    """Tüm kullanıcılara push notification gönder"""
+    try:
+        profiles = supabase.table("profiles") \
+            .select("fcm_token") \
+            .not_.is_("fcm_token", "null") \
+            .execute()
+
+        if not profiles.data:
+            return
+
+        tokens = [p["fcm_token"] for p in profiles.data if p.get("fcm_token")]
+        if not tokens:
+            return
+
+        for token in tokens:
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title=title,
+                        body=body,
+                    ),
+                    data={"market": market},
+                    token=token,
+                )
+                messaging.send(message)
+            except Exception as e:
+                print(f"⚠️ Push hatası {token[:20]}...: {e}")
+
+        print(f"📱 Push gönderildi: {len(tokens)} kullanıcı")
+    except Exception as e:
+        print(f"❌ Push notification hatası: {e}")
 
 
 def get_last_signal_time(symbol):
@@ -198,7 +243,6 @@ def parse_ai_levels(ai_text):
 # ==================== BOT ====================
 
 def bot_should_buy(symbol, price, price_change, volume_ratio, kap_news):
-    """Groq'a al mı diye sor"""
     try:
         prompt = f"""Sen bir borsa trading botusun. Aşağıdaki sinyali analiz et ve sadece AL veya ALMA de.
 
@@ -238,7 +282,6 @@ Sadece "AL" veya "ALMA" yaz, başka hiçbir şey yazma."""
 
 
 def bot_should_sell(symbol, buy_price, current_price, kap_news):
-    """Groq'a sat mı diye sor"""
     try:
         change = ((current_price - buy_price) / buy_price) * 100
         prompt = f"""Sen bir borsa trading botusun. Açık pozisyonu değerlendir ve SAT veya BEKLE de.
@@ -279,9 +322,7 @@ Sadece "SAT" veya "BEKLE" yaz, başka hiçbir şey yazma."""
 
 
 def bot_buy(user_id, symbol, price, signal_id, user_level, balance):
-    """Demo alım yap"""
     try:
-        # Acemi/Usta: ayda max 3 işlem, 1 hisse aynı anda
         if user_level != 'pro':
             month_start = datetime.now(timezone.utc).replace(
                 day=1, hour=0, minute=0, second=0).isoformat()
@@ -303,7 +344,6 @@ def bot_buy(user_id, symbol, price, signal_id, user_level, balance):
                 print(f"⚠️ {user_id} zaten açık pozisyon var")
                 return False
 
-        # Yatırım miktarı — bakiyenin %10'u, max 100
         invest = min(balance * 0.10, 100)
         if invest < 10:
             return False
@@ -321,7 +361,6 @@ def bot_buy(user_id, symbol, price, signal_id, user_level, balance):
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
 
-        # Bakiyeden düş
         supabase.table("demo_portfolios").update({
             "balance": round(balance - invest, 2)
         }).eq("user_id", user_id).execute()
@@ -334,7 +373,6 @@ def bot_buy(user_id, symbol, price, signal_id, user_level, balance):
 
 
 def bot_sell(trade, current_price):
-    """Demo satış yap"""
     try:
         buy_price = trade["buy_price"]
         quantity = trade["quantity"]
@@ -347,7 +385,6 @@ def bot_sell(trade, current_price):
             "profit_loss": round(profit_loss, 2)
         }).eq("id", trade["id"]).execute()
 
-        # Bakiyeye ekle
         portfolio = supabase.table("demo_portfolios") \
             .select("balance") \
             .eq("user_id", trade["user_id"]) \
@@ -365,7 +402,6 @@ def bot_sell(trade, current_price):
 
 
 def bot_check_open_positions():
-    """Açık pozisyonları kontrol et — sat kararı"""
     try:
         trades = supabase.table("demo_trades") \
             .select("*") \
@@ -396,7 +432,6 @@ def bot_check_open_positions():
 
 
 def bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id):
-    """Sinyal gelince tüm kullanıcıların demo portföyleri için karar ver"""
     try:
         if not bot_should_buy(symbol, price, price_change, volume_ratio, kap_news):
             return
@@ -408,7 +443,6 @@ def bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, sign
         if not portfolios.data:
             return
 
-        # Her kullanıcının seviyesini al
         for portfolio in portfolios.data:
             user_id = portfolio["user_id"]
             balance = portfolio["balance"]
@@ -549,10 +583,17 @@ def scan_once(symbols, avg_volumes):
             signal_cache[symbol] = now
             signals_found += 1
 
-            # Bot işle
             if result.data:
                 signal_id = result.data[0].get("id")
                 bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id)
+
+            # Push notification gönder
+            emoji = "🚀" if is_momentum else "📊"
+            send_push_notification(
+                title=f"{emoji} {symbol} Sinyali",
+                body=f"{price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x",
+                market="BIST"
+            )
 
             print(f"✅ KAYDEDİLDİ: {description}")
             time.sleep(0.5)
@@ -587,11 +628,9 @@ def main():
             found = scan_once(symbols, avg_volumes)
             scan_count += 1
 
-            # Her 6 taramada bir açık pozisyonları kontrol et (~12 dk)
             if scan_count % 6 == 0:
                 bot_check_open_positions()
 
-            # Her 12 taramada bir sinyal sonuçlarını kontrol et (~24 dk)
             if scan_count % 12 == 0:
                 check_signal_results()
 
