@@ -28,30 +28,44 @@ def get_last_signal_time(symbol):
        return 0
 
 
-def get_avg_volume_from_db(symbol):
+def load_all_avg_volumes():
    try:
-       r = supabase.table("stock_prices") \
-           .select("volume, updated_at") \
-           .eq("symbol", symbol) \
-           .order("updated_at", ascending=False) \
-           .limit(100) \
-           .execute()
-       if not r.data:
-           return 0
+       print("📊 Tüm hacim verileri yükleniyor...")
+       all_data = []
+       offset = 0
+       while True:
+           r = supabase.table("stock_prices") \
+               .select("symbol, volume, updated_at") \
+               .range(offset, offset + 999) \
+               .execute()
+           if not r.data:
+               break
+           all_data.extend(r.data)
+           if len(r.data) < 1000:
+               break
+           offset += 1000
 
-       daily_max = {}
-       for row in r.data:
+       symbol_daily = {}
+       for row in all_data:
+           sym = row["symbol"]
            day = row["updated_at"][:10]
            vol = row.get("volume", 0) or 0
-           if day not in daily_max or vol > daily_max[day]:
-               daily_max[day] = vol
+           if sym not in symbol_daily:
+               symbol_daily[sym] = {}
+           if day not in symbol_daily[sym] or vol > symbol_daily[sym][day]:
+               symbol_daily[sym][day] = vol
 
-       volumes = list(daily_max.values())
-       if volumes:
-           return sum(volumes) / len(volumes)
-       return 0
-   except:
-       return 0
+       avg_volumes = {}
+       for sym, days in symbol_daily.items():
+           volumes = list(days.values())
+           avg_volumes[sym] = sum(volumes) / len(volumes) if volumes else 0
+
+       loaded = sum(1 for v in avg_volumes.values() if v > 0)
+       print(f"✅ {loaded}/{len(avg_volumes)} hisse için hacim verisi yüklendi")
+       return avg_volumes
+   except Exception as e:
+       print(f"⚠️ Hacim yükleme hatası: {e}")
+       return {}
 
 
 def get_bist_symbols():
@@ -263,15 +277,7 @@ def scan_once(symbols, avg_volumes):
 def main():
    print("🚀 Atlas TR Gerçek Zamanlı Sinyal Motoru başlatıldı...")
    symbols = get_bist_symbols()
-
-   print("📊 Ortalama hacimler Supabase'den yükleniyor...")
-   avg_volumes = {}
-   for symbol in symbols:
-       avg_vol = get_avg_volume_from_db(symbol)
-       avg_volumes[symbol] = avg_vol
-
-   loaded = sum(1 for v in avg_volumes.values() if v > 0)
-   print(f"✅ {loaded}/{len(symbols)} hisse için hacim verisi yüklendi")
+   avg_volumes = load_all_avg_volumes()
 
    while True:
        now = datetime.now()
