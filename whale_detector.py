@@ -13,63 +13,85 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Kaliteli hisseler — S&P500 ve NASDAQ100'den seçilmiş, $10+ fiyat
+# Small cap + squeeze potansiyeli — $0.05-$50 bandı
 QUALITY_SYMBOLS = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD",
-    "NFLX", "ORCL", "CRM", "ADBE", "PYPL", "INTC", "QCOM", "AVGO",
-    "TXN", "MU", "AMAT", "LRCX", "KLAC", "MRVL", "SMCI", "ARM",
-    "PLTR", "SNOW", "DDOG", "ZS", "CRWD", "PANW", "NET", "MDB",
-    "COIN", "HOOD", "RBLX", "UBER", "LYFT", "ABNB", "DASH", "SHOP",
-    "SQ", "AFRM", "SOFI", "UPST", "LC", "OPEN", "OPFI", "DAVE",
-    "RIVN", "LCID", "NIO", "XPEV", "LI", "JOBY", "ACHR", "ASTS",
-    "IONQ", "RGTI", "QUBT", "ARQQ", "SOUN", "BBAI", "RCAT", "LUNR"
+    # Meme / squeeze candidates
+    "GME", "AMC", "BB", "BBAI", "SOUN", "RCAT",
+    # Kripto volatil
+    "COIN", "HOOD", "MSTR", "RIOT", "MARA", "HUT", "CLSK",
+    # EV / space / speculative
+    "RIVN", "LCID", "NIO", "XPEV", "LI", "JOBY", "ACHR",
+    "ASTS", "LUNR", "RKLB",
+    # Quantum / AI speculative
+    "IONQ", "RGTI", "QUBT", "ARQQ",
+    # Fintech small cap
+    "AFRM", "SOFI", "UPST", "LC", "OPEN", "OPFI", "DAVE",
+    # Growth orta cap
+    "PLTR", "SNOW", "DDOG", "NET", "MDB",
+    "CVNA", "UBER", "LYFT", "ABNB", "DASH",
+    # Volatil tech
+    "NVDA", "TSLA", "AMD", "SMCI", "ARM",
 ]
 
-last_signal_time = {}
+signal_cache = {}  # RAM'de spam kontrolü
+
 
 def is_market_open():
-    """ABD borsası açık mı? 09:30-16:00 ET = 13:30-20:00 UTC"""
     now = datetime.now(timezone.utc)
-    # Hafta sonu kontrolü
     if now.weekday() >= 5:
         return False
-    market_open = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=20, minute=0, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    open_t = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    return open_t <= now <= close_t
 
-def get_quote(symbol):
-    """Finnhub'dan günlük veri al — open, close, high, low, volume"""
-    try:
-        r = requests.get(
-            f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}",
-            timeout=5
-        )
-        q = r.json()
-        return {
-            "open": q.get("o", 0),
-            "high": q.get("h", 0),
-            "low": q.get("l", 0),
-            "prev_close": q.get("pc", 0),
-            "current": q.get("c", 0),
-        }
-    except:
-        return None
 
 def get_avg_volume(symbol):
-    """Finnhub metric endpoint — free plan'da çalışıyor"""
     try:
         r = requests.get(
             f"https://finnhub.io/api/v1/stock/metric?symbol={symbol}&metric=all&token={FINNHUB_KEY}",
             timeout=5
         )
-        data = r.json()
-        # 10 günlük ortalama hacim
-        avg_vol = data.get("metric", {}).get("10DayAverageTradingVolume", 0)
-        if avg_vol:
-            return avg_vol * 1_000_000  # milyon cinsinden geliyor
-        return 0
+        avg_vol = r.json().get("metric", {}).get("10DayAverageTradingVolume", 0)
+        return (avg_vol or 0) * 1_000_000
     except:
         return 0
+
+
+def get_short_interest(symbol):
+    """Short squeeze potansiyeli"""
+    try:
+        r = requests.get(
+            f"https://finnhub.io/api/v1/stock/metric?symbol={symbol}&metric=all&token={FINNHUB_KEY}",
+            timeout=5
+        )
+        metric = r.json().get("metric", {})
+        short_ratio = metric.get("shortRatio", 0) or 0
+        short_pct = metric.get("shortPercentOutstanding", 0) or 0
+        return {
+            "short_ratio": short_ratio,
+            "short_pct": short_pct,
+            "squeeze": short_ratio > 3 and short_pct > 0.10
+        }
+    except:
+        return {"short_ratio": 0, "short_pct": 0, "squeeze": False}
+
+
+def get_insider(symbol):
+    try:
+        r = requests.get(
+            f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={symbol}&token={FINNHUB_KEY}",
+            timeout=5
+        )
+        data = r.json().get("data", [])
+        purchases = [t for t in data[:10] if t.get("transactionCode") == "P-Purchase"]
+        if len(purchases) >= 2:
+            return f"{len(purchases)} insider alımı — {purchases[0].get('name', '')}"
+        if purchases:
+            return f"{purchases[0].get('name')} bought {purchases[0].get('share', 0):,} shares"
+        return ""
+    except:
+        return ""
+
 
 def get_news(symbol):
     try:
@@ -86,21 +108,31 @@ def get_news(symbol):
     except:
         return ""
 
-def get_insider(symbol):
-    try:
-        r = requests.get(
-            f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={symbol}&token={FINNHUB_KEY}",
-            timeout=5
-        )
-        data = r.json().get("data", [])
-        for t in data[:5]:
-            if t.get("transactionCode") == "P-Purchase":
-                return f"{t.get('name')} bought {t.get('share', 0):,} shares"
-        return ""
-    except:
-        return ""
 
-def get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider):
+def get_conviction(price_change, volume_ratio, short_info, insider):
+    """Conviction skoru — HIGH / MEDIUM / NORMAL"""
+    score = 0
+    if abs(price_change) >= 5:
+        score += 2
+    elif abs(price_change) >= 3:
+        score += 1
+    if volume_ratio >= 5:
+        score += 2
+    elif volume_ratio >= 3:
+        score += 1
+    if short_info["squeeze"]:
+        score += 2
+    if insider and "insider" in insider.lower():
+        score += 1
+
+    if score >= 5:
+        return "HIGH"
+    elif score >= 3:
+        return "MEDIUM"
+    return "NORMAL"
+
+
+def get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider, conviction):
     try:
         prompt = f"""You are a financial analyst. Write 3-level explanation for this signal.
 
@@ -108,24 +140,25 @@ Stock: {symbol}
 Price: ${price:.2f}
 Change: {price_change:+.1f}%
 Volume: {volume_ratio:.1f}x above average
+Conviction: {conviction}
 News: {news if news else 'None'}
 Insider: {insider if insider else 'None'}
 
 ===BEGINNER===
-[1-2 sentences, plain language]
+[1-2 sentences, plain language, mention conviction level]
 ===INTERMEDIATE===
-[technical analysis]
+[technical analysis with conviction context]
 ===PRO===
-[professional analysis]"""
+[professional analysis, short squeeze/insider if applicable]"""
 
-        response = requests.post(
+        r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {GROQ_KEY}",
                 "Content-Type": "application/json"
             },
             json={
-                "model": "llama3-8b-8192",
+                "model": "llama-3.1-8b-instant",
                 "messages": [
                     {
                         "role": "system",
@@ -133,17 +166,22 @@ Insider: {insider if insider else 'None'}
                     },
                     {"role": "user", "content": prompt}
                 ],
-                "max_tokens": 600,
+                "max_tokens": 500,
                 "temperature": 0.3
             },
             timeout=15
         )
-        result = response.json()["choices"][0]["message"]["content"]
+        resp = r.json()
+        if "choices" not in resp:
+            print(f"⚠️ Groq: {resp.get('error', {}).get('message', str(resp))}")
+            return ""
+        result = resp["choices"][0]["message"]["content"]
         print(f"✅ AI: {result[:50]}...")
         return result
     except Exception as e:
         print(f"⚠️ AI hatası: {e}")
         return ""
+
 
 def parse_ai_levels(ai_text):
     acemi, usta, pro = "", "", ""
@@ -158,8 +196,8 @@ def parse_ai_levels(ai_text):
         pass
     return acemi, usta, pro
 
+
 def get_last_signal_time(symbol):
-    """Spam kontrolü — Supabase'den oku"""
     try:
         r = supabase.table("us_signals") \
             .select("created_at") \
@@ -168,40 +206,33 @@ def get_last_signal_time(symbol):
             .limit(1) \
             .execute()
         if r.data:
-            last = r.data[0]["created_at"]
-            dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
             return dt.timestamp()
         return 0
     except:
         return 0
 
+
 class VolumeTracker:
     def __init__(self):
-        self.trades = {}  # symbol -> [(price, volume, timestamp)]
-        self.daily_opens = {}  # symbol -> open_price
+        self.trades = {}
+        self.daily_opens = {}
 
     def update(self, symbol, price, volume):
         now = time.time()
         if symbol not in self.trades:
             self.trades[symbol] = []
             self.daily_opens[symbol] = price
-
         self.trades[symbol].append((price, volume, now))
-
-        # Son 5 dakikayı tut
         cutoff = now - 300
         self.trades[symbol] = [(p, v, t) for p, v, t in self.trades[symbol] if t > cutoff]
 
-    def get_volume_ratio(self, symbol, current_volume, avg_volume):
+    def get_volume_ratio(self, symbol, avg_volume):
         if avg_volume <= 0:
             return 0
-        # Son 5 dakika toplam hacim
         recent_volume = sum(v for _, v, _ in self.trades.get(symbol, []))
-        # Günlük ortalamayı 5 dakikaya böl (6.5 saat = 78 adet 5 dakika)
         expected_5min = avg_volume / 78
-        if expected_5min <= 0:
-            return 0
-        return recent_volume / expected_5min
+        return recent_volume / expected_5min if expected_5min > 0 else 0
 
     def get_price_change(self, symbol, current_price):
         open_price = self.daily_opens.get(symbol, current_price)
@@ -209,34 +240,49 @@ class VolumeTracker:
             return 0
         return ((current_price - open_price) / open_price) * 100
 
+
 tracker = VolumeTracker()
 active_symbols = []
 avg_volumes = {}
+short_data = {}  # Her hisse için short interest cache
+
 
 def process_signal(symbol, signal_type, price, price_change, volume_ratio):
-    # Borsa kapalıysa işleme
     if not is_market_open():
         return
 
-    # Fiyat filtresi — min $5
-    if price < 5:
+    if price < 0.05:
         return
 
-    # Spam kontrolü
+    # RAM cache kontrolü
+    now = time.time()
+    if symbol in signal_cache and now - signal_cache[symbol] < 3600:
+        return
+
+    # Supabase kontrolü — restart güvencesi
     last_time = get_last_signal_time(symbol)
-    if time.time() - last_time < 3600:  # 1 saat
+    if now - last_time < 3600:
+        signal_cache[symbol] = last_time
         return
 
     print(f"🔍 {symbol} araştırılıyor...")
 
+    short_info = short_data.get(symbol, {"short_ratio": 0, "short_pct": 0, "squeeze": False})
     news = get_news(symbol)
     insider = get_insider(symbol)
-    ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider)
+    conviction = get_conviction(price_change, volume_ratio, short_info, insider)
+
+    print(f"📊 {symbol} | Conviction: {conviction} | Short squeeze: {short_info['squeeze']}")
+
+    ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider, conviction)
     acemi, usta, pro = parse_ai_levels(ai_text)
 
-    description = f"🚀 {symbol} | ${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x"
+    emoji = "🔥" if conviction == "HIGH" else "⚡" if conviction == "MEDIUM" else "🚀"
+    description = f"{emoji} {symbol} | ${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}"
+    if short_info["squeeze"]:
+        description += f" | 🩳 Short: {short_info['short_ratio']:.1f}x"
     if news:
-        description += f" | 📰 {news[:100]}"
+        description += f" | 📰 {news[:80]}"
     if insider:
         description += f" | 🐋 {insider}"
 
@@ -255,9 +301,11 @@ def process_signal(symbol, signal_type, price, price_change, volume_ratio):
 
     try:
         supabase.table("us_signals").insert(signal).execute()
-        print(f"✅ KAYDEDİLDİ: {description}")
+        signal_cache[symbol] = now
+        print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
     except Exception as e:
         print(f"❌ Kayıt hatası: {e}")
+
 
 def on_message(ws, message):
     try:
@@ -270,7 +318,7 @@ def on_message(ws, message):
             price = float(trade.get("p", 0))
             volume = float(trade.get("v", 0))
 
-            if not symbol or not price or price < 5:
+            if not symbol or not price or price < 0.05:
                 continue
 
             tracker.update(symbol, price, volume)
@@ -279,49 +327,67 @@ def on_message(ws, message):
             if avg_vol == 0:
                 continue
 
-            volume_ratio = tracker.get_volume_ratio(symbol, volume, avg_vol)
+            volume_ratio = tracker.get_volume_ratio(symbol, avg_vol)
             price_change = tracker.get_price_change(symbol, price)
 
-            # Momentum: hacim 5x + fiyat %5
-            if volume_ratio >= 5 and abs(price_change) >= 5:
+            # Threshold düşürüldü — daha erken yakalar
+            if volume_ratio >= 2 and abs(price_change) >= 3:
                 process_signal(symbol, "momentum", price, price_change, volume_ratio)
-
-            # Volume spike: hacim 10x
-            elif volume_ratio >= 10:
+            elif volume_ratio >= 3:
                 process_signal(symbol, "volume_spike", price, price_change, volume_ratio)
 
     except Exception as e:
         print(f"Mesaj hatası: {e}")
+
 
 def on_open(ws):
     print(f"✅ Bağlandı. {len(active_symbols)} hisse izleniyor...")
     for symbol in active_symbols:
         ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
 
+
 def on_error(ws, error):
     print(f"❌ WebSocket hatası: {error}")
+
 
 def on_close(ws, close_status_code, close_msg):
     print("🔌 Bağlantı kapandı, 5 saniye sonra yeniden bağlanıyor...")
     time.sleep(5)
     start()
 
+
 def start():
-    global active_symbols, avg_volumes
+    global active_symbols, avg_volumes, short_data
 
     print("🔍 Hisse listesi ve ortalama hacimler yükleniyor...")
     active_symbols = QUALITY_SYMBOLS
 
-    # Her hisse için ortalama hacim çek
     for symbol in active_symbols:
         avg_vol = get_avg_volume(symbol)
         avg_volumes[symbol] = avg_vol
-        print(f"  {symbol}: avg_vol={avg_vol:,.0f}")
+        if avg_vol > 0:
+            print(f"  {symbol}: avg_vol={avg_vol:,.0f}")
         time.sleep(0.2)
 
     print(f"✅ {len(active_symbols)} hisse hazır")
-    print(f"📡 WebSocket bağlanıyor...")
 
+    # Short interest — başlangıçta bir kez yükle
+    print("📊 Short interest verileri yükleniyor...")
+    for symbol in active_symbols:
+        short_data[symbol] = get_short_interest(symbol)
+        if short_data[symbol]["squeeze"]:
+            print(f"  🩳 {symbol}: SQUEEZE POTANSIYELI — {short_data[symbol]['short_ratio']:.1f}x")
+        time.sleep(0.2)
+
+    # Başlangıçta mevcut sinyalleri cache'e yükle
+    print("🔄 Mevcut sinyaller cache'e yükleniyor...")
+    for symbol in active_symbols:
+        last_time = get_last_signal_time(symbol)
+        if last_time > 0:
+            signal_cache[symbol] = last_time
+    print(f"✅ {len(signal_cache)} sembol cache'e yüklendi")
+
+    print("📡 WebSocket bağlanıyor...")
     ws = websocket.WebSocketApp(
         f"wss://ws.finnhub.io?token={FINNHUB_KEY}",
         on_open=on_open,
@@ -330,6 +396,7 @@ def start():
         on_close=on_close
     )
     ws.run_forever()
+
 
 if __name__ == "__main__":
     print("🚀 Atlas US Sinyal Motoru başlatıldı...")
