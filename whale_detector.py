@@ -3,6 +3,7 @@ import json
 import time
 import requests
 import websocket
+import yfinance as yf
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
 
@@ -16,7 +17,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 signal_cache = {}
 avg_volumes = {}
 active_symbols = []
-news_cache = {}  # Haber cache — aynı haberi tekrar çekme
+news_cache = {}
 
 
 def is_market_open():
@@ -52,23 +53,10 @@ def get_nyse_symbols():
         return []
 
 
-def get_avg_volume(symbol):
-    try:
-        r = requests.get(
-            f"https://finnhub.io/api/v1/stock/metric?symbol={symbol}&metric=all&token={FINNHUB_KEY}",
-            timeout=5
-        )
-        avg_vol = r.json().get("metric", {}).get("10DayAverageTradingVolume", 0)
-        return (avg_vol or 0) * 1_000_000
-    except:
-        return 0
-
-
 def get_news(symbol):
-    """Bugünkü haber var mı — katalizör kontrolü"""
     if symbol in news_cache:
         cached_time, cached_news = news_cache[symbol]
-        if time.time() - cached_time < 1800:  # 30 dk cache
+        if time.time() - cached_time < 1800:
             return cached_news
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -103,37 +91,23 @@ def get_insider(symbol):
 
 
 def get_conviction(price_change, volume_ratio, has_news, insider):
-    """
-    Haber + hacim + fiyat üçlüsü = HIGH
-    İkisi = MEDIUM
-    Biri = NORMAL
-    """
     score = 0
-
-    # Fiyat hareketi
     if abs(price_change) >= 10:
         score += 3
     elif abs(price_change) >= 5:
         score += 2
     elif abs(price_change) >= 3:
         score += 1
-
-    # Hacim
     if volume_ratio >= 10:
         score += 3
     elif volume_ratio >= 5:
         score += 2
     elif volume_ratio >= 2:
         score += 1
-
-    # Haber katalizörü — en önemli
     if has_news:
         score += 3
-
-    # Insider alım
     if insider:
         score += 2
-
     if score >= 7:
         return "HIGH"
     elif score >= 4:
@@ -256,31 +230,26 @@ tracker = VolumeTracker()
 def process_signal(symbol, signal_type, price, price_change, volume_ratio):
     if not is_market_open():
         return
-
     if price < 1.0 or price > 20.0:
         return
-
     now = time.time()
     if symbol in signal_cache and now - signal_cache[symbol] < 3600:
         return
-
     last_time = get_last_signal_time(symbol)
     if now - last_time < 3600:
         signal_cache[symbol] = last_time
         return
 
     print(f"🔍 {symbol} araştırılıyor...")
-
     news = get_news(symbol)
     insider = get_insider(symbol)
     has_news = bool(news)
     conviction = get_conviction(price_change, volume_ratio, has_news, insider)
 
-    # LOW conviction sinyalleri kaydetme
     if conviction == "NORMAL" and not has_news:
         return
 
-    print(f"📊 {symbol} | {conviction} | Haber: {bool(news)} | Insider: {bool(insider)}")
+    print(f"📊 {symbol} | {conviction} | Haber: {has_news} | Insider: {bool(insider)}")
 
     ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider, conviction)
     acemi, usta, pro = parse_ai_levels(ai_text)
@@ -318,29 +287,22 @@ def on_message(ws, message):
         data = json.loads(message)
         if data.get("type") != "trade":
             return
-
         for trade in data.get("data", []):
             symbol = trade.get("s")
             price = float(trade.get("p", 0))
             volume = float(trade.get("v", 0))
-
             if not symbol or not price or price < 1.0 or price > 20.0:
                 continue
-
             tracker.update(symbol, price, volume)
-
             avg_vol = avg_volumes.get(symbol, 0)
             if avg_vol == 0:
                 continue
-
             volume_ratio = tracker.get_volume_ratio(symbol, avg_vol)
             price_change = tracker.get_price_change(symbol, price)
-
             if volume_ratio >= 2 and abs(price_change) >= 3:
                 process_signal(symbol, "momentum", price, price_change, volume_ratio)
             elif volume_ratio >= 5:
                 process_signal(symbol, "volume_spike", price, price_change, volume_ratio)
-
     except Exception as e:
         print(f"Mesaj hatası: {e}")
 
@@ -362,7 +324,7 @@ def on_close(ws, close_status_code, close_msg):
 
 
 def build_watchlist():
-    """NASDAQ + NYSE — $1-$20, hacim 500K+"""
+    """NASDAQ + NYSE — yfinance ile hızlı filtre"""
     print("📋 NASDAQ listesi yükleniyor...")
     nasdaq = get_nasdaq_symbols()
     print(f"  NASDAQ: {len(nasdaq)} sembol")
@@ -372,28 +334,45 @@ def build_watchlist():
     print(f"  NYSE: {len(nyse)} sembol")
 
     all_symbols = list(set(nasdaq + nyse))
-    print(f"  Toplam: {len(all_symbols)} sembol — Finnhub ile filtre başlıyor...")
+    print(f"  Toplam: {len(all_symbols)} sembol — yfinance ile filtre başlıyor...")
 
     candidates = []
-    for i, symbol in enumerate(all_symbols):
+    batch_size = 200
+    total_batches = (len(all_symbols) + batch_size - 1) // batch_size
+
+    for i in range(0, len(all_symbols), batch_size):
+        batch = all_symbols[i:i + batch_size]
+        batch_num = i // batch_size + 1
         try:
-            avg_vol = get_avg_volume(symbol)
-            if avg_vol >= 500_000:
-                # Fiyat kontrolü — quote ile
-                r = requests.get(
-                    f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}",
-                    timeout=5
-                )
-                price = r.json().get("c", 0)
-                if 1.0 <= price <= 20.0:
-                    candidates.append(symbol)
-                    avg_volumes[symbol] = avg_vol
-                    print(f"  ✅ {symbol}: ${price:.2f} | avg_vol={avg_vol:,.0f}")
-            if i % 50 == 0:
-                print(f"  ... {i}/{len(all_symbols)} tarandı, {len(candidates)} aday")
-            time.sleep(0.15)
-        except:
+            data = yf.download(
+                ' '.join(batch),
+                period='5d',
+                interval='1d',
+                progress=False,
+                threads=True
+            )
+            if data.empty:
+                continue
+
+            closes = data['Close'].iloc[-1]
+            volumes = data['Volume'].mean()
+
+            for symbol in batch:
+                try:
+                    price = float(closes[symbol])
+                    vol = float(volumes[symbol])
+                    if 1.0 <= price <= 20.0 and vol >= 500_000:
+                        candidates.append(symbol)
+                        avg_volumes[symbol] = vol
+                        print(f"  ✅ {symbol}: ${price:.2f} | avg_vol={vol:,.0f}")
+                except:
+                    continue
+        except Exception as e:
+            print(f"  Batch {batch_num} hatası: {e}")
             continue
+
+        print(f"  Batch {batch_num}/{total_batches} tamamlandı | {len(candidates)} aday")
+        time.sleep(1)
 
     print(f"\n✅ {len(candidates)} hisse belirlendi")
     return candidates
@@ -413,7 +392,6 @@ def start():
         start()
         return
 
-    # Mevcut sinyalleri cache'e yükle
     print("🔄 Cache yükleniyor...")
     for symbol in active_symbols:
         last_time = get_last_signal_time(symbol)
