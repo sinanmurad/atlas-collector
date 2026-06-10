@@ -31,15 +31,25 @@ def get_last_signal_time(symbol):
 def get_avg_volume_from_db(symbol):
    try:
        r = supabase.table("stock_prices") \
-           .select("volume") \
+           .select("volume, updated_at") \
            .eq("symbol", symbol) \
            .order("updated_at", ascending=False) \
-           .limit(30) \
+           .limit(100) \
            .execute()
-       if r.data:
-           volumes = [row["volume"] for row in r.data if row.get("volume")]
-           if volumes:
-               return sum(volumes) / len(volumes)
+       if not r.data:
+           return 0
+
+       # Güne göre grupla, her günün maksimum hacmini al
+       daily_max = {}
+       for row in r.data:
+           day = row["updated_at"][:10]
+           vol = row.get("volume", 0) or 0
+           if day not in daily_max or vol > daily_max[day]:
+               daily_max[day] = vol
+
+       volumes = list(daily_max.values())
+       if volumes:
+           return sum(volumes) / len(volumes)
        return 0
    except:
        return 0
@@ -249,7 +259,7 @@ def main():
        avg_volumes[symbol] = avg_vol
        if avg_vol > 0:
            print(f"  {symbol}: {avg_vol:,.0f}")
-   
+
    loaded = sum(1 for v in avg_volumes.values() if v > 0)
    print(f"✅ {loaded}/{len(symbols)} hisse için hacim verisi yüklendi")
 
