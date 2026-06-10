@@ -2,3 +2,4 @@ requests
 supabase
 websocket-client
 yfinance
+firebase-admin
