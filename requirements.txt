@@ -2,5 +2,3 @@ requests
 supabase
 websocket-client
 yfinance
-# Python versiyonu
-python_version >=3.11,<3.13
