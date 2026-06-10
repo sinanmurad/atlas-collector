@@ -18,6 +18,7 @@ signal_cache = {}
 avg_volumes = {}
 active_symbols = []
 news_cache = {}
+last_price_update = {}  # Canlı fiyat güncelleme zamanı
 
 
 def is_market_open():
@@ -196,6 +197,22 @@ def get_last_signal_time(symbol):
         return 0
 
 
+def update_live_price(symbol, price):
+    """Canlı fiyatı Supabase'e yaz — 60 saniyede bir"""
+    now = time.time()
+    if symbol in last_price_update and now - last_price_update[symbol] < 60:
+        return
+    try:
+        supabase.table("us_watchlist").upsert({
+            "symbol": symbol,
+            "last_price": round(price, 2),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        last_price_update[symbol] = now
+    except:
+        pass
+
+
 class VolumeTracker:
     def __init__(self):
         self.trades = {}
@@ -293,7 +310,13 @@ def on_message(ws, message):
             volume = float(trade.get("v", 0))
             if not symbol or not price or price < 1.0 or price > 20.0:
                 continue
+
             tracker.update(symbol, price, volume)
+
+            # Canlı fiyat güncelle — 60 saniyede bir
+            if symbol in avg_volumes:
+                update_live_price(symbol, price)
+
             avg_vol = avg_volumes.get(symbol, 0)
             if avg_vol == 0:
                 continue
@@ -324,7 +347,6 @@ def on_close(ws, close_status_code, close_msg):
 
 
 def build_watchlist():
-    """NASDAQ + NYSE — yfinance ile hızlı filtre"""
     print("📋 NASDAQ listesi yükleniyor...")
     nasdaq = get_nasdaq_symbols()
     print(f"  NASDAQ: {len(nasdaq)} sembol")
@@ -364,6 +386,18 @@ def build_watchlist():
                     if 1.0 <= price <= 20.0 and vol >= 500_000:
                         candidates.append(symbol)
                         avg_volumes[symbol] = vol
+
+                        # Supabase'e kaydet
+                        try:
+                            supabase.table("us_watchlist").upsert({
+                                "symbol": symbol,
+                                "avg_volume": int(vol),
+                                "last_price": round(price, 2),
+                                "updated_at": datetime.now(timezone.utc).isoformat()
+                            }).execute()
+                        except:
+                            pass
+
                         print(f"  ✅ {symbol}: ${price:.2f} | avg_vol={vol:,.0f}")
                 except:
                     continue
