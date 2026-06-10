@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from supabase import create_client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -152,10 +152,7 @@ KAP: {kap_news if kap_news else 'Yok'} | Yüksek: {day_high:.2f} | Düşük: {da
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_KEY}",
-                "Content-Type": "application/json"
-            },
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [
@@ -196,8 +193,244 @@ def parse_ai_levels(ai_text):
     return acemi, usta, pro
 
 
+# ==================== BOT ====================
+
+def bot_should_buy(symbol, price, price_change, volume_ratio, kap_news):
+    """Groq'a al mı diye sor"""
+    try:
+        prompt = f"""Sen bir borsa trading botusun. Aşağıdaki sinyali analiz et ve sadece AL veya ALMA de.
+
+Hisse: {symbol}
+Fiyat: {price:.2f} TL
+Değişim: %{price_change:.1f}
+Hacim: {volume_ratio:.1f}x normalden fazla
+KAP: {kap_news if kap_news else 'Yok'}
+
+Karar kriterleri:
+- Yükseliş trendi + yüksek hacim = AL
+- KAP haberi var + pozitif hareket = AL
+- Sadece küçük hareket + düşük hacim = ALMA
+- Düşüş trendi = ALMA
+
+Sadece "AL" veya "ALMA" yaz, başka hiçbir şey yazma."""
+
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 10,
+                "temperature": 0.1
+            },
+            timeout=10
+        )
+        resp = r.json()
+        if "choices" not in resp:
+            return False
+        decision = resp["choices"][0]["message"]["content"].strip().upper()
+        print(f"🤖 Bot kararı {symbol}: {decision}")
+        return "AL" in decision and "ALMA" not in decision
+    except:
+        return False
+
+
+def bot_should_sell(symbol, buy_price, current_price, kap_news):
+    """Groq'a sat mı diye sor"""
+    try:
+        change = ((current_price - buy_price) / buy_price) * 100
+        prompt = f"""Sen bir borsa trading botusun. Açık pozisyonu değerlendir ve SAT veya BEKLE de.
+
+Hisse: {symbol}
+Alış fiyatı: {buy_price:.2f} TL
+Anlık fiyat: {current_price:.2f} TL
+Kar/Zarar: %{change:.1f}
+KAP: {kap_news if kap_news else 'Yok'}
+
+Karar kriterleri:
+- %10+ kar = SAT
+- %-5 zarar = SAT (stop loss)
+- Olumsuz KAP haberi = SAT
+- Henüz hedefe ulaşmadı = BEKLE
+
+Sadece "SAT" veya "BEKLE" yaz, başka hiçbir şey yazma."""
+
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 10,
+                "temperature": 0.1
+            },
+            timeout=10
+        )
+        resp = r.json()
+        if "choices" not in resp:
+            return False
+        decision = resp["choices"][0]["message"]["content"].strip().upper()
+        print(f"🤖 Bot sat kararı {symbol}: {decision} (%{change:.1f})")
+        return "SAT" in decision
+    except:
+        return False
+
+
+def bot_buy(user_id, symbol, price, signal_id, user_level, balance):
+    """Demo alım yap"""
+    try:
+        # Acemi/Usta: ayda max 3 işlem, 1 hisse aynı anda
+        if user_level != 'pro':
+            month_start = datetime.now(timezone.utc).replace(
+                day=1, hour=0, minute=0, second=0).isoformat()
+            month_trades = supabase.table("demo_trades") \
+                .select("id") \
+                .eq("user_id", user_id) \
+                .gte("created_at", month_start) \
+                .execute()
+            if len(month_trades.data) >= 3:
+                print(f"⚠️ {user_id} aylık limit doldu")
+                return False
+
+            open_trades = supabase.table("demo_trades") \
+                .select("id") \
+                .eq("user_id", user_id) \
+                .eq("status", "open") \
+                .execute()
+            if len(open_trades.data) >= 1:
+                print(f"⚠️ {user_id} zaten açık pozisyon var")
+                return False
+
+        # Yatırım miktarı — bakiyenin %10'u, max 100
+        invest = min(balance * 0.10, 100)
+        if invest < 10:
+            return False
+        quantity = invest / price
+
+        supabase.table("demo_trades").insert({
+            "user_id": user_id,
+            "symbol": symbol,
+            "market": "BIST",
+            "signal_id": signal_id,
+            "buy_price": price,
+            "buy_date": datetime.now(timezone.utc).isoformat(),
+            "quantity": round(quantity, 4),
+            "status": "open",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+
+        # Bakiyeden düş
+        supabase.table("demo_portfolios").update({
+            "balance": round(balance - invest, 2)
+        }).eq("user_id", user_id).execute()
+
+        print(f"✅ BOT ALIM: {user_id} → {symbol} {quantity:.4f} lot @ {price:.2f} TL")
+        return True
+    except Exception as e:
+        print(f"❌ Bot alım hatası: {e}")
+        return False
+
+
+def bot_sell(trade, current_price):
+    """Demo satış yap"""
+    try:
+        buy_price = trade["buy_price"]
+        quantity = trade["quantity"]
+        profit_loss = (current_price - buy_price) * quantity
+
+        supabase.table("demo_trades").update({
+            "sell_price": current_price,
+            "sell_date": datetime.now(timezone.utc).isoformat(),
+            "status": "closed",
+            "profit_loss": round(profit_loss, 2)
+        }).eq("id", trade["id"]).execute()
+
+        # Bakiyeye ekle
+        portfolio = supabase.table("demo_portfolios") \
+            .select("balance") \
+            .eq("user_id", trade["user_id"]) \
+            .maybeSingle() \
+            .execute()
+        if portfolio.data:
+            new_balance = portfolio.data["balance"] + (quantity * current_price)
+            supabase.table("demo_portfolios").update({
+                "balance": round(new_balance, 2)
+            }).eq("user_id", trade["user_id"]).execute()
+
+        print(f"✅ BOT SATIŞ: {trade['user_id']} → {trade['symbol']} | K/Z: {profit_loss:.2f} TL")
+    except Exception as e:
+        print(f"❌ Bot satış hatası: {e}")
+
+
+def bot_check_open_positions():
+    """Açık pozisyonları kontrol et — sat kararı"""
+    try:
+        trades = supabase.table("demo_trades") \
+            .select("*") \
+            .eq("status", "open") \
+            .eq("market", "BIST") \
+            .execute()
+
+        if not trades.data:
+            return
+
+        print(f"🔍 {len(trades.data)} açık pozisyon kontrol ediliyor...")
+
+        for trade in trades.data:
+            symbol = trade["symbol"]
+            data = get_price_data(symbol)
+            if not data or not data["price"]:
+                continue
+
+            current_price = data["price"]
+            kap_news = get_kap_news(symbol)
+
+            if bot_should_sell(symbol, trade["buy_price"], current_price, kap_news):
+                bot_sell(trade, current_price)
+
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"❌ Pozisyon kontrol hatası: {e}")
+
+
+def bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id):
+    """Sinyal gelince tüm kullanıcıların demo portföyleri için karar ver"""
+    try:
+        if not bot_should_buy(symbol, price, price_change, volume_ratio, kap_news):
+            return
+
+        portfolios = supabase.table("demo_portfolios") \
+            .select("user_id, balance") \
+            .execute()
+
+        if not portfolios.data:
+            return
+
+        # Her kullanıcının seviyesini al
+        for portfolio in portfolios.data:
+            user_id = portfolio["user_id"]
+            balance = portfolio["balance"]
+
+            if balance < 10:
+                continue
+
+            profile = supabase.table("profiles") \
+                .select("level") \
+                .eq("id", user_id) \
+                .maybeSingle() \
+                .execute()
+            user_level = profile.data.get("level", "acemi") if profile.data else "acemi"
+
+            bot_buy(user_id, symbol, price, signal_id, user_level, balance)
+            time.sleep(0.2)
+
+    except Exception as e:
+        print(f"❌ Bot sinyal işleme hatası: {e}")
+
+
+# ==================== SİNYAL SONUÇLARI ====================
+
 def save_signal_result(symbol, signal_id, buy_price):
-    """24 saat sonra fiyatı kontrol et ve kaydet"""
     try:
         data = get_price_data(symbol)
         if not data or not data["price"]:
@@ -209,15 +442,13 @@ def save_signal_result(symbol, signal_id, buy_price):
             "result_change": round(change_pct, 2),
             "result_checked_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", signal_id).execute()
-        print(f"📈 Sonuç kaydedildi: {symbol} %{change_pct:.1f}")
+        print(f"📈 Sonuç: {symbol} %{change_pct:.1f}")
     except:
         pass
 
 
 def check_signal_results():
-    """24 saat önce verilen sinyallerin sonucunu kontrol et"""
     try:
-        from datetime import timedelta
         yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         day_before = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
 
@@ -236,6 +467,8 @@ def check_signal_results():
     except:
         pass
 
+
+# ==================== ANA TARAMA ====================
 
 def scan_once(symbols, avg_volumes):
     signals_found = 0
@@ -312,8 +545,14 @@ def scan_once(symbols, avg_volumes):
             }).execute()
 
             signal_cache[symbol] = now
-            print(f"✅ KAYDEDİLDİ: {description}")
             signals_found += 1
+
+            # Bot işle
+            if result.data:
+                signal_id = result.data[0].get("id")
+                bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id)
+
+            print(f"✅ KAYDEDİLDİ: {description}")
             time.sleep(0.5)
 
         except Exception as e:
@@ -346,7 +585,11 @@ def main():
             found = scan_once(symbols, avg_volumes)
             scan_count += 1
 
-            # Her 12 taramada bir (~24 dk) sinyal sonuçlarını kontrol et
+            # Her 6 taramada bir açık pozisyonları kontrol et (~12 dk)
+            if scan_count % 6 == 0:
+                bot_check_open_positions()
+
+            # Her 12 taramada bir sinyal sonuçlarını kontrol et (~24 dk)
             if scan_count % 12 == 0:
                 check_signal_results()
 
