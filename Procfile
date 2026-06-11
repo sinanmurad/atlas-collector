@@ -1,2 +1,1 @@
-worker: python whale_detector.py & python tr_realtime_collector.py & wait
-
+worker: python tr_realtime_collector.py & python whale_detector.py & python crypto_collector.py & wait
