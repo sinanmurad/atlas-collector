@@ -23,7 +23,6 @@ active_symbols = []
 news_cache = {}
 last_price_update = {}
 
-# Firebase başlat — sadece bir kez
 try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
@@ -39,28 +38,21 @@ def send_push_notification(title, body, market="US"):
             .select("fcm_token") \
             .not_.is_("fcm_token", "null") \
             .execute()
-
         if not profiles.data:
             return
-
         tokens = [p["fcm_token"] for p in profiles.data if p.get("fcm_token")]
         if not tokens:
             return
-
         for token in tokens:
             try:
                 message = messaging.Message(
-                    notification=messaging.Notification(
-                        title=title,
-                        body=body,
-                    ),
+                    notification=messaging.Notification(title=title, body=body),
                     data={"market": market},
                     token=token,
                 )
                 messaging.send(message)
             except Exception as e:
                 print(f"⚠️ Push hatası: {e}")
-
         print(f"📱 Push gönderildi: {len(tokens)} kullanıcı")
     except Exception as e:
         print(f"❌ Push notification hatası: {e}")
@@ -186,10 +178,7 @@ Insider: {insider if insider else 'None'}
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a financial analyst. Use only the given format. Never change ===BEGINNER===, ===INTERMEDIATE===, ===PRO=== headers."
-                    },
+                    {"role": "system", "content": "You are a financial analyst. Use only the given format. Never change ===BEGINNER===, ===INTERMEDIATE===, ===PRO=== headers."},
                     {"role": "user", "content": prompt}
                 ],
                 "max_tokens": 500,
@@ -250,8 +239,8 @@ def update_live_price(symbol, price):
             "updated_at": datetime.now(timezone.utc).isoformat()
         }).execute()
         last_price_update[symbol] = now
-    except:
-        pass
+    except Exception as e:
+        print(f"⚠️ Live price hatası {symbol}: {e}")
 
 
 class VolumeTracker:
@@ -336,8 +325,6 @@ def process_signal(symbol, signal_type, price, price_change, volume_ratio):
         supabase.table("us_signals").insert(signal).execute()
         signal_cache[symbol] = now
         print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
-
-        # Push notification gönder
         send_push_notification(
             title=f"{emoji} {symbol} Sinyali",
             body=f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}",
@@ -358,12 +345,9 @@ def on_message(ws, message):
             volume = float(trade.get("v", 0))
             if not symbol or not price or price < 1.0 or price > 20.0:
                 continue
-
             tracker.update(symbol, price, volume)
-
             if symbol in avg_volumes:
                 update_live_price(symbol, price)
-
             avg_vol = avg_volumes.get(symbol, 0)
             if avg_vol == 0:
                 continue
@@ -440,8 +424,8 @@ def build_watchlist():
                                 "last_price": round(price, 2),
                                 "updated_at": datetime.now(timezone.utc).isoformat()
                             }).execute()
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"  ⚠️ Supabase upsert hatası {symbol}: {e}")
                         print(f"  ✅ {symbol}: ${price:.2f} | avg_vol={vol:,.0f}")
                 except:
                     continue
