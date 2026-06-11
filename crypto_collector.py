@@ -294,7 +294,149 @@ def get_last_signal_time(symbol):
     except:
         return 0
 
+# ============================================================
+# KRİPTO BOT
+# ============================================================
 
+def crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
+    if ch1h < 0:
+        return False
+    if conviction == "CRITICAL":
+        return True
+    if conviction == "HIGH" and layer == "BIRIKIM":
+        return True
+    if conviction == "HIGH" and ch1h >= 5 and vol_chg >= 200:
+        return True
+    if conviction == "MEDIUM" and layer == "BIRIKIM" and vol_chg >= 500:
+        return True
+    return False
+
+
+def crypto_bot_should_sell(buy_price, current_price, conviction):
+    change = ((current_price - buy_price) / buy_price) * 100
+    take_profit = 20 if conviction == "CRITICAL" else 15
+    stop_loss = -8
+    if change >= take_profit:
+        print(f"  💰 Kripto %{change:.1f} kar — SAT")
+        return True
+    if change <= stop_loss:
+        print(f"  🛑 Kripto %{change:.1f} zarar — STOP LOSS")
+        return True
+    return False
+
+
+def crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction):
+    try:
+        if not is_pro:
+            month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0).isoformat()
+            month_trades = supabase.table("demo_trades").select("id") \
+                .eq("user_id", user_id).eq("market", "CRYPTO") \
+                .gte("created_at", month_start).execute()
+            if len(month_trades.data) >= 5:
+                print(f"⚠️ {user_id} kripto aylık limit (5)")
+                return False
+            open_trades = supabase.table("demo_trades").select("id") \
+                .eq("user_id", user_id).eq("market", "CRYPTO").eq("status", "open").execute()
+            if len(open_trades.data) >= 2:
+                print(f"⚠️ {user_id} max 2 açık kripto pozisyon")
+                return False
+
+        # CRITICAL = %20, HIGH = %15, MEDIUM = %10
+        pct = 0.20 if conviction == "CRITICAL" else 0.15 if conviction == "HIGH" else 0.10
+        invest = min(balance * pct, 200)
+        if invest < 10:
+            return False
+
+        quantity = invest / price
+        supabase.table("demo_trades").insert({
+            "user_id": user_id, "symbol": symbol, "market": "CRYPTO",
+            "signal_id": signal_id, "buy_price": price,
+            "buy_date": datetime.now(timezone.utc).isoformat(),
+            "quantity": round(quantity, 6), "status": "open",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+
+        supabase.table("demo_portfolios").update({
+            "crypto_balance": round(balance - invest, 2)
+        }).eq("user_id", user_id).execute()
+
+        print(f"✅ KRİPTO BOT ALIM: {user_id} → {symbol} @ ${price:.6f} (${invest:.0f})")
+        return True
+    except Exception as e:
+        print(f"❌ Kripto bot alım hatası: {e}")
+        return False
+
+
+def crypto_bot_sell(trade, current_price):
+    try:
+        profit_loss = (current_price - trade["buy_price"]) * trade["quantity"]
+        supabase.table("demo_trades").update({
+            "sell_price": current_price,
+            "sell_date": datetime.now(timezone.utc).isoformat(),
+            "status": "closed",
+            "profit_loss": round(profit_loss, 2)
+        }).eq("id", trade["id"]).execute()
+
+        portfolio = supabase.table("demo_portfolios").select("crypto_balance") \
+            .eq("user_id", trade["user_id"]).limit(1).execute()
+        if portfolio.data:
+            new_bal = portfolio.data[0]["crypto_balance"] + (trade["quantity"] * current_price)
+            supabase.table("demo_portfolios").update({
+                "crypto_balance": round(new_bal, 2)
+            }).eq("user_id", trade["user_id"]).execute()
+
+        print(f"✅ KRİPTO BOT SATIŞ: {trade['symbol']} | K/Z: ${profit_loss:.2f}")
+    except Exception as e:
+        print(f"❌ Kripto bot satış hatası: {e}")
+
+
+def crypto_bot_check_positions():
+    try:
+        trades = supabase.table("demo_trades").select("*") \
+            .eq("status", "open").eq("market", "CRYPTO").execute()
+        if not trades.data:
+            return
+        print(f"🔍 {len(trades.data)} açık kripto pozisyon kontrol ediliyor...")
+        for trade in trades.data:
+            try:
+                sym = trade["symbol"] + "USDT" if not trade["symbol"].endswith("USDT") else trade["symbol"]
+                klines = get_binance_klines(sym, "15m", 2)
+                if not klines:
+                    continue
+                current_price = float(klines[-1][4])
+                conviction = "HIGH"  # Default
+                if crypto_bot_should_sell(trade["buy_price"], current_price, conviction):
+                    crypto_bot_sell(trade, current_price)
+            except:
+                continue
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"❌ Kripto pozisyon kontrol hatası: {e}")
+
+
+def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id):
+    try:
+        if not crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
+            print(f"🤖 Kripto Bot {symbol}: ALMA")
+            return
+
+        print(f"🤖 Kripto Bot {symbol}: AL")
+        portfolios = supabase.table("demo_portfolios").select("user_id, crypto_balance").execute()
+        if not portfolios.data:
+            return
+
+        for p in portfolios.data:
+            user_id = p["user_id"]
+            balance = p.get("crypto_balance", 0) or 0
+            if balance < 10:
+                continue
+            profile = supabase.table("profiles").select("is_pro") \
+                .eq("id", user_id).limit(1).execute()
+            is_pro = profile.data[0].get("is_pro", False) if profile.data else False
+            crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction)
+            time.sleep(0.2)
+    except Exception as e:
+        print(f"❌ Kripto bot işleme hatası: {e}")
 # ============================================================
 # KARTAL GÖZÜ — PUANLAMA
 # ============================================================
@@ -603,9 +745,13 @@ def parse_ai_levels(ai_text):
 # ANA TARAMA
 # ============================================================
 
-def scan_once():
+def scan_once(scan_count=0):
     print(f"\n🦅 KRİPTO KARTAL GÖZÜ — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     print("=" * 55)
+
+    # Her 3 taramada bir açık pozisyonları kontrol et
+    if scan_count % 3 == 0:
+        crypto_bot_check_positions()
 
     fear_greed = get_fear_greed()
     if fear_greed:
@@ -627,7 +773,6 @@ def scan_once():
     for coin in cmc_coins:
         symbol = coin.get("symbol", "")
         try:
-            # Cache kontrolü
             if symbol in signal_cache and now - signal_cache[symbol] < 7200:
                 continue
             last_time = get_last_signal_time(symbol)
@@ -635,7 +780,6 @@ def scan_once():
                 signal_cache[symbol] = last_time
                 continue
 
-            # Ön filtre — teknik analiz pahalı, önce CMC filtrele
             quote = coin.get("quote", {}).get("USD", {})
             price = float(quote.get("price", 0) or 0)
             price_change_1h = float(quote.get("percent_change_1h", 0) or 0)
@@ -651,9 +795,8 @@ def scan_once():
             if volume_change_24h < 30 and price_change_1h < 2:
                 continue
 
-            # Teknik analiz — Binance klines
             tech = get_technical_data(symbol)
-            time.sleep(0.3)  # Rate limit
+            time.sleep(0.3)
 
             result = analyze_coin(coin, tech, fear_greed)
             if not result:
@@ -662,10 +805,9 @@ def scan_once():
             scored.append(result)
             print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} | {result['signal_layer']} | RSI:{result.get('rsi','?')} | OBV:{result.get('obv_trend','?')}")
 
-        except Exception as e:
+        except:
             continue
 
-    # Sırala — BİRİKİM önce, sonra score
     scored.sort(key=lambda x: (0 if x["signal_layer"] == "BIRIKIM" else 1, -x["score"]))
     top5 = scored[:5]
 
@@ -724,6 +866,13 @@ def scan_once():
             signals_found += 1
             signal_id = result.data[0].get("id") if result.data else None
 
+            # Bot işle
+            crypto_bot_process(
+                symbol, price, conviction,
+                s["price_change_1h"], s["volume_change_24h"],
+                signal_layer, signal_id
+            )
+
             push_body = f"{price_str} | RSI:{s.get('rsi','?')} | {layer_emoji}{signal_layer}"
             send_push_notification(
                 title=f"{emoji} {symbol} — {conviction}",
@@ -763,12 +912,12 @@ def main():
     scan_count = 0
     while True:
         try:
-            found = scan_once()
+            found = scan_once(scan_count)
             scan_count += 1
             print(f"\n✅ Tarama #{scan_count} bitti. {found} sinyal. 15 dk bekleniyor...")
-            time.sleep(900)  # 15 dk — Binance klines çok istek atmamak için
+            time.sleep(900)
         except Exception as e:
-            print(f"❌ Ana döngü hatası: {e}")
+            print(f"❌ Döngü hatası: {e}")
             time.sleep(120)
 
 
