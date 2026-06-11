@@ -475,7 +475,6 @@ def scan_once():
     for coin in all_coins:
         symbol = coin.get("symbol", "")
         try:
-            # Cache kontrolü — 2 saat aynı coinden sinyal gelmesin
             cache_key = symbol
             if cache_key in signal_cache and now - signal_cache[cache_key] < 7200:
                 continue
@@ -489,18 +488,14 @@ def scan_once():
                 continue
 
             scored.append(result)
-            layer = result["signal_layer"]
-            print(f"  🎯 {symbol} ({result['name']}) | {result['conviction']} | Score: {result['score']} | {layer}")
-            for r in result["reasons"]:
-                print(f"     → {r}")
+            print(f"  🎯 {symbol} | {result['conviction']} | Score: {result['score']} | {result['signal_layer']}")
 
         except Exception as e:
             print(f"❌ {symbol}: {e}")
             continue
 
-    # Sırala — BİRİKİM sinyalleri önce, sonra score
     scored.sort(key=lambda x: (
-        0 if x["signal_layer"] == "BIRIKIM" else 1,  # Birikim önce
+        0 if x["signal_layer"] == "BIRIKIM" else 1,
         -x["score"]
     ))
 
@@ -581,7 +576,6 @@ def scan_once():
             continue
 
     return signals_found
-
 
 # ============================================================
 # ANA DÖNGÜ
