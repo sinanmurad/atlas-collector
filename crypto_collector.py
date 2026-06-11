@@ -84,7 +84,6 @@ def get_cmc_coins():
     try:
         all_coins = {}
 
-        # Strateji 1: Hacim sıralaması
         r1 = requests.get(
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
             headers=CMC_HEADERS,
@@ -93,7 +92,6 @@ def get_cmc_coins():
                 "convert": "USD",
                 "sort": "volume_24h",
                 "sort_dir": "desc",
-                "aux": "percent_change_1h,percent_change_4h,percent_change_24h,percent_change_7d,volume_change_24h,market_cap",
             },
             timeout=30
         )
@@ -106,7 +104,6 @@ def get_cmc_coins():
 
         time.sleep(2)
 
-        # Strateji 2: 1s kazananlar
         r2 = requests.get(
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
             headers=CMC_HEADERS,
@@ -115,7 +112,6 @@ def get_cmc_coins():
                 "convert": "USD",
                 "sort": "percent_change_1h",
                 "sort_dir": "desc",
-                "aux": "percent_change_1h,percent_change_4h,percent_change_24h,percent_change_7d,volume_change_24h,market_cap",
             },
             timeout=30
         )
