@@ -60,10 +60,21 @@ def send_push_notification(title, body, signal_id=None):
 
 def get_all_usdt_pairs():
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/24hr",
+            headers={"Accept": "application/json"},
+            timeout=30
+        )
+        if r.status_code == 429:
+            print("⚠️ Binance rate limit — 60sn bekleniyor...")
+            time.sleep(60)
+            return []
+        if r.status_code != 200:
+            print(f"❌ Binance HTTP {r.status_code}: {r.text[:100]}")
+            return []
         tickers = r.json()
         if not isinstance(tickers, list):
-            print(f"❌ Binance beklenmedik yanıt: {type(tickers)}")
+            print(f"❌ Binance beklenmedik yanıt: {r.text[:200]}")
             return []
 
         candidates = []
