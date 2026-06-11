@@ -22,6 +22,7 @@ avg_volumes = {}
 active_symbols = []
 news_cache = {}
 last_price_update = {}
+company_cache = {}  # Şirket bilgisi cache
 
 try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
@@ -74,7 +75,13 @@ def get_nasdaq_symbols():
             timeout=10
         )
         lines = r.text.strip().split('\n')
-        return [l.split(',')[0] for l in lines[1:] if l.split(',')[0].isalpha() and 2 <= len(l.split(',')[0]) <= 5]
+        symbols = []
+        for l in lines[1:]:
+            parts = l.split(',')
+            sym = parts[0]
+            if sym.isalpha() and 2 <= len(sym) <= 5:
+                symbols.append(sym)
+        return symbols
     except:
         return []
 
@@ -86,9 +93,38 @@ def get_nyse_symbols():
             timeout=10
         )
         lines = r.text.strip().split('\n')
-        return [l.split(',')[0] for l in lines[1:] if l.split(',')[0].isalpha() and 2 <= len(l.split(',')[0]) <= 5]
+        symbols = []
+        for l in lines[1:]:
+            parts = l.split(',')
+            sym = parts[0]
+            if sym.isalpha() and 2 <= len(sym) <= 5:
+                symbols.append(sym)
+        return symbols
     except:
         return []
+
+
+def get_company_profile(symbol):
+    """Finnhub'dan şirket profili — isim, sektör, market cap"""
+    if symbol in company_cache:
+        return company_cache[symbol]
+    try:
+        r = requests.get(
+            f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}&token={FINNHUB_KEY}",
+            timeout=5
+        )
+        data = r.json()
+        profile = {
+            "name": data.get("name", ""),
+            "sector": data.get("finnhubIndustry", ""),
+            "market_cap": int(data.get("marketCapitalization", 0) * 1_000_000) if data.get("marketCapitalization") else 0,
+            "country": data.get("country", ""),
+            "exchange": data.get("exchange", ""),
+        }
+        company_cache[symbol] = profile
+        return profile
+    except:
+        return {"name": "", "sector": "", "market_cap": 0, "country": "", "exchange": ""}
 
 
 def get_news(symbol):
@@ -153,11 +189,12 @@ def get_conviction(price_change, volume_ratio, has_news, insider):
     return "NORMAL"
 
 
-def get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider, conviction):
+def get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider, conviction, company_name, sector):
     try:
         prompt = f"""You are a financial analyst. Write 3-level explanation for this signal.
 
-Stock: {symbol}
+Stock: {symbol} ({company_name})
+Sector: {sector}
 Price: ${price:.2f}
 Change: {price_change:+.1f}%
 Volume: {volume_ratio:.1f}x above average
@@ -166,11 +203,11 @@ News: {news if news else 'None'}
 Insider: {insider if insider else 'None'}
 
 ===BEGINNER===
-[1-2 sentences, plain language]
+[1-2 sentences, plain language, mention what company does]
 ===INTERMEDIATE===
-[technical analysis]
+[technical analysis with sector context]
 ===PRO===
-[professional analysis with catalyst context]"""
+[professional analysis, insider probability, risk/reward]"""
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -233,14 +270,13 @@ def update_live_price(symbol, price):
     if symbol in last_price_update and now - last_price_update[symbol] < 60:
         return
     try:
-        supabase.table("us_watchlist").upsert({
-            "symbol": symbol,
+        supabase.table("us_watchlist").update({
             "last_price": round(price, 2),
             "updated_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
+        }).eq("symbol", symbol).execute()
         last_price_update[symbol] = now
-    except Exception as e:
-        print(f"⚠️ Live price hatası {symbol}: {e}")
+    except:
+        pass
 
 
 class VolumeTracker:
@@ -296,13 +332,22 @@ def process_signal(symbol, signal_type, price, price_change, volume_ratio):
     if conviction == "NORMAL" and not has_news:
         return
 
-    print(f"📊 {symbol} | {conviction} | Haber: {has_news} | Insider: {bool(insider)}")
+    company = company_cache.get(symbol, {"name": "", "sector": ""})
+    company_name = company.get("name", "")
+    sector = company.get("sector", "")
 
-    ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider, conviction)
+    print(f"📊 {symbol} ({company_name}) | {conviction} | Haber: {has_news} | Insider: {bool(insider)}")
+
+    ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, news, insider, conviction, company_name, sector)
     acemi, usta, pro = parse_ai_levels(ai_text)
 
     emoji = "🔥" if conviction == "HIGH" else "⚡" if conviction == "MEDIUM" else "🚀"
-    description = f"{emoji} {symbol} | ${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}"
+    description = f"{emoji} {symbol}"
+    if company_name:
+        description += f" ({company_name})"
+    description += f" | ${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}"
+    if sector:
+        description += f" | {sector}"
     if news:
         description += f" | 📰 {news[:80]}"
     if insider:
@@ -325,9 +370,12 @@ def process_signal(symbol, signal_type, price, price_change, volume_ratio):
         supabase.table("us_signals").insert(signal).execute()
         signal_cache[symbol] = now
         print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
+        push_body = f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x"
+        if company_name:
+            push_body = f"{company_name} — {push_body}"
         send_push_notification(
-            title=f"{emoji} {symbol} Sinyali",
-            body=f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}",
+            title=f"{emoji} {symbol} — {conviction}",
+            body=push_body,
             market="US"
         )
     except Exception as e:
@@ -417,16 +465,29 @@ def build_watchlist():
                     if 1.0 <= price <= 20.0 and vol >= 500_000:
                         candidates.append(symbol)
                         avg_volumes[symbol] = vol
+
+                        # Şirket profili çek
+                        profile = get_company_profile(symbol)
+                        time.sleep(0.1)  # Finnhub rate limit
+
                         try:
                             supabase.table("us_watchlist").upsert({
                                 "symbol": symbol,
+                                "name": profile["name"],
+                                "sector": profile["sector"],
+                                "market_cap": profile["market_cap"],
+                                "country": profile["country"],
+                                "exchange": profile["exchange"],
                                 "avg_volume": int(vol),
                                 "last_price": round(price, 2),
                                 "updated_at": datetime.now(timezone.utc).isoformat()
                             }).execute()
                         except Exception as e:
-                            print(f"  ⚠️ Supabase upsert hatası {symbol}: {e}")
-                        print(f"  ✅ {symbol}: ${price:.2f} | avg_vol={vol:,.0f}")
+                            print(f"  ⚠️ Supabase hatası {symbol}: {e}")
+
+                        name_str = f" | {profile['name']}" if profile['name'] else ""
+                        sector_str = f" | {profile['sector']}" if profile['sector'] else ""
+                        print(f"  ✅ {symbol}{name_str}{sector_str} | ${price:.2f} | avg_vol={vol:,.0f}")
                 except:
                     continue
         except Exception as e:
@@ -443,7 +504,7 @@ def build_watchlist():
 def start():
     global active_symbols
 
-    print("🚀 Atlas US Sinyal Motoru v2 başlatıldı...")
+    print("🚀 Atlas US Kartal Gözü Sinyal Motoru başlatıldı...")
     print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
     active_symbols = build_watchlist()
