@@ -16,7 +16,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 signal_cache = {}
 
-# Firebase başlat
 try:
     if FIREBASE_SERVICE_ACCOUNT:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
@@ -27,34 +26,26 @@ except Exception as e:
 
 
 def send_push_notification(title, body, market="BIST"):
-    """Tüm kullanıcılara push notification gönder"""
     try:
         profiles = supabase.table("profiles") \
             .select("fcm_token") \
             .not_.is_("fcm_token", "null") \
             .execute()
-
         if not profiles.data:
             return
-
         tokens = [p["fcm_token"] for p in profiles.data if p.get("fcm_token")]
         if not tokens:
             return
-
         for token in tokens:
             try:
                 message = messaging.Message(
-                    notification=messaging.Notification(
-                        title=title,
-                        body=body,
-                    ),
+                    notification=messaging.Notification(title=title, body=body),
                     data={"market": market},
                     token=token,
                 )
                 messaging.send(message)
             except Exception as e:
                 print(f"⚠️ Push hatası {token[:20]}...: {e}")
-
         print(f"📱 Push gönderildi: {len(tokens)} kullanıcı")
     except Exception as e:
         print(f"❌ Push notification hatası: {e}")
@@ -183,19 +174,60 @@ def get_kap_news(symbol):
         return ""
 
 
-def get_ai_explanation(symbol, price, price_change, volume_ratio, kap_news, day_high, day_low):
+def get_conviction(price_change, volume_ratio, has_kap):
+    """
+    Kartal gözü conviction sistemi:
+    - Sadece hacim patlaması = MEDIUM (birisi sessizce alıyor)
+    - Hacim + fiyat hareketi = HIGH
+    - KAP + herhangi hareket = HIGH
+    - Hacim + KAP = CRITICAL
+    """
+    score = 0
+
+    # Hacim — en önemli gösterge
+    if volume_ratio >= 10:
+        score += 4
+    elif volume_ratio >= 5:
+        score += 3
+    elif volume_ratio >= 3:
+        score += 2
+    elif volume_ratio >= 2:
+        score += 1
+
+    # Fiyat hareketi
+    if abs(price_change) >= 5:
+        score += 3
+    elif abs(price_change) >= 3:
+        score += 2
+    elif abs(price_change) >= 1:
+        score += 1
+
+    # KAP bildirimi — katalizör
+    if has_kap:
+        score += 4
+
+    if score >= 7:
+        return "CRITICAL"
+    elif score >= 5:
+        return "HIGH"
+    elif score >= 3:
+        return "MEDIUM"
+    return "NORMAL"
+
+
+def get_ai_explanation(symbol, price, price_change, volume_ratio, kap_news, day_high, day_low, conviction):
     try:
         prompt = f"""Türk finans asistanısın. Kısa ve net yaz.
 
-{symbol} | {price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x
+{symbol} | {price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x | Güven: {conviction}
 KAP: {kap_news if kap_news else 'Yok'} | Yüksek: {day_high:.2f} | Düşük: {day_low:.2f}
 
 ===ACEMİ===
-[1 cümle, çok sade Türkçe]
+[1 cümle, çok sade Türkçe, conviction seviyesini belirt]
 ===USTA===
-[2 cümle, teknik analiz]
+[2 cümle, teknik analiz, hacim ve fiyat ilişkisi]
 ===PRO===
-[3 cümle, profesyonel analiz]"""
+[3 cümle, profesyonel analiz, insider olasılığı, risk/ödül]"""
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -242,7 +274,7 @@ def parse_ai_levels(ai_text):
 
 # ==================== BOT ====================
 
-def bot_should_buy(symbol, price, price_change, volume_ratio, kap_news):
+def bot_should_buy(symbol, price, price_change, volume_ratio, kap_news, conviction):
     try:
         prompt = f"""Sen bir borsa trading botusun. Aşağıdaki sinyali analiz et ve sadece AL veya ALMA de.
 
@@ -251,12 +283,14 @@ Fiyat: {price:.2f} TL
 Değişim: %{price_change:.1f}
 Hacim: {volume_ratio:.1f}x normalden fazla
 KAP: {kap_news if kap_news else 'Yok'}
+Güven Skoru: {conviction}
 
 Karar kriterleri:
-- Yükseliş trendi + yüksek hacim = AL
+- CRITICAL veya HIGH conviction = AL
+- Hacim 5x+ = AL
 - KAP haberi var + pozitif hareket = AL
-- Sadece küçük hareket + düşük hacim = ALMA
-- Düşüş trendi = ALMA
+- NORMAL conviction + düşük hacim = ALMA
+- Düşüş trendi + KAP yok = ALMA
 
 Sadece "AL" veya "ALMA" yaz, başka hiçbir şey yazma."""
 
@@ -321,9 +355,9 @@ Sadece "SAT" veya "BEKLE" yaz, başka hiçbir şey yazma."""
         return False
 
 
-def bot_buy(user_id, symbol, price, signal_id, user_level, balance):
+def bot_buy(user_id, symbol, price, signal_id, is_pro, balance):
     try:
-        if user_level != 'pro':
+        if not is_pro:
             month_start = datetime.now(timezone.utc).replace(
                 day=1, hour=0, minute=0, second=0).isoformat()
             month_trades = supabase.table("demo_trades") \
@@ -431,9 +465,9 @@ def bot_check_open_positions():
         print(f"❌ Pozisyon kontrol hatası: {e}")
 
 
-def bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id):
+def bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id, conviction):
     try:
-        if not bot_should_buy(symbol, price, price_change, volume_ratio, kap_news):
+        if not bot_should_buy(symbol, price, price_change, volume_ratio, kap_news, conviction):
             return
 
         portfolios = supabase.table("demo_portfolios") \
@@ -451,13 +485,13 @@ def bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, sign
                 continue
 
             profile = supabase.table("profiles") \
-                .select("level") \
+                .select("is_pro") \
                 .eq("id", user_id) \
                 .maybeSingle() \
                 .execute()
-            user_level = profile.data.get("level", "acemi") if profile.data else "acemi"
+            is_pro = profile.data.get("is_pro", False) if profile.data else False
 
-            bot_buy(user_id, symbol, price, signal_id, user_level, balance)
+            bot_buy(user_id, symbol, price, signal_id, is_pro, balance)
             time.sleep(0.2)
 
     except Exception as e:
@@ -539,14 +573,30 @@ def scan_once(symbols, avg_volumes):
             price_change = ((price - open_price) / open_price) * 100
             volume_ratio = volume / avg_volume
 
-            if volume_ratio > 500:
+            # Anlamsız veri filtresi
+            if volume_ratio > 500 or volume_ratio < 0:
                 time.sleep(0.05)
                 continue
 
-            is_momentum = abs(price_change) >= 5 and volume_ratio >= 2
-            is_volume_spike = volume_ratio >= 5
+            # KAP kontrolü — önce bak
+            kap_news = get_kap_news(symbol) if volume_ratio >= 1.5 or abs(price_change) >= 1 else ""
 
-            if not is_momentum and not is_volume_spike:
+            # Conviction hesapla
+            has_kap = bool(kap_news)
+            conviction = get_conviction(price_change, volume_ratio, has_kap)
+
+            # Sinyal kriterleri — kartal gözü
+            is_early_signal = volume_ratio >= 3 and abs(price_change) >= 1    # Erken uyarı
+            is_momentum = volume_ratio >= 2 and abs(price_change) >= 3        # Momentum
+            is_volume_spike = volume_ratio >= 5                                # Saf hacim patlaması
+            is_kap_signal = has_kap and abs(price_change) >= 1                # KAP katalizörü
+
+            if not any([is_early_signal, is_momentum, is_volume_spike, is_kap_signal]):
+                time.sleep(0.05)
+                continue
+
+            # NORMAL conviction + KAP yok = geç
+            if conviction == "NORMAL" and not has_kap:
                 time.sleep(0.05)
                 continue
 
@@ -555,14 +605,29 @@ def scan_once(symbols, avg_volumes):
                 signal_cache[symbol] = last_time
                 continue
 
-            signal_type = "momentum" if is_momentum else "volume_spike"
-            print(f"🎯 {symbol} | Açılış:{open_price:.2f} Şimdi:{price:.2f} | %{price_change:.1f} | {volume_ratio:.1f}x")
+            # Sinyal tipi belirle
+            if conviction == "CRITICAL":
+                signal_type = "critical"
+                emoji = "🔥"
+            elif is_kap_signal:
+                signal_type = "kap_momentum"
+                emoji = "📰"
+            elif is_volume_spike:
+                signal_type = "volume_spike"
+                emoji = "📊"
+            elif is_early_signal and not is_momentum:
+                signal_type = "early_signal"
+                emoji = "👁️"
+            else:
+                signal_type = "momentum"
+                emoji = "🚀"
 
-            kap_news = get_kap_news(symbol)
-            ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, kap_news, day_high, day_low)
+            print(f"🎯 {symbol} | {conviction} | Açılış:{open_price:.2f} Şimdi:{price:.2f} | %{price_change:.1f} | {volume_ratio:.1f}x | {signal_type}")
+
+            ai_text = get_ai_explanation(symbol, price, price_change, volume_ratio, kap_news, day_high, day_low, conviction)
             acemi, usta, pro = parse_ai_levels(ai_text)
 
-            description = f"{'🚀' if is_momentum else '📊'} {symbol} | {price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x"
+            description = f"{emoji} {symbol} | {price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x | {conviction}"
             if kap_news:
                 description += f" | 📰 {kap_news[:80]}"
 
@@ -585,17 +650,15 @@ def scan_once(symbols, avg_volumes):
 
             if result.data:
                 signal_id = result.data[0].get("id")
-                bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id)
+                bot_process_signal(symbol, price, price_change, volume_ratio, kap_news, signal_id, conviction)
 
-            # Push notification gönder
-            emoji = "🚀" if is_momentum else "📊"
             send_push_notification(
-                title=f"{emoji} {symbol} Sinyali",
+                title=f"{emoji} {symbol} — {conviction}",
                 body=f"{price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x",
                 market="BIST"
             )
 
-            print(f"✅ KAYDEDİLDİ: {description}")
+            print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
             time.sleep(0.5)
 
         except Exception as e:
@@ -606,7 +669,7 @@ def scan_once(symbols, avg_volumes):
 
 
 def main():
-    print("🚀 Atlas TR Gerçek Zamanlı Sinyal Motoru başlatıldı...")
+    print("🚀 Atlas TR Kartal Gözü Sinyal Motoru başlatıldı...")
     symbols = get_bist_symbols()
     avg_volumes = load_all_avg_volumes()
 
