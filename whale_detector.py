@@ -364,4 +364,4 @@ def run_premarket_scan():
     Kartal gözü — borsa açılmadan 4 saat önce çalışır
     Açılışta hareket edecek hisseleri önceden tespit eder
     """
-    print(f"\n🦅
+    print("\n🦅 KARTAL GÖZÜ — PRE-MARKET TARAMA BASLIYOR")
