@@ -106,7 +106,7 @@ def get_cmc_coins():
                 all_coins[coin.get("id")] = coin
             print(f"  → Hacim listesi: {len(all_coins)} coin")
         else:
-            print(f"⚠️ CMC-1: {r1.status_code}")
+            print(f"⚠️ CMC-1: {r1.status_code} — {r1.text[:200]}")
 
         time.sleep(2)
 
@@ -133,7 +133,7 @@ def get_cmc_coins():
                     all_coins[cid] = coin
             print(f"  → Momentum listesi: toplam {len(all_coins)} coin")
         else:
-            print(f"⚠️ CMC-2: {r2.status_code}")
+            print(f"⚠️ CMC-2: {r2.status_code} — {r2.text[:200]}")
 
         return list(all_coins.values())
 
