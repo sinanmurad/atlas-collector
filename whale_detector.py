@@ -952,8 +952,9 @@ def on_message(ws, message):
 
 
 def on_open(ws):
-    print(f"✅ WebSocket bağlandı. {len(active_symbols)} hisse izleniyor...")
-    for symbol in active_symbols:
+    symbols_to_sub = active_symbols[:50]
+    print(f"✅ WebSocket bağlandı. {len(symbols_to_sub)} hisse izleniyor...")
+    for symbol in symbols_to_sub:
         ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
 
 
