@@ -92,7 +92,7 @@ def get_cmc_coins():
             params={
                 "limit": 500,
                 "convert": "USD",
-                "sort": "volume_change_24h",
+                "sort": "volume_24h",
                 "sort_dir": "desc",
                 "price_min": 0.000001,
                 "price_max": 2.0,
