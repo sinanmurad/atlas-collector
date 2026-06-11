@@ -125,16 +125,13 @@ def get_price_data(symbol):
         r = requests.get(url, headers=HEADERS, timeout=8)
         data = r.json()["chart"]["result"][0]
         meta = data["meta"]
-
         open_price = meta.get("regularMarketOpen", 0)
         if not open_price:
             opens = data.get("indicators", {}).get("quote", [{}])[0].get("open", [])
             open_price = next((x for x in opens if x), 0)
-
         prev_close = meta.get("previousClose", 0)
         if not open_price or open_price == 0:
             open_price = prev_close
-
         return {
             "price": meta.get("regularMarketPrice", 0),
             "open_price": open_price,
@@ -166,29 +163,21 @@ def get_kap_news(symbol):
 
 
 def is_significant_kap(kap_text):
-    """Geniş kataliz listesi — çoğu KAP bildirimi sinyal olabilir"""
     if not kap_text:
         return False
     kap_lower = kap_text.lower()
-    # Geniş liste — BIST'te her önemli bildirim yakalanmalı
     catalyst_keywords = [
-        # Mali sonuçlar
         "kar", "zarar", "kâr", "gelir", "ciro", "hasılat", "ebitda",
         "mali", "finansal", "bilanço", "sonuç", "dönem",
-        # Kurumsal aksiyonlar
         "temettü", "kar dağıtım", "sermaye", "artırım", "azaltım",
         "bölünme", "birleşme", "devralma", "satın alma", "satış",
         "pay", "hisse", "geri alım",
-        # Sözleşme & İş
         "sözleşme", "anlaşma", "ihale", "proje", "sipariş",
         "ortaklık", "işbirliği", "lisans", "patent",
         "ihracat", "ithalat", "kapasite", "üretim",
-        # Yönetim
         "yönetim", "genel kurul", "olağan", "olağanüstü",
         "atama", "istifa", "değişiklik",
-        # Yatırım
         "yatırım", "büyüme", "genişleme", "açılış",
-        # Diğer önemli
         "rekor", "açıklama", "karar", "onay", "izin",
         "ihraç", "tahvil", "bono", "kredi",
     ]
@@ -218,19 +207,25 @@ def calculate_signal_score(price_change, volume_ratio, kap_news, has_significant
     score = 0
     reasons = []
 
-    # Düşüş + kataliz yok = sinyal yok
-    if price_change <= -3 and not has_significant_kap:
+    # Düşüş + kataliz yok = kesinlikle sinyal yok
+    if price_change < 0 and not has_significant_kap:
         return "NORMAL", [], 0
+
+    # KAP YOKSA minimum hacim + fiyat şartı
+    if not has_significant_kap and not kap_news:
+        # Kataliz yok — çok güçlü olmalı
+        if volume_ratio < 3 or abs(price_change) < 3:
+            return "NORMAL", [], 0
 
     # 1. KAP KATALİZİ
     if has_significant_kap:
-        score += 4
+        score += 5
         reasons.append(f"KAP: {kap_news[:70]}")
     elif kap_news:
-        score += 1
+        score += 2
         reasons.append(f"KAP bildirimi: {kap_news[:70]}")
 
-    # 2. HACİM
+    # 2. HACİM — kurumsal para göstergesi
     if volume_ratio >= 5:
         score += 4
         reasons.append(f"Hacim {volume_ratio:.1f}x — güçlü kurumsal ilgi")
@@ -245,7 +240,10 @@ def calculate_signal_score(price_change, volume_ratio, kap_news, has_significant
         reasons.append(f"Hacim {volume_ratio:.1f}x hafif artış")
 
     # 3. FİYAT HAREKETİ
-    if price_change >= 5:
+    if price_change >= 7:
+        score += 4
+        reasons.append(f"%{price_change:.1f} çok güçlü yükseliş")
+    elif price_change >= 5:
         score += 3
         reasons.append(f"%{price_change:.1f} güçlü yükseliş")
     elif price_change >= 3:
@@ -254,18 +252,15 @@ def calculate_signal_score(price_change, volume_ratio, kap_news, has_significant
     elif price_change >= 1:
         score += 1
         reasons.append(f"%{price_change:.1f} hafif yükseliş")
-    elif -1 < price_change < 1:
-        score += 0  # Nötr
-    elif price_change <= -3 and has_significant_kap:
-        score += 1
-        reasons.append(f"KAP var, fiyat {price_change:.1f}% — dikkat")
+    elif price_change < 0 and has_significant_kap:
+        reasons.append(f"KAP var, fiyat {price_change:.1f}% — geçici satış")
 
-    # SONUÇ — düşürülmüş eşikler
-    if score >= 8:
+    # SONUÇ
+    if score >= 9:
         conviction = "CRITICAL"
-    elif score >= 6:
+    elif score >= 7:
         conviction = "HIGH"
-    elif score >= 3:
+    elif score >= 5:
         conviction = "MEDIUM"
     else:
         conviction = "NORMAL"
@@ -334,7 +329,7 @@ def bot_should_buy(price_change, volume_ratio, conviction):
         return True
     if price_change >= 3 and volume_ratio >= 3:
         return True
-    if conviction == "MEDIUM" and price_change >= 1 and volume_ratio >= 2:
+    if conviction == "MEDIUM" and price_change >= 2 and volume_ratio >= 2:
         return True
     if volume_ratio >= 5 and price_change > 0:
         return True
@@ -364,12 +359,10 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance):
             if len(open_trades.data) >= 1:
                 print(f"⚠️ {user_id} açık pozisyon var")
                 return False
-
         invest = min(balance * 0.10, 100)
         if invest < 10:
             return False
         quantity = invest / price
-
         supabase.table("demo_trades").insert({
             "user_id": user_id, "symbol": symbol, "market": "BIST",
             "signal_id": signal_id, "buy_price": price,
@@ -377,11 +370,9 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance):
             "quantity": round(quantity, 4), "status": "open",
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
-
         supabase.table("demo_portfolios").update({
             "balance": round(balance - invest, 2)
         }).eq("user_id", user_id).execute()
-
         print(f"✅ BOT ALIM: {user_id} → {symbol} @ {price:.2f} TL")
         return True
     except Exception as e:
@@ -398,12 +389,10 @@ def bot_sell(trade, current_price):
             "status": "closed",
             "profit_loss": round(profit_loss, 2)
         }).eq("id", trade["id"]).execute()
-
         portfolio = supabase.table("demo_portfolios").select("balance").eq("user_id", trade["user_id"]).maybeSingle().execute()
         if portfolio.data:
             new_balance = portfolio.data["balance"] + (trade["quantity"] * current_price)
             supabase.table("demo_portfolios").update({"balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
-
         print(f"✅ BOT SATIŞ: {trade['symbol']} | K/Z: {profit_loss:.2f} TL")
     except Exception as e:
         print(f"❌ Bot satış hatası: {e}")
@@ -480,47 +469,31 @@ def check_signal_results():
 
 
 def scan_once(symbols, avg_volumes):
-    """
-    Kartal gözü tarama — 3 adım:
-    1. Tüm hisseleri hızlı tara, güçlü adayları seç
-    2. Adaylara KAP + puanlama uygula
-    3. En iyi 5 sinyali kaydet
-    """
     candidates = []
     now = time.time()
 
-    # ADIM 1: HIZLI TARAMA
     for symbol in symbols:
         try:
             if symbol in signal_cache and now - signal_cache[symbol] < 3600:
                 continue
-
             data = get_price_data(symbol)
             if not data:
                 continue
-
             price = data["price"]
             open_price = data["open_price"]
             volume = data["volume"]
-
             if not price or price == 0 or not open_price or open_price == 0:
                 continue
-
             avg_volume = avg_volumes.get(symbol, 0)
             if avg_volume == 0:
                 continue
-
             price_change = ((price - open_price) / open_price) * 100
             volume_ratio = volume / avg_volume
-
             if volume_ratio > 500 or volume_ratio < 0:
                 continue
-
-            # Ön filtre — çok zayıf hisseleri at, KAP kontrolü pahalı
-            # En az biri güçlü olmalı: hacim VEYA fiyat
-            if volume_ratio < 1.5 and abs(price_change) < 2:
+            # Ön filtre: en az biri güçlü olmalı
+            if volume_ratio < 2 and abs(price_change) < 3:
                 continue
-
             candidates.append({
                 "symbol": symbol,
                 "price": price,
@@ -530,42 +503,32 @@ def scan_once(symbols, avg_volumes):
                 "day_high": data["day_high"],
                 "day_low": data["day_low"],
             })
-
         except:
             continue
 
     print(f"  📋 {len(candidates)} aday — KAP + puanlama başlıyor...")
 
-    # ADIM 2: KAP + PUANLAMA
     scored = []
     for c in candidates:
         try:
             symbol = c["symbol"]
             kap_news = get_kap_news(symbol)
             has_significant_kap = is_significant_kap(kap_news)
-
             conviction, reasons, score = calculate_signal_score(
                 c["price_change"], c["volume_ratio"], kap_news, has_significant_kap
             )
-
             if conviction == "NORMAL":
                 continue
-
-            # Son 1 saat içinde sinyal verildi mi
             last_time = get_last_signal_time(symbol)
             if now - last_time < 3600:
                 signal_cache[symbol] = last_time
                 continue
-
             scored.append({**c, "conviction": conviction, "reasons": reasons, "score": score, "kap_news": kap_news})
-
         except:
             continue
 
-    # ADIM 3: EN İYİ 5 SEÇ
     scored.sort(key=lambda x: x["score"], reverse=True)
     top5 = scored[:5]
-
     print(f"  🎯 {len(scored)} sinyal adayı → en iyi {len(top5)} seçildi")
 
     signals_found = 0
@@ -618,20 +581,16 @@ def scan_once(symbols, avg_volumes):
 
             signal_cache[symbol] = now
             signals_found += 1
-
             signal_id = result.data[0].get("id") if result.data else None
             bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id)
-
             send_push_notification(
                 title=f"{emoji} {symbol} — {conviction}",
                 body=f"{price:.2f} TL | %{price_change:.1f} | Hacim: {volume_ratio:.1f}x",
                 market="BIST",
                 signal_id=signal_id
             )
-
             print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
             time.sleep(0.5)
-
         except Exception as e:
             print(f"❌ {s.get('symbol', '?')}: {e}")
             continue
@@ -662,24 +621,19 @@ def main():
         try:
             now_utc = datetime.now(timezone.utc)
             hour = now_utc.hour
-
-            # BIST: 07:00-15:00 UTC = 10:00-18:00 TR
             if 7 <= hour < 15:
                 print(f"\n📡 Tarama başlıyor... {now_utc.strftime('%H:%M:%S')} UTC")
                 found = scan_once(symbols, avg_volumes)
                 scan_count += 1
-
                 if scan_count % 6 == 0:
                     bot_check_open_positions()
                 if scan_count % 12 == 0:
                     check_signal_results()
-
                 print(f"✅ Tarama bitti. {found} sinyal. 2 dk bekleniyor...")
                 time.sleep(120)
             else:
                 print(f"💤 Borsa kapalı. {now_utc.strftime('%H:%M UTC')}")
                 time.sleep(300)
-
         except Exception as e:
             print(f"❌ Ana döngü hatası: {e}")
             time.sleep(60)
