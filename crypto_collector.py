@@ -59,33 +59,31 @@ def send_push_notification(title, body, signal_id=None):
 
 
 def get_all_usdt_pairs():
-    """Binance'den tüm USDT paritelerini çek — $2 altı, hacimli olanları filtrele"""
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
         tickers = r.json()
+        if not isinstance(tickers, list):
+            print(f"❌ Binance beklenmedik yanıt: {type(tickers)}")
+            return []
 
         candidates = []
         for t in tickers:
+            if not isinstance(t, dict):
+                continue
             symbol = t.get("symbol", "")
             if not symbol.endswith("USDT"):
                 continue
-
-            price = float(t.get("lastPrice", 0))
-            volume_usdt = float(t.get("quoteVolume", 0))  # 24s USDT hacmi
-            price_change_pct = float(t.get("priceChangePercent", 0))
-            count = int(t.get("count", 0))  # 24s işlem sayısı
-
-            # Filtreler:
-            # 1. Fiyat $0.000001 ile $2 arası
-            # 2. 24s hacim en az $500K (canlı coin)
-            # 3. Fiyat > 0
+            try:
+                price = float(t.get("lastPrice", 0) or 0)
+                volume_usdt = float(t.get("quoteVolume", 0) or 0)
+                price_change_pct = float(t.get("priceChangePercent", 0) or 0)
+                count = int(t.get("count", 0) or 0)
+            except:
+                continue
             if not (0.000001 <= price <= 2.0):
                 continue
             if volume_usdt < 500_000:
                 continue
-            if price <= 0:
-                continue
-
             candidates.append({
                 "symbol": symbol,
                 "price": price,
@@ -94,7 +92,6 @@ def get_all_usdt_pairs():
                 "trade_count": count,
             })
 
-        # Hacme göre sırala — en aktif olanlar önce
         candidates.sort(key=lambda x: x["volume_usdt_24h"], reverse=True)
         print(f"✅ {len(candidates)} USDT paritesi bulundu ($2 altı, hacimli)")
         return candidates
@@ -102,7 +99,6 @@ def get_all_usdt_pairs():
     except Exception as e:
         print(f"❌ Binance ticker hatası: {e}")
         return []
-
 
 def get_1h_candles(symbol):
     """Son 48 saatin 1 saatlik mumlarını çek — baseline hacim ve trend için"""
