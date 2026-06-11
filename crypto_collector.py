@@ -82,24 +82,54 @@ def send_push_notification(title, body, signal_id=None):
 
 def get_cmc_coins():
     try:
-        print(f"🔑 CMC Key: {CMC_API_KEY[:8] if CMC_API_KEY else 'YOK'}...")
-        r = requests.get(
+        all_coins = {}
+
+        # Strateji 1: Hacim sıralaması
+        r1 = requests.get(
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
             headers=CMC_HEADERS,
             params={
-                "limit": 200,
+                "limit": 500,
                 "convert": "USD",
-                "sort": "market_cap",
+                "sort": "volume_24h",
                 "sort_dir": "desc",
+                "aux": "percent_change_1h,percent_change_4h,percent_change_24h,percent_change_7d,volume_change_24h,market_cap",
             },
             timeout=30
         )
-        print(f"CMC yanıt: {r.status_code} — {r.text[:300]}")
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            print(f"✅ {len(data)} coin geldi")
-            return data
-        return []
+        if r1.status_code == 200:
+            for coin in r1.json().get("data", []):
+                all_coins[coin.get("id")] = coin
+            print(f"  → Hacim listesi: {len(all_coins)} coin")
+        else:
+            print(f"⚠️ CMC-1: {r1.status_code} — {r1.text[:200]}")
+
+        time.sleep(2)
+
+        # Strateji 2: 1s kazananlar
+        r2 = requests.get(
+            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
+            headers=CMC_HEADERS,
+            params={
+                "limit": 500,
+                "convert": "USD",
+                "sort": "percent_change_1h",
+                "sort_dir": "desc",
+                "aux": "percent_change_1h,percent_change_4h,percent_change_24h,percent_change_7d,volume_change_24h,market_cap",
+            },
+            timeout=30
+        )
+        if r2.status_code == 200:
+            for coin in r2.json().get("data", []):
+                cid = coin.get("id")
+                if cid not in all_coins:
+                    all_coins[cid] = coin
+            print(f"  → Momentum listesi: toplam {len(all_coins)} coin")
+        else:
+            print(f"⚠️ CMC-2: {r2.status_code} — {r2.text[:200]}")
+
+        return list(all_coins.values())
+
     except Exception as e:
         print(f"❌ CMC hatası: {e}")
         return []
