@@ -421,6 +421,10 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         elif rsi > 60:
             score += 1
 
+    # OBV aşağı ise BİRİKİM olamaz
+    if obv_trend == "down":
+        layer = "MOMENTUM"
+                   
     # ── OBV ──────────────────────────────────────────────────
     if obv_div:
         # Bullish diverjans: fiyat düşerken OBV yükseliyor = en güçlü birikim sinyali
