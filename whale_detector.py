@@ -80,15 +80,6 @@ def is_market_open():
     return open_t <= now <= close_t
 
 
-def is_premarket():
-    now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:
-        return False
-    premarket_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_open = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    return premarket_start <= now < market_open
-
-
 def load_watchlist_from_db():
     global active_symbols
     try:
@@ -224,7 +215,7 @@ def get_news_catalyst(symbol, company_name=""):
             headline = news.get("headline", "").lower()
             summary = news.get("summary", "").lower()
 
-            # Haber bu hisseyle alakalı mı?
+            # Haber bu hisseyle alakalı mı — sembol veya şirket adı geçmeli
             is_relevant = (
                 symbol_lower in headline or
                 symbol_lower in summary or
@@ -361,7 +352,6 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
     if not has_catalyst:
         return "NORMAL", [], 0
 
-    # 1. EARNINGS
     if earnings:
         eps_est = earnings.get("eps_estimate")
         eps_act = earnings.get("eps_actual")
@@ -373,12 +363,10 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
             score += 2
             reasons.append("Earnings açıklaması bugün")
 
-    # 2. KATALIZ HABER
     if catalyst:
         score += 3
         reasons.append(f"Kataliz [{catalyst['keyword']}]: {catalyst['headline'][:60]}")
 
-    # 3. ANALİST
     if analyst:
         buy = analyst.get("buy", 0)
         sell = analyst.get("sell", 0)
@@ -389,12 +377,10 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
             score += 2
             reasons.append(f"Analist: {buy} AL {sell} SAT")
 
-    # 4. INSIDER
     if insider:
         score += 3
         reasons.append(f"Insider: {insider}")
 
-    # 5. HACİM
     if trend_data["vol_ratio"] >= 2:
         score += 3
         reasons.append(f"Hacim {trend_data['vol_ratio']}x — kurumsal ilgi")
@@ -402,7 +388,6 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
         score += 2
         reasons.append(f"Hacim {trend_data['vol_ratio']}x artışı")
 
-    # 6. FİYAT TREND
     if trend_data["prev_change"] >= 4:
         score += 2
         reasons.append(f"Dün +{trend_data['prev_change']}% güçlü kapanış")
@@ -670,11 +655,10 @@ def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, si
 
 
 def run_premarket_scan():
+    """Gece analizi — sinyalleri DB'ye kaydet, push GÖNDERME"""
     print("\n" + "="*50)
-    print("🦅 KARTAL GÖZÜ — PRE-MARKET ANALIZ")
-    now_utc = datetime.now(timezone.utc)
-    minutes_to_open = int((13.5 - now_utc.hour - now_utc.minute / 60) * 60)
-    print(f"⏰ Acilisa {minutes_to_open} dakika var")
+    print("🦅 KARTAL GÖZÜ — GECE ANALİZİ")
+    print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')} — Sabah 15:30 TR'de sinyaller gönderilecek")
     print("="*50)
 
     print("\n📅 Earnings takvimi kontrol ediliyor...")
@@ -699,7 +683,6 @@ def run_premarket_scan():
             catalyst = get_news_catalyst(symbol, company_name)
             time.sleep(0.05)
 
-            # Kataliz zorunlu
             if not catalyst and not earnings:
                 continue
 
@@ -745,7 +728,7 @@ def run_premarket_scan():
     signals.sort(key=lambda x: x["score"], reverse=True)
     top5 = signals[:5]
 
-    print(f"\n✅ {len(signals)} aday → en iyi {len(top5)} sinyal gönderiliyor...")
+    print(f"\n✅ {len(signals)} aday — en iyi {len(top5)} sinyal DB'ye kaydediliyor...")
 
     for sig in top5:
         try:
@@ -786,24 +769,68 @@ def run_premarket_scan():
 
             signal_id = result.data[0].get("id") if result.data else None
             premarket_signal_cache[symbol] = time.time()
-
-            push_body = f"${trend['last_close']} | Dun {trend['prev_change']:+}% | {conviction}"
-            if sig["company_name"]:
-                push_body = f"{sig['company_name']} — {push_body}"
-
-            send_push_notification(
-                title=f"{emoji} {symbol} — Acilis Oncesi Sinyal",
-                body=push_body,
-                market="US",
-                signal_id=signal_id
-            )
-
-            print(f"✅ SINYAL: {description}")
+            print(f"✅ DB'ye kaydedildi: {description}")
 
         except Exception as e:
             print(f"❌ Sinyal kayıt hatası {sig['symbol']}: {e}")
 
-    print(f"\n🦅 Pre-market tamamlandi. {len(top5)} sinyal.")
+    print(f"\n🌙 Gece analizi tamamlandı. {len(top5)} sinyal hazır. Sabah 15:30 TR'de gönderilecek.")
+
+
+def send_morning_signals():
+    """Gece hazırlanan US sinyallerini 15:30 TR'de push ile gönder"""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=16)).isoformat()
+        r = supabase.table("us_signals") \
+            .select("*") \
+            .gte("created_at", since) \
+            .eq("signal_type", "premarket") \
+            .order("created_at", ascending=False) \
+            .limit(5) \
+            .execute()
+
+        if not r.data:
+            print("⚠️ Sabah için US sinyali bulunamadı")
+            return
+
+        print(f"📱 {len(r.data)} US sabah sinyali gönderiliyor...")
+
+        for signal in r.data:
+            symbol = signal["symbol"]
+            price = signal.get("price", 0)
+            value = signal.get("value", 0)
+            volume_ratio = signal.get("volume_ratio", 0)
+            signal_id = signal["id"]
+            description = signal.get("description", "")
+
+            company_name = ""
+            if "(" in description and ")" in description:
+                try:
+                    company_name = description.split("(")[1].split(")")[0]
+                except:
+                    pass
+
+            emoji = "⚡"
+            if "🔥" in description:
+                emoji = "🔥"
+            elif "👁️" in description:
+                emoji = "👁️"
+
+            push_body = f"${price:.2f} | {value:+.1f}% | Vol: {volume_ratio:.1f}x"
+            if company_name:
+                push_body = f"{company_name} — {push_body}"
+
+            send_push_notification(
+                title=f"{emoji} {symbol} — Açılış Öncesi Sinyal",
+                body=push_body,
+                market="US",
+                signal_id=signal_id
+            )
+            time.sleep(0.5)
+
+        print("✅ US sabah sinyalleri gönderildi.")
+    except Exception as e:
+        print(f"❌ US sabah sinyal gönderme hatası: {e}")
 
 
 def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
@@ -964,7 +991,7 @@ def start():
 
     print("🔄 Sinyal cache yukleniyor...")
     try:
-        since = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        since = (datetime.now(timezone.utc) - timedelta(hours=16)).isoformat()
         r = supabase.table("us_signals").select("symbol, created_at").gte("created_at", since).execute()
         for row in r.data:
             sym = row["symbol"]
@@ -974,8 +1001,9 @@ def start():
     except Exception as e:
         print(f"⚠️ Cache yukleme hatası: {e}")
 
-    premarket_done = False
     last_watchlist_refresh = time.time()
+    night_scan_done = False
+    morning_signals_sent = False
 
     while True:
         try:
@@ -983,29 +1011,61 @@ def start():
             hour = now_utc.hour
             minute = now_utc.minute
 
+            # ============================================================
+            # GECE WATCHLIST YENİLE: 02:00 UTC (05:00 TR)
+            # ============================================================
             if hour == 2 and minute < 5 and time.time() - last_watchlist_refresh > 3600:
                 print("🌙 Gece watchlist yenileniyor...")
                 refresh_watchlist_background()
                 last_watchlist_refresh = time.time()
                 premarket_signal_cache.clear()
-                premarket_done = False
+                night_scan_done = False
+                morning_signals_sent = False
 
-            if is_premarket() and not premarket_done:
-                run_premarket_scan()
-                premarket_done = True
-                print("💤 Pre-market bitti. Acilis bekleniyor...")
-                time.sleep(300)
+            # ============================================================
+            # GECE MODU: 20:00-12:29 UTC (23:00-15:29 TR)
+            # Borsa kapandıktan sonra analiz yap, push GÖNDERME
+            # ============================================================
+            if hour >= 20 or hour < 12:
+                if not night_scan_done:
+                    print(f"\n🌙 US GECE MOTORU başlıyor... {now_utc.strftime('%H:%M UTC')}")
+                    premarket_signal_cache.clear()
+                    run_premarket_scan()
+                    night_scan_done = True
+                    morning_signals_sent = False
+                else:
+                    print(f"💤 US gece bekleniyor... {now_utc.strftime('%H:%M UTC')}")
+                time.sleep(600)
 
+            # ============================================================
+            # SABAH SİNYAL GÖNDERME: 12:30-12:59 UTC (15:30-15:59 TR)
+            # Borsa açılmadan 1 saat önce push gönder
+            # ============================================================
+            elif hour == 12 and minute >= 30 and not morning_signals_sent:
+                print(f"\n🦅 US SABAH SİNYALLERİ — {now_utc.strftime('%H:%M UTC')} (15:30 TR)")
+                send_morning_signals()
+                morning_signals_sent = True
+                night_scan_done = False
+                print("✅ US sabah sinyalleri gönderildi. Borsa açılışı bekleniyor...")
+                time.sleep(120)
+
+            # ============================================================
+            # BORSA AÇIK: 13:30-20:00 UTC (16:30-23:00 TR)
+            # WebSocket ile canlı takip
+            # ============================================================
             elif is_market_open():
-                premarket_done = False
-                print(f"📡 WebSocket bağlanıyor... ({len(active_symbols)} hisse)")
+                night_scan_done = False
+                morning_signals_sent = False
+                print(f"📡 US WebSocket bağlanıyor... ({len(active_symbols)} hisse)")
                 connect_websocket()
 
+            # ============================================================
+            # ARA DÖNEM: 13:00-13:29 UTC (16:00-16:29 TR)
+            # ============================================================
             else:
-                if hour == 21 and minute < 5:
+                if hour == 20 and minute < 5:
                     bot_check_open_positions()
-                    premarket_done = False
-                print(f"💤 Borsa kapali. {now_utc.strftime('%H:%M UTC')}")
+                print(f"💤 US bekleniyor. {now_utc.strftime('%H:%M UTC')}")
                 time.sleep(300)
 
         except Exception as e:
