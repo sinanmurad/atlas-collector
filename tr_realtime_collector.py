@@ -439,8 +439,8 @@ def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, si
             balance = portfolio["balance"]
             if balance < 10:
                 continue
-            profile = supabase.table("profiles").select("is_pro").eq("id", user_id).maybeSingle().execute()
-            is_pro = profile.data.get("is_pro", False) if profile.data else False
+            profile = supabase.table("profiles").select("is_pro").eq("id", user_id).limit(1).execute()
+            is_pro = profile.data[0].get("is_pro", False) if profile.data else False
             bot_buy(user_id, symbol, price, signal_id, is_pro, balance)
             time.sleep(0.2)
     except Exception as e:
