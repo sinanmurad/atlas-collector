@@ -31,17 +31,18 @@ try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
         firebase_admin.initialize_app(cred)
-        print("✅ Firebase Admin başlatıldı")
+        print("✅ Firebase Admin baslatildi")
 except Exception as e:
-    print(f"⚠️ Firebase başlatma hatası: {e}")
+    print(f"⚠️ Firebase baslatma hatası: {e}")
 
+
+# ============================================================
+# PUSH NOTIFICATION
+# ============================================================
 
 def send_push_notification(title, body, market="US", signal_id=None):
     try:
-        profiles = supabase.table("profiles") \
-            .select("fcm_token") \
-            .not_.is_("fcm_token", "null") \
-            .execute()
+        profiles = supabase.table("profiles").select("fcm_token").not_.is_("fcm_token", "null").execute()
         if not profiles.data:
             return
         tokens = [p["fcm_token"] for p in profiles.data if p.get("fcm_token")]
@@ -59,14 +60,10 @@ def send_push_notification(title, body, market="US", signal_id=None):
                     },
                     android=messaging.AndroidConfig(
                         priority="high",
-                        notification=messaging.AndroidNotification(
-                            channel_id="atlas_signals",
-                        ),
+                        notification=messaging.AndroidNotification(channel_id="atlas_signals"),
                     ),
                     apns=messaging.APNSConfig(
-                        payload=messaging.APNSPayload(
-                            aps=messaging.Aps(sound="default", badge=1)
-                        )
+                        payload=messaging.APNSPayload(aps=messaging.Aps(sound="default", badge=1))
                     ),
                     token=token,
                 )
@@ -78,79 +75,75 @@ def send_push_notification(title, body, market="US", signal_id=None):
         print(f"❌ Push notification hatası: {e}")
 
 
+# ============================================================
+# ZAMAN KONTROL
+# ============================================================
+
 def is_market_open():
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return False
-    open_t = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    close_t = now.replace(hour=20, minute=0, second=0, microsecond=0)
-    return open_t <= now <= close_t
+    return now.replace(hour=13, minute=30, second=0, microsecond=0) <= now <= now.replace(hour=20, minute=0, second=0, microsecond=0)
 
 
 def is_premarket():
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return False
-    premarket_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_open = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    return premarket_start <= now < market_open
+    return now.replace(hour=9, minute=30, second=0, microsecond=0) <= now < now.replace(hour=13, minute=30, second=0, microsecond=0)
 
+
+# ============================================================
+# WATCHLIST — SUPABASE'DEN YUKLE
+# ============================================================
 
 def load_watchlist_from_db():
-    """Supabase'den mevcut watchlist'i yükle — hızlı başlangıç"""
     global active_symbols
     try:
-        print("📋 Watchlist Supabase'den yükleniyor...")
-        result = supabase.table("us_watchlist") \
-            .select("symbol, avg_volume, last_price, name, sector") \
-            .execute()
+        print("📋 Watchlist Supabase'den yukleniyor...")
+        result = supabase.table("us_watchlist").select("symbol, avg_volume, last_price, name, sector").execute()
         if not result.data:
-            print("⚠️ Watchlist boş")
             return []
         symbols = []
         for row in result.data:
             sym = row["symbol"]
             vol = row.get("avg_volume", 0) or 0
-            name = row.get("name", "")
-            sector = row.get("sector", "")
             if vol > 0:
                 avg_volumes[sym] = vol
                 symbols.append(sym)
-                if name:
-                    company_cache[sym] = {"name": name, "sector": sector, "market_cap": 0, "country": "", "exchange": ""}
-        print(f"✅ {len(symbols)} hisse yüklendi")
+                company_cache[sym] = {
+                    "name": row.get("name", ""),
+                    "sector": row.get("sector", ""),
+                    "market_cap": 0, "country": "", "exchange": ""
+                }
+        print(f"✅ {len(symbols)} hisse yuklendi")
         return symbols
     except Exception as e:
-        print(f"❌ Watchlist yükleme hatası: {e}")
+        print(f"❌ Watchlist yukleme hatası: {e}")
         return []
 
 
 def refresh_watchlist_background():
-    """Gece watchlist'i yenile — yfinance batch"""
     global active_symbols
     try:
-        print("🔄 Watchlist yenileniyor (arka plan)...")
+        print("🔄 Watchlist yenileniyor...")
+        nasdaq, nyse = [], []
+        try:
+            r = requests.get('https://raw.githubusercontent.com/datasets/nasdaq-listings/main/data/nasdaq-listed.csv', timeout=10)
+            nasdaq = [l.split(',')[0] for l in r.text.strip().split('\n')[1:] if l.split(',')[0].isalpha() and 2 <= len(l.split(',')[0]) <= 5]
+        except:
+            pass
+        try:
+            r = requests.get('https://raw.githubusercontent.com/datasets/nyse-listings/main/data/nyse-listed.csv', timeout=10)
+            nyse = [l.split(',')[0] for l in r.text.strip().split('\n')[1:] if l.split(',')[0].isalpha() and 2 <= len(l.split(',')[0]) <= 5]
+        except:
+            pass
 
-        def get_symbols():
-            nasdaq, nyse = [], []
-            try:
-                r = requests.get('https://raw.githubusercontent.com/datasets/nasdaq-listings/main/data/nasdaq-listed.csv', timeout=10)
-                nasdaq = [l.split(',')[0] for l in r.text.strip().split('\n')[1:] if l.split(',')[0].isalpha() and 2 <= len(l.split(',')[0]) <= 5]
-            except:
-                pass
-            try:
-                r = requests.get('https://raw.githubusercontent.com/datasets/nyse-listings/main/data/nyse-listed.csv', timeout=10)
-                nyse = [l.split(',')[0] for l in r.text.strip().split('\n')[1:] if l.split(',')[0].isalpha() and 2 <= len(l.split(',')[0]) <= 5]
-            except:
-                pass
-            return list(set(nasdaq + nyse))
-
-        all_symbols = get_symbols()
+        all_symbols = list(set(nasdaq + nyse))
         candidates = []
-        batch_size = 200
 
-        for i in range(0, len(all_symbols), batch_size):
-            batch = all_symbols[i:i + batch_size]
+        for i in range(0, len(all_symbols), 200):
+            batch = all_symbols[i:i+200]
             try:
                 data = yf.download(' '.join(batch), period='5d', interval='1d', progress=False, threads=True)
                 if data.empty:
@@ -164,11 +157,11 @@ def refresh_watchlist_background():
                         if 1.0 <= price <= 20.0 and vol >= 500_000:
                             candidates.append(sym)
                             avg_volumes[sym] = vol
-                            try:
-                                profile = {"name": "", "sector": "", "market_cap": 0, "country": "", "exchange": ""}
-                                if sym not in company_cache:
-                                    r = requests.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={sym}&token={FINNHUB_KEY}", timeout=5)
-                                    d = r.json()
+                            profile = {"name": "", "sector": "", "market_cap": 0, "country": "", "exchange": ""}
+                            if sym not in company_cache:
+                                try:
+                                    rp = requests.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={sym}&token={FINNHUB_KEY}", timeout=5)
+                                    d = rp.json()
                                     profile = {
                                         "name": d.get("name", ""),
                                         "sector": d.get("finnhubIndustry", ""),
@@ -178,17 +171,16 @@ def refresh_watchlist_background():
                                     }
                                     company_cache[sym] = profile
                                     time.sleep(0.1)
-                                else:
-                                    profile = company_cache[sym]
+                                except:
+                                    pass
+                            else:
+                                profile = company_cache[sym]
+                            try:
                                 supabase.table("us_watchlist").upsert({
-                                    "symbol": sym,
-                                    "name": profile["name"],
-                                    "sector": profile["sector"],
-                                    "market_cap": profile["market_cap"],
-                                    "country": profile["country"],
-                                    "exchange": profile["exchange"],
-                                    "avg_volume": int(vol),
-                                    "last_price": round(price, 2),
+                                    "symbol": sym, "name": profile["name"],
+                                    "sector": profile["sector"], "market_cap": profile["market_cap"],
+                                    "country": profile["country"], "exchange": profile["exchange"],
+                                    "avg_volume": int(vol), "last_price": round(price, 2),
                                     "updated_at": datetime.now(timezone.utc).isoformat()
                                 }).execute()
                             except:
@@ -205,181 +197,273 @@ def refresh_watchlist_background():
         print(f"❌ Watchlist yenileme hatası: {e}")
 
 
-def get_news(symbol, days=1):
-    cache_key = f"{symbol}_{days}"
-    if cache_key in news_cache:
-        cached_time, cached_news = news_cache[cache_key]
-        if time.time() - cached_time < 1800:
-            return cached_news
+# ============================================================
+# KARTAL GÖZÜ — PRE-MARKET KATALIZ MOTORU
+# ============================================================
+
+def get_earnings_today():
+    """Bugün earnings raporu açıklayacak hisseler"""
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        from_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
         r = requests.get(
-            f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={today}&token={FINNHUB_KEY}",
+            f"https://finnhub.io/api/v1/calendar/earnings?from={today}&to={today}&token={FINNHUB_KEY}",
+            timeout=10
+        )
+        data = r.json()
+        earnings = data.get("earningsCalendar", [])
+        symbols = []
+        for e in earnings:
+            sym = e.get("symbol", "")
+            hour = e.get("hour", "")
+            # BMO = Before Market Open, sabah açıklayanlar
+            if sym and hour in ["bmo", "amc", ""]:
+                symbols.append({
+                    "symbol": sym,
+                    "eps_estimate": e.get("epsEstimate"),
+                    "eps_actual": e.get("epsActual"),
+                    "hour": hour
+                })
+        print(f"📅 Bugün {len(symbols)} şirket earnings açıklıyor")
+        return symbols
+    except Exception as e:
+        print(f"⚠️ Earnings takvim hatası: {e}")
+        return []
+
+
+def get_analyst_upgrades_today():
+    """Son 24 saatte analist upgrade alan hisseler"""
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        r = requests.get(
+            f"https://finnhub.io/api/v1/calendar/recommendation?from={yesterday}&to={today}&token={FINNHUB_KEY}",
+            timeout=10
+        )
+        data = r.json()
+        upgrades = []
+        if isinstance(data, list):
+            for item in data:
+                action = item.get("action", "")
+                if action in ["upgrade", "init", "reiterated"]:
+                    upgrades.append({
+                        "symbol": item.get("symbol", ""),
+                        "from": item.get("fromGrade", ""),
+                        "to": item.get("toGrade", ""),
+                        "firm": item.get("company", ""),
+                        "action": action
+                    })
+        print(f"📈 Son 24 saatte {len(upgrades)} analist aksiyonu")
+        return upgrades
+    except Exception as e:
+        print(f"⚠️ Analist upgrade hatası: {e}")
+        return []
+
+
+def get_news_catalyst(symbol):
+    """Son 48 saatte önemli haber var mı — sadece gerçek kataliz"""
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        two_days_ago = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+        r = requests.get(
+            f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={two_days_ago}&to={today}&token={FINNHUB_KEY}",
             timeout=5
         )
         news_list = r.json()
-        headlines = [n.get("headline", "") for n in news_list[:3]] if isinstance(news_list, list) else []
-        result = " | ".join(headlines) if headlines else ""
-        news_cache[cache_key] = (time.time(), result)
-        return result
+        if not isinstance(news_list, list) or not news_list:
+            return None
+
+        # Önemli anahtar kelimeler — gerçek kataliz
+        catalyst_keywords = [
+            "earnings", "revenue", "profit", "beat", "exceed", "guidance",
+            "upgrade", "buy", "outperform", "target", "raised",
+            "fda", "approval", "approved", "patent",
+            "merger", "acquisition", "buyout", "deal",
+            "contract", "partnership", "agreement",
+            "dividend", "buyback",
+            "ceo", "appointed", "hired",
+        ]
+
+        for news in news_list[:10]:
+            headline = news.get("headline", "").lower()
+            summary = news.get("summary", "").lower()
+            for kw in catalyst_keywords:
+                if kw in headline or kw in summary:
+                    return {
+                        "headline": news.get("headline", ""),
+                        "keyword": kw,
+                        "time": news.get("datetime", 0)
+                    }
+        return None
     except:
-        return ""
+        return None
 
 
-def get_analyst_rating(symbol):
-    if symbol in analyst_cache:
-        cached_time, cached_data = analyst_cache[symbol]
-        if time.time() - cached_time < 3600:
-            return cached_data
+def get_gap_data(symbol):
+    """Dün kapanış vs bugün beklenen açılış — gap hesapla"""
     try:
-        r = requests.get(
-            f"https://finnhub.io/api/v1/stock/recommendation?symbol={symbol}&token={FINNHUB_KEY}",
-            timeout=5
-        )
-        data = r.json()
-        if data and isinstance(data, list):
-            latest = data[0]
-            result = {
-                "buy": latest.get("buy", 0) + latest.get("strongBuy", 0),
-                "hold": latest.get("hold", 0),
-                "sell": latest.get("sell", 0)
-            }
-            analyst_cache[symbol] = (time.time(), result)
-            return result
-        return None
+        t = yf.Ticker(symbol)
+        hist = t.history(period="5d").dropna()
+        if len(hist) < 2:
+            return None
+
+        prev_close = float(hist['Close'].iloc[-1])
+        volumes = hist['Volume'].tolist()
+        closes = hist['Close'].tolist()
+
+        avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 0
+        last_vol = volumes[-1]
+        vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0
+
+        # 5 günlük trend
+        five_day_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
+        prev_day_change = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if len(closes) >= 2 else 0
+
+        return {
+            "prev_close": round(prev_close, 2),
+            "vol_ratio": round(vol_ratio, 2),
+            "five_day_change": round(five_day_change, 2),
+            "prev_day_change": round(prev_day_change, 2),
+            "avg_vol": int(avg_vol),
+            "last_vol": int(last_vol)
+        }
     except:
         return None
 
 
-def get_insider(symbol):
+def get_insider_recent(symbol):
+    """Son 30 günde insider alımı var mı"""
     try:
         r = requests.get(
             f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={symbol}&token={FINNHUB_KEY}",
             timeout=5
         )
         data = r.json().get("data", [])
-        purchases = [t for t in data[:10] if t.get("transactionCode") == "P-Purchase"]
-        if len(purchases) >= 2:
-            return f"{len(purchases)} insider alımı"
-        if purchases:
-            return f"{purchases[0].get('name', '')} bought {purchases[0].get('share', 0):,} shares"
-        return ""
-    except:
-        return ""
-
-
-def get_5day_trend(symbol):
-    try:
-        t = yf.Ticker(symbol)
-        hist = t.history(period="10d").dropna()
-        if len(hist) < 3:
-            return None
-        closes = hist['Close'].tolist()
-        volumes = hist['Volume'].tolist()
-        last5 = closes[-5:] if len(closes) >= 5 else closes
-        trend = "up" if last5[-1] > last5[0] else "down"
-        prev_change = ((closes[-1] - closes[-2]) / closes[-2]) * 100
-        avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if volumes[:-1] else 0
-        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
-        return {
-            "trend": trend,
-            "prev_change": round(prev_change, 2),
-            "vol_ratio": round(vol_ratio, 2),
-            "last_close": round(closes[-1], 2),
-            "5d_change": round(((closes[-1] - closes[-5]) / closes[-5]) * 100, 2) if len(closes) >= 5 else 0
-        }
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        recent_purchases = [
+            t for t in data
+            if t.get("transactionCode") == "P-Purchase"
+            and t.get("transactionDate", "") >= cutoff
+        ]
+        if len(recent_purchases) >= 2:
+            total = sum(p.get("share", 0) * p.get("transactionPrice", 0) for p in recent_purchases)
+            return f"{len(recent_purchases)} insider alımı (${total:,.0f})"
+        if recent_purchases:
+            p = recent_purchases[0]
+            return f"{p.get('name', 'Insider')} — {p.get('share', 0):,} hisse"
+        return None
     except:
         return None
 
 
-def premarket_conviction(trend_data, news, analyst, insider):
+def calculate_premarket_score(symbol, gap_data, catalyst, earnings, analyst_upgrade, insider):
+    """
+    Profesyonel pre-market puanlama sistemi
+    Kataliz olmadan sinyal yok — bu kural değişmez
+    """
     score = 0
     reasons = []
+    conviction = "NORMAL"
 
-    if not trend_data:
-        return "NORMAL", []
+    # ZORUNLU: Kataliz yoksa sinyal yok
+    has_catalyst = bool(catalyst or earnings or analyst_upgrade)
+    if not has_catalyst:
+        return "NORMAL", [], 0
 
-    if trend_data["trend"] == "down" and trend_data["5d_change"] <= -5:
-        score += 2
-        reasons.append(f"5g düşüş {trend_data['5d_change']}% — bounce adayı")
+    if not gap_data:
+        return "NORMAL", [], 0
 
-    if trend_data["prev_change"] >= 3:
-        score += 2
-        reasons.append(f"Dün +{trend_data['prev_change']}% güçlü kapanış")
-    elif trend_data["prev_change"] >= 1:
-        score += 1
-        reasons.append(f"Dün +{trend_data['prev_change']}% pozitif kapanış")
+    # 1. EARNINGS — en güçlü kataliz
+    if earnings:
+        eps_est = earnings.get("eps_estimate")
+        eps_act = earnings.get("eps_actual")
+        if eps_est and eps_act:
+            if eps_act > eps_est:
+                beat_pct = ((eps_act - eps_est) / abs(eps_est)) * 100 if eps_est != 0 else 0
+                score += 5
+                reasons.append(f"Earnings BEAT: %{beat_pct:.0f} üstünde ({eps_act} vs {eps_est} tahmin)")
+            else:
+                score -= 2
+                reasons.append(f"Earnings MISS: {eps_act} vs {eps_est} tahmin")
+        else:
+            score += 2
+            reasons.append("Earnings açıklaması bugün")
 
-    if trend_data["vol_ratio"] >= 2:
+    # 2. ANALIST UPGRADE
+    if analyst_upgrade:
+        score += 4
+        reasons.append(f"Analist {analyst_upgrade['action'].upper()}: {analyst_upgrade['firm']} — {analyst_upgrade['from']} → {analyst_upgrade['to']}")
+
+    # 3. HABER KATALİZİ
+    if catalyst:
         score += 3
-        reasons.append(f"Hacim {trend_data['vol_ratio']}x — kurumsal ilgi")
-    elif trend_data["vol_ratio"] >= 1.5:
-        score += 2
-        reasons.append(f"Hacim {trend_data['vol_ratio']}x artışı")
+        reasons.append(f"Kataliz haber [{catalyst['keyword']}]: {catalyst['headline'][:70]}")
 
-    if news:
-        score += 3
-        reasons.append(f"Haber: {news[:60]}")
-
-    if analyst:
-        buy = analyst.get("buy", 0)
-        sell = analyst.get("sell", 0)
-        if buy >= 5 and sell == 0:
-            score += 3
-            reasons.append(f"Analist: {buy} AL 0 SAT")
-        elif buy > sell:
-            score += 1
-            reasons.append(f"Analist: {buy} AL {sell} SAT")
-
+    # 4. INSIDER ALIMI
     if insider:
         score += 3
-        reasons.append(f"Insider: {insider}")
+        reasons.append(f"Son 30g Insider: {insider}")
 
-    if score >= 8:
-        return "CRITICAL", reasons
-    elif score >= 6:
-        return "HIGH", reasons
+    # 5. HACİM ARTIŞI — katalizi doğrular
+    if gap_data["vol_ratio"] >= 2:
+        score += 3
+        reasons.append(f"Hacim {gap_data['vol_ratio']}x — kurumsal ilgi doğrulandı")
+    elif gap_data["vol_ratio"] >= 1.5:
+        score += 2
+        reasons.append(f"Hacim {gap_data['vol_ratio']}x artışı")
+    elif gap_data["vol_ratio"] < 0.8:
+        score -= 1
+        reasons.append(f"Hacim düşük {gap_data['vol_ratio']}x — ilgi zayıf")
+
+    # 6. FİYAT TREND
+    if gap_data["prev_day_change"] >= 4:
+        score += 2
+        reasons.append(f"Dün +{gap_data['prev_day_change']}% güçlü kapanış")
+    elif gap_data["prev_day_change"] >= 2:
+        score += 1
+        reasons.append(f"Dün +{gap_data['prev_day_change']}% pozitif")
+    elif gap_data["prev_day_change"] <= -4:
+        score -= 1
+        reasons.append(f"Dün {gap_data['prev_day_change']}% zayıf kapanış")
+
+    # SONUÇ
+    if score >= 10:
+        conviction = "CRITICAL"
+    elif score >= 7:
+        conviction = "HIGH"
     elif score >= 4:
-        return "MEDIUM", reasons
-    return "NORMAL", reasons
+        conviction = "MEDIUM"
+    else:
+        conviction = "NORMAL"
+
+    return conviction, reasons, score
 
 
-def get_ai_explanation(symbol, company_name, sector, trend_data, news, insider, analyst, conviction, reasons, is_premarket_signal=False):
+def get_ai_premarket_explanation(symbol, company_name, sector, gap_data, catalyst, earnings, analyst_upgrade, insider, conviction, reasons):
     try:
-        analyst_str = f"Buy={analyst['buy']} Hold={analyst['hold']} Sell={analyst['sell']}" if analyst else "N/A"
+        earnings_str = f"Earnings: {earnings}" if earnings else "Earnings: None"
+        analyst_str = f"Analyst: {analyst_upgrade['firm']} {analyst_upgrade['action']} {analyst_upgrade['from']}→{analyst_upgrade['to']}" if analyst_upgrade else "Analyst: None"
+        catalyst_str = f"News: {catalyst['headline'][:100]}" if catalyst else "News: None"
+        insider_str = f"Insider: {insider}" if insider else "Insider: None"
 
-        if is_premarket_signal and trend_data:
-            prompt = f"""Financial analyst. Pre-market signal. 3 levels.
-
-Stock: {symbol} ({company_name}) | Sector: {sector}
-Last Close: ${trend_data['last_close']} | Yesterday: {trend_data['prev_change']:+}% | 5d: {trend_data['5d_change']:+}%
-Volume Ratio: {trend_data['vol_ratio']}x | Conviction: {conviction}
-Reasons: {', '.join(reasons)}
-News: {news if news else 'None'}
-Insider: {insider if insider else 'None'}
-Analyst: {analyst_str}
-
-===BEGINNER===
-[1-2 sentences, what to expect at open]
-===INTERMEDIATE===
-[technical setup, key levels]
-===PRO===
-[catalyst, risk/reward, entry strategy]"""
-        else:
-            prompt = f"""Financial analyst. Live market signal. 3 levels.
+        prompt = f"""Professional financial analyst. Pre-market analysis. Be specific and actionable.
 
 Stock: {symbol} ({company_name}) | Sector: {sector}
-Conviction: {conviction}
-News: {news if news else 'None'}
-Insider: {insider if insider else 'None'}
+Price: ${gap_data['prev_close'] if gap_data else 'N/A'}
+Yesterday: {gap_data['prev_day_change'] if gap_data else 'N/A':+}% | 5-Day: {gap_data['five_day_change'] if gap_data else 'N/A':+}%
+Volume Ratio: {gap_data['vol_ratio'] if gap_data else 'N/A'}x
+Conviction: {conviction} (Score drives this)
+{earnings_str}
+{analyst_str}
+{catalyst_str}
+{insider_str}
+Key Reasons: {' | '.join(reasons)}
 
 ===BEGINNER===
-[1-2 sentences plain language]
+[Max 2 sentences. What is happening and what to expect at open. No jargon.]
 ===INTERMEDIATE===
-[technical analysis]
+[Max 3 sentences. Technical setup + catalyst context + key price level to watch.]
 ===PRO===
-[professional analysis, risk/reward]"""
+[Max 4 sentences. Institutional probability, catalyst strength, risk/reward ratio, specific entry/stop/target levels in dollars.]"""
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -387,11 +471,11 @@ Insider: {insider if insider else 'None'}
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [
-                    {"role": "system", "content": "Financial analyst. Use exact format. Never change ===BEGINNER===, ===INTERMEDIATE===, ===PRO=== headers."},
+                    {"role": "system", "content": "You are a professional financial analyst. Use ONLY the exact format given. Never change headers. Be specific, not generic."},
                     {"role": "user", "content": prompt}
                 ],
-                "max_tokens": 500,
-                "temperature": 0.3
+                "max_tokens": 600,
+                "temperature": 0.2
             },
             timeout=15
         )
@@ -417,14 +501,177 @@ def parse_ai_levels(ai_text):
     return acemi, usta, pro
 
 
+def run_premarket_scan():
+    """
+    KARTAL GÖZÜ — Profesyonel pre-market tarama
+    Borsa açılmadan önce çalışır, sadece kataliz olan hisseleri tarar
+    """
+    print("\n" + "="*50)
+    print("🦅 KARTAL GÖZÜ — PRE-MARKET ANALIZ")
+    now_utc = datetime.now(timezone.utc)
+    minutes_to_open = int((13.5 - now_utc.hour - now_utc.minute / 60) * 60)
+    print(f"⏰ Acilisa {minutes_to_open} dakika var")
+    print("="*50)
+
+    # 1. BUGÜN EARNINGS AÇIKLAYACAKLAR
+    print("\n📅 Earnings takvimi kontrol ediliyor...")
+    earnings_today = get_earnings_today()
+    earnings_map = {e["symbol"]: e for e in earnings_today}
+
+    # 2. ANALIST UPGRADE/DOWNGRADE
+    print("📈 Analist aksiyonları kontrol ediliyor...")
+    upgrades_today = get_analyst_upgrades_today()
+    upgrades_map = {u["symbol"]: u for u in upgrades_today}
+
+    # 3. WATCHLIST + EARNINGS + UPGRADES BİRLEŞTİR
+    all_targets = set(list(avg_volumes.keys()) + list(earnings_map.keys()) + list(upgrades_map.keys()))
+    print(f"🔍 {len(all_targets)} hisse taranıyor (watchlist + earnings + upgrades)...")
+
+    signals = []
+
+    for symbol in all_targets:
+        try:
+            if symbol in premarket_signal_cache:
+                continue
+
+            # Şirket bilgisi
+            company = company_cache.get(symbol, {"name": "", "sector": ""})
+            company_name = company.get("name", "")
+            sector = company.get("sector", "")
+
+            # Earnings ve analist
+            earnings = earnings_map.get(symbol)
+            analyst_upgrade = upgrades_map.get(symbol)
+
+            # Haber katalizi
+            catalyst = get_news_catalyst(symbol)
+            time.sleep(0.05)
+
+            # Kataliz yok = atla
+            if not catalyst and not earnings and not analyst_upgrade:
+                continue
+
+            # Fiyat ve hacim verisi
+            gap_data = get_gap_data(symbol)
+            if not gap_data:
+                continue
+
+            # Fiyat aralığı kontrolü — $1-20
+            if not (1.0 <= gap_data["prev_close"] <= 20.0):
+                # Earnings varsa büyük hisseler de dahil
+                if not earnings:
+                    continue
+
+            # Insider
+            insider = get_insider_recent(symbol)
+
+            # PUANLAMA
+            conviction, reasons, score = calculate_premarket_score(
+                symbol, gap_data, catalyst, earnings, analyst_upgrade, insider
+            )
+
+            if conviction == "NORMAL":
+                continue
+
+            signals.append({
+                "symbol": symbol,
+                "company_name": company_name,
+                "sector": sector,
+                "gap_data": gap_data,
+                "catalyst": catalyst,
+                "earnings": earnings,
+                "analyst_upgrade": analyst_upgrade,
+                "insider": insider,
+                "conviction": conviction,
+                "reasons": reasons,
+                "score": score
+            })
+
+            print(f"  🎯 {symbol} ({company_name}) | {conviction} | Score: {score}")
+            for r in reasons:
+                print(f"     → {r}")
+
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"❌ {symbol}: {e}")
+            continue
+
+    # EN YÜKSEK PUANLILARI SEÇ — max 5 sinyal
+    signals.sort(key=lambda x: x["score"], reverse=True)
+    top_signals = signals[:5]
+
+    print(f"\n✅ {len(signals)} aday bulundu, en iyi {len(top_signals)} sinyal gönderiliyor...")
+
+    for sig in top_signals:
+        try:
+            symbol = sig["symbol"]
+            conviction = sig["conviction"]
+            gap_data = sig["gap_data"]
+            reasons = sig["reasons"]
+
+            ai_text = get_ai_premarket_explanation(
+                symbol, sig["company_name"], sig["sector"],
+                gap_data, sig["catalyst"], sig["earnings"],
+                sig["analyst_upgrade"], sig["insider"],
+                conviction, reasons
+            )
+            acemi, usta, pro = parse_ai_levels(ai_text)
+
+            emoji = "🔥" if conviction == "CRITICAL" else "⚡" if conviction == "HIGH" else "👁️"
+            description = f"{emoji} PRE-MARKET | {symbol}"
+            if sig["company_name"]:
+                description += f" ({sig['company_name']})"
+            description += f" | ${gap_data['prev_close']} | Dun: {gap_data['prev_day_change']:+}%"
+            if sig["catalyst"]:
+                description += f" | 📰 {sig['catalyst']['headline'][:60]}"
+            if sig["earnings"]:
+                description += f" | 📊 Earnings"
+            if sig["analyst_upgrade"]:
+                description += f" | 📈 {sig['analyst_upgrade']['firm']} {sig['analyst_upgrade']['action']}"
+
+            result = supabase.table("us_signals").insert({
+                "symbol": symbol,
+                "signal_type": "premarket",
+                "value": gap_data["prev_day_change"],
+                "description": description,
+                "acemi_explanation": acemi,
+                "usta_explanation": usta,
+                "pro_explanation": pro,
+                "price": gap_data["prev_close"],
+                "volume_ratio": gap_data["vol_ratio"],
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+
+            signal_id = result.data[0].get("id") if result.data else None
+            premarket_signal_cache[symbol] = time.time()
+
+            push_body = f"${gap_data['prev_close']} | {gap_data['prev_day_change']:+}% | {conviction}"
+            if sig["company_name"]:
+                push_body = f"{sig['company_name']} — {push_body}"
+
+            send_push_notification(
+                title=f"{emoji} {symbol} — Acilis Oncesi Sinyal",
+                body=push_body,
+                market="US",
+                signal_id=signal_id
+            )
+
+            print(f"✅ SINYAL: {description}")
+
+        except Exception as e:
+            print(f"❌ Sinyal kayıt hatası {sig['symbol']}: {e}")
+
+    print(f"\n🦅 Pre-market tarama tamamlandi. {len(top_signals)} sinyal gonderildi.")
+
+
+# ============================================================
+# CANLI MARKET — WEBSOCKET
+# ============================================================
+
 def get_last_signal_time(symbol):
     try:
-        r = supabase.table("us_signals") \
-            .select("created_at") \
-            .eq("symbol", symbol) \
-            .order("created_at", ascending=False) \
-            .limit(1) \
-            .execute()
+        r = supabase.table("us_signals").select("created_at").eq("symbol", symbol).order("created_at", ascending=False).limit(1).execute()
         if r.data:
             dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
             return dt.timestamp()
@@ -478,6 +725,104 @@ class VolumeTracker:
 tracker = VolumeTracker()
 
 
+def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
+    if not is_market_open():
+        return
+    if price < 1.0 or price > 20.0:
+        return
+    if price_change < 0:
+        return
+
+    now = time.time()
+    if symbol in signal_cache and now - signal_cache[symbol] < 3600:
+        return
+    last_time = get_last_signal_time(symbol)
+    if now - last_time < 3600:
+        signal_cache[symbol] = last_time
+        return
+
+    # Canlı sinyalde de kataliz kontrol et
+    catalyst = get_news_catalyst(symbol)
+    insider = get_insider_recent(symbol)
+    has_catalyst = bool(catalyst or insider)
+
+    score = 0
+    if abs(price_change) >= 10:
+        score += 3
+    elif abs(price_change) >= 5:
+        score += 2
+    elif abs(price_change) >= 3:
+        score += 1
+    if volume_ratio >= 10:
+        score += 3
+    elif volume_ratio >= 5:
+        score += 2
+    elif volume_ratio >= 2:
+        score += 1
+    if catalyst:
+        score += 3
+    if insider:
+        score += 2
+
+    conviction = "HIGH" if score >= 7 else "MEDIUM" if score >= 4 else "NORMAL"
+
+    # NORMAL + kataliz yok = sinyal yok
+    if conviction == "NORMAL" and not has_catalyst:
+        return
+
+    company = company_cache.get(symbol, {"name": "", "sector": ""})
+    company_name = company.get("name", "")
+    sector = company.get("sector", "")
+
+    print(f"📊 CANLI: {symbol} ({company_name}) | {conviction} | {price_change:+.1f}% | {volume_ratio:.1f}x")
+
+    emoji = "🔥" if conviction == "HIGH" else "⚡"
+    description = f"{emoji} {symbol}"
+    if company_name:
+        description += f" ({company_name})"
+    description += f" | ${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}"
+    if catalyst:
+        description += f" | 📰 {catalyst['headline'][:60]}"
+    if insider:
+        description += f" | 🐋 {insider}"
+
+    try:
+        result = supabase.table("us_signals").insert({
+            "symbol": symbol,
+            "signal_type": signal_type,
+            "value": round(price_change, 2),
+            "description": description,
+            "acemi_explanation": "",
+            "usta_explanation": "",
+            "pro_explanation": "",
+            "price": price,
+            "volume_ratio": round(volume_ratio, 2),
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+
+        signal_cache[symbol] = now
+        signal_id = result.data[0].get("id") if result.data else None
+        print(f"✅ KAYDEDİLDİ: {description}")
+
+        bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id)
+
+        push_body = f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x"
+        if company_name:
+            push_body = f"{company_name} — {push_body}"
+        send_push_notification(
+            title=f"{emoji} {symbol} — {conviction}",
+            body=push_body,
+            market="US",
+            signal_id=signal_id
+        )
+    except Exception as e:
+        print(f"❌ Kayıt hatası: {e}")
+
+
+# ============================================================
+# BOT — KURAL TABANLI
+# ============================================================
+
 def bot_should_buy(price_change, volume_ratio, conviction):
     if price_change < 0:
         return False
@@ -509,7 +854,7 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance):
             month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0).isoformat()
             month_trades = supabase.table("demo_trades").select("id").eq("user_id", user_id).gte("created_at", month_start).execute()
             if len(month_trades.data) >= 3:
-                print(f"⚠️ {user_id} aylık limit doldu")
+                print(f"⚠️ {user_id} aylik limit doldu")
                 return False
             open_trades = supabase.table("demo_trades").select("id").eq("user_id", user_id).eq("status", "open").execute()
             if len(open_trades.data) >= 1:
@@ -533,7 +878,7 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance):
             "balance": round(balance - invest, 2)
         }).eq("user_id", user_id).execute()
 
-        print(f"✅ BOT ALIM: {user_id} → {symbol} {quantity:.4f} lot @ ${price:.2f}")
+        print(f"✅ BOT ALIM: {user_id} → {symbol} @ ${price:.2f}")
         return True
     except Exception as e:
         print(f"❌ Bot alım hatası: {e}")
@@ -555,7 +900,7 @@ def bot_sell(trade, current_price):
             new_balance = portfolio.data["balance"] + (trade["quantity"] * current_price)
             supabase.table("demo_portfolios").update({"balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
 
-        print(f"✅ BOT SATIŞ: {trade['user_id']} → {trade['symbol']} | K/Z: ${profit_loss:.2f}")
+        print(f"✅ BOT SATIŞ: {trade['symbol']} | K/Z: ${profit_loss:.2f}")
     except Exception as e:
         print(f"❌ Bot satış hatası: {e}")
 
@@ -585,7 +930,6 @@ def bot_check_open_positions():
 def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id):
     try:
         if not bot_should_buy(price_change, volume_ratio, conviction):
-            print(f"🤖 Bot {symbol}: ALMA")
             return
         print(f"🤖 Bot {symbol}: AL")
 
@@ -606,192 +950,9 @@ def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, si
         print(f"❌ Bot sinyal işleme hatası: {e}")
 
 
-def run_premarket_scan():
-    print("\n🦅 KARTAL GÖZÜ — PRE-MARKET TARAMA BASLIYOR")
-    now_utc = datetime.now(timezone.utc)
-    minutes_to_open = int((13.5 - now_utc.hour - now_utc.minute / 60) * 60)
-    print(f"⏰ {datetime.now().strftime('%H:%M')} — Açılışa {minutes_to_open} dakika var")
-
-    candidates = list(avg_volumes.keys())
-    if not candidates:
-        print("⚠️ Watchlist boş")
-        return
-
-    signals_found = 0
-    print(f"🔍 {len(candidates)} hisse taranıyor...")
-
-    for symbol in candidates:
-        try:
-            if symbol in premarket_signal_cache:
-                continue
-
-            trend = get_5day_trend(symbol)
-            if not trend:
-                continue
-
-            if not (1.0 <= trend["last_close"] <= 20.0):
-                continue
-
-            news = get_news(symbol, days=2)
-            analyst = get_analyst_rating(symbol)
-            insider = get_insider(symbol)
-
-            conviction, reasons = premarket_conviction(trend, news, analyst, insider)
-
-            if conviction == "NORMAL":
-                continue
-
-            company = company_cache.get(symbol, {"name": "", "sector": ""})
-            company_name = company.get("name", "")
-            sector = company.get("sector", "")
-
-            print(f"\n🎯 {symbol} ({company_name}) | {conviction}")
-            for r in reasons:
-                print(f"   → {r}")
-
-            ai_text = get_ai_explanation(symbol, company_name, sector, trend, news, insider, analyst, conviction, reasons, is_premarket_signal=True)
-            acemi, usta, pro = parse_ai_levels(ai_text)
-
-            emoji = "🔥" if conviction == "CRITICAL" else "⚡" if conviction == "HIGH" else "👁️"
-            description = f"{emoji} PRE-MARKET | {symbol}"
-            if company_name:
-                description += f" ({company_name})"
-            description += f" | ${trend['last_close']} | Dün: {trend['prev_change']:+}% | 5g: {trend['5d_change']:+}%"
-            if news:
-                description += f" | 📰 {news[:80]}"
-
-            result = supabase.table("us_signals").insert({
-                "symbol": symbol,
-                "signal_type": "premarket",
-                "value": trend["prev_change"],
-                "description": description,
-                "acemi_explanation": acemi,
-                "usta_explanation": usta,
-                "pro_explanation": pro,
-                "price": trend["last_close"],
-                "volume_ratio": trend["vol_ratio"],
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }).execute()
-
-            signal_id = result.data[0].get("id") if result.data else None
-            premarket_signal_cache[symbol] = time.time()
-            signals_found += 1
-
-            push_body = f"${trend['last_close']} | Dün {trend['prev_change']:+}% | {conviction}"
-            if company_name:
-                push_body = f"{company_name} — {push_body}"
-
-            send_push_notification(
-                title=f"{emoji} {symbol} — Acilis Oncesi Sinyal",
-                body=push_body,
-                market="US",
-                signal_id=signal_id
-            )
-
-            print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
-            time.sleep(0.5)
-
-        except Exception as e:
-            print(f"❌ {symbol}: {e}")
-            continue
-
-    print(f"\n✅ Pre-market tarama bitti. {signals_found} sinyal.")
-
-
-def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
-    if not is_market_open():
-        return
-    if price < 1.0 or price > 20.0:
-        return
-    if price_change < 0:
-        return
-
-    now = time.time()
-    if symbol in signal_cache and now - signal_cache[symbol] < 3600:
-        return
-    last_time = get_last_signal_time(symbol)
-    if now - last_time < 3600:
-        signal_cache[symbol] = last_time
-        return
-
-    news = get_news(symbol)
-    insider = get_insider(symbol)
-    has_news = bool(news)
-
-    score = 0
-    if abs(price_change) >= 10:
-        score += 3
-    elif abs(price_change) >= 5:
-        score += 2
-    elif abs(price_change) >= 3:
-        score += 1
-    if volume_ratio >= 10:
-        score += 3
-    elif volume_ratio >= 5:
-        score += 2
-    elif volume_ratio >= 2:
-        score += 1
-    if has_news:
-        score += 3
-    if insider:
-        score += 2
-
-    conviction = "HIGH" if score >= 7 else "MEDIUM" if score >= 4 else "NORMAL"
-
-    if conviction == "NORMAL" and not has_news:
-        return
-
-    company = company_cache.get(symbol, {"name": "", "sector": ""})
-    company_name = company.get("name", "")
-    sector = company.get("sector", "")
-
-    print(f"📊 {symbol} ({company_name}) | {conviction} | {price_change:+.1f}% | {volume_ratio:.1f}x")
-
-    ai_text = get_ai_explanation(symbol, company_name, sector, None, news, insider, None, conviction, [], is_premarket_signal=False)
-    acemi, usta, pro = parse_ai_levels(ai_text)
-
-    emoji = "🔥" if conviction == "HIGH" else "⚡"
-    description = f"{emoji} {symbol}"
-    if company_name:
-        description += f" ({company_name})"
-    description += f" | ${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x | {conviction}"
-    if news:
-        description += f" | 📰 {news[:80]}"
-    if insider:
-        description += f" | 🐋 {insider}"
-
-    try:
-        result = supabase.table("us_signals").insert({
-            "symbol": symbol,
-            "signal_type": signal_type,
-            "value": round(price_change, 2),
-            "description": description,
-            "acemi_explanation": acemi,
-            "usta_explanation": usta,
-            "pro_explanation": pro,
-            "price": price,
-            "volume_ratio": round(volume_ratio, 2),
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
-
-        signal_cache[symbol] = now
-        signal_id = result.data[0].get("id") if result.data else None
-        print(f"✅ KAYDEDİLDİ [{conviction}]: {description}")
-
-        bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id)
-
-        push_body = f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x"
-        if company_name:
-            push_body = f"{company_name} — {push_body}"
-        send_push_notification(
-            title=f"{emoji} {symbol} — {conviction}",
-            body=push_body,
-            market="US",
-            signal_id=signal_id
-        )
-    except Exception as e:
-        print(f"❌ Kayıt hatası: {e}")
-
+# ============================================================
+# WEBSOCKET
+# ============================================================
 
 def on_message(ws, message):
     try:
@@ -817,7 +978,7 @@ def on_message(ws, message):
             elif volume_ratio >= 5 and price_change > 0:
                 process_live_signal(symbol, "volume_spike", price, price_change, volume_ratio)
     except Exception as e:
-        print(f"Mesaj hatası: {e}")
+        print(f"WS mesaj hatası: {e}")
 
 
 def on_open(ws):
@@ -847,21 +1008,22 @@ def connect_websocket():
     ws.run_forever()
 
 
+# ============================================================
+# ANA DONGU
+# ============================================================
+
 def start():
     global active_symbols
 
-    print("🚀 Atlas US Kartal Gözü baslatildi...")
+    print("🚀 Atlas US Kartal Gözü v2 baslatildi...")
     print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
-    # Supabase'den hızlı yükle
     active_symbols = load_watchlist_from_db()
-
     if not active_symbols:
-        print("⚠️ DB boş, yfinance ile yükleniyor...")
+        print("⚠️ DB bos, yfinance ile yukleniyor...")
         refresh_watchlist_background()
 
-    # Cache yükle
-    print("🔄 Sinyal cache yükleniyor...")
+    print("🔄 Sinyal cache yukleniyor...")
     try:
         since = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
         r = supabase.table("us_signals").select("symbol, created_at").gte("created_at", since).execute()
@@ -869,9 +1031,9 @@ def start():
             sym = row["symbol"]
             dt = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             signal_cache[sym] = dt.timestamp()
-        print(f"✅ {len(signal_cache)} sinyal cache'e yüklendi")
+        print(f"✅ {len(signal_cache)} sinyal cache'e yuklendi")
     except Exception as e:
-        print(f"⚠️ Cache yükleme hatası: {e}")
+        print(f"⚠️ Cache yukleme hatası: {e}")
 
     premarket_done = False
     last_watchlist_refresh = time.time()
@@ -882,7 +1044,7 @@ def start():
             hour = now_utc.hour
             minute = now_utc.minute
 
-            # Gece 02:00 UTC'de watchlist yenile
+            # Gece 02:00 UTC watchlist yenile
             if hour == 2 and minute < 5 and time.time() - last_watchlist_refresh > 3600:
                 print("🌙 Gece watchlist yenileniyor...")
                 refresh_watchlist_background()
@@ -890,22 +1052,25 @@ def start():
                 premarket_signal_cache.clear()
                 premarket_done = False
 
+            # PRE-MARKET — kartal gözü
             if is_premarket() and not premarket_done:
                 run_premarket_scan()
                 premarket_done = True
                 print("💤 Pre-market bitti. Açılış bekleniyor...")
                 time.sleep(300)
 
+            # BORSA ACIK — WebSocket
             elif is_market_open():
                 premarket_done = False
                 print(f"📡 WebSocket bağlanıyor... ({len(active_symbols)} hisse)")
                 connect_websocket()
 
+            # BORSA KAPALI
             else:
                 if hour == 21 and minute < 5:
                     bot_check_open_positions()
                     premarket_done = False
-                print(f"💤 Borsa kapalı. {now_utc.strftime('%H:%M UTC')}")
+                print(f"💤 Borsa kapali. {now_utc.strftime('%H:%M UTC')}")
                 time.sleep(300)
 
         except Exception as e:
