@@ -959,12 +959,17 @@ def on_open(ws):
 
 
 def on_error(ws, error):
-    print(f"❌ WebSocket hatası: {error}")
+    error_str = str(error)
+    if "429" in error_str:
+        print(f"⚠️ Rate limit — 20sn bekleniyor...")
+        time.sleep(20)
+    else:
+        print(f"❌ WebSocket hatası: {error}")
 
 
 def on_close(ws, close_status_code, close_msg):
-    print("🔌 Bağlantı kapandı, 5sn sonra yeniden...")
-    time.sleep(5)
+    print("🔌 Bağlantı kapandı, 10sn sonra yeniden...")
+    time.sleep(10)
     connect_websocket()
 
 
