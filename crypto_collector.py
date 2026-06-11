@@ -377,7 +377,12 @@ def scam_check(symbol, price, ch1h, ch24h, vol_chg, tech):
     # 7. 4 saatte sert düşüş
     if tech.get("ch4h", 0) < -10:
         return True, "4s %10+ düşüş — trend kötü"
-
+    if tech:
+        rsi = tech.get("rsi")
+        obv = tech.get("obv_trend")
+        if rsi and rsi > 80 and obv == "down":
+            return True, "RSI 80+ OBV düşüyor — dağıtım"
+        
     return False, ""
 
 
@@ -423,9 +428,13 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         layer = "BIRIKIM"
         reasons.append("🐋 OBV bullish diverjans — whale sessizce birikiyor")
     elif obv_trend == "up" and ch1h < 5:
-        score += 6
-        layer = "BIRIKIM"
-        reasons.append("🐋 OBV yükseliyor, fiyat sessiz — birikim")
+        if rsi and rsi > 70:
+            score += 2
+            reasons.append("📈 OBV yükseliyor ama RSI yüksek — momentum")
+        else:
+            score += 6
+            layer = "BIRIKIM"
+            reasons.append("🐋 OBV yükseliyor, fiyat sessiz — birikim")
     elif obv_trend == "up":
         score += 3
         reasons.append("📈 OBV yükseliyor — alım baskısı")
