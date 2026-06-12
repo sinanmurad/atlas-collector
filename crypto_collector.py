@@ -646,7 +646,7 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     # 4s hacim artışı (Binance/MEXC/Gate.io'dan)
     if vol_surge >= 3 and ch1h < 5:
         score += 3
-        if layer != "BIRIKIM":
+        if layer != "BIRIKIM" and obv_trend != "down":
             layer = "BIRIKIM"
         reasons.append(f"🐋 4s hacim {vol_surge:.1f}x — sessiz birikim")
     elif vol_surge >= 2:
