@@ -1313,7 +1313,7 @@ def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_i
         print(f"❌ Kripto bot: {e}")
 
 
-def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None):
+def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None, atr=0, reasons=None):
     try:
         if not is_pro:
             month_start = datetime.now(timezone.utc).replace(
@@ -1334,6 +1334,16 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
         if invest < 10:
             return
 
+        # ATR-bazlı stop/hedef — volatiliteye uyarlanır. ATR yoksa %8/%20 fallback.
+        if atr and atr > 0:
+            stop_price = round(price - atr * 1.5, 10)
+            target_price = round(price + atr * 3, 10)
+        else:
+            stop_price = round(price * 0.92, 10)
+            target_price = round(price * 1.20, 10)
+
+        entry_reason = " | ".join(reasons) if reasons else None
+
         supabase.table("demo_trades").insert({
             "user_id": user_id, "symbol": symbol, "market": "CRYPTO",
             "signal_id": signal_id, "buy_price": price,
@@ -1343,6 +1353,11 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
             "entry_rsi": rsi,
             "entry_obv": obv,
             "entry_conviction": conviction,
+            "entry_atr": atr,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "current_price": price,
+            "entry_reason": entry_reason,
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
 
@@ -1350,7 +1365,7 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
             "crypto_balance": round(balance - invest, 2)
         }).eq("user_id", user_id).execute()
 
-        print(f"  ✅ Bot alım: {user_id} → {symbol} ${invest:.0f} | {layer} | RSI:{rsi}")
+        print(f"  ✅ Bot alım: {user_id} → {symbol} ${invest:.0f} | {layer} | Stop:{stop_price} Hedef:{target_price}")
     except Exception as e:
         print(f"❌ Bot buy: {e}")
 
@@ -1368,12 +1383,30 @@ def crypto_bot_check_positions():
                 if not k:
                     continue
                 current = float(k[-1][4])
-                change = ((current - trade["buy_price"]) / trade["buy_price"]) * 100
-                take_profit = 20
-                stop_loss = -8
-                if change >= take_profit or change <= stop_loss:
-                    pl = (current - trade["buy_price"]) * trade["quantity"]
-                    exit_reason = "Kar Al (Take Profit)" if change >= take_profit else "Zarar Durdur (Stop Loss)"
+                buy_price = trade["buy_price"]
+                stop_price = trade.get("stop_price") or buy_price * 0.92
+                target_price = trade.get("target_price") or buy_price * 1.20
+                change = ((current - buy_price) / buy_price) * 100
+
+                # TRAILING STOP: fiyat hedefin %50'sine ulaştıysa,
+                # stop'u giriş fiyatına çek (kayıp riskini sıfırla, kârı kilitle)
+                halfway = buy_price + (target_price - buy_price) * 0.5
+                new_stop = stop_price
+                if current >= halfway and stop_price < buy_price:
+                    new_stop = buy_price
+                    print(f"  🔒 {trade['symbol']} stop giriş fiyatına çekildi (trailing)")
+
+                # Canlı fiyat ve stop'u her taramada güncelle
+                supabase.table("demo_trades").update({
+                    "current_price": current,
+                    "stop_price": new_stop,
+                }).eq("id", trade["id"]).execute()
+
+                if current >= target_price or current <= new_stop:
+                    pl = (current - buy_price) * trade["quantity"]
+                    exit_reason = "Hedef Vuruldu (Take Profit)" if current >= target_price else (
+                        "Trailing Stop — Kâr Korundu" if new_stop > buy_price else "Stop Loss"
+                    )
                     supabase.table("demo_trades").update({
                         "sell_price": current,
                         "sell_date": datetime.now(timezone.utc).isoformat(),
@@ -1389,7 +1422,7 @@ def crypto_bot_check_positions():
                             "crypto_balance": round(new_bal, 2)
                         }).eq("user_id", trade["user_id"]).execute()
                     action = "💰 KAR" if pl > 0 else "🛑 STOP"
-                    print(f"  {action}: {trade['symbol']} %{change:.1f} | ${pl:.2f}")
+                    print(f"  {action}: {trade['symbol']} %{change:.1f} | ${pl:.2f} | {exit_reason}")
             except:
                 continue
             time.sleep(0.3)
