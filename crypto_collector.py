@@ -1100,7 +1100,7 @@ def get_ai_explanation(s, fg):
             ps = f"${price:.2f}"
 
         stop = price * 0.92 if atr == 0 else price - atr * 1.5
-        target = price * 1.20 if atr == 0 else price + atr * 3
+        target = price * 1.40 if atr == 0 else price + atr * 8
         fg_str = f"{fg['value']} ({fg['label']})" if fg else "Veri yok"
 
         layer_ctx = {
@@ -1329,10 +1329,10 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
 
         if atr and atr > 0:
             stop_price = round(price - atr * 1.5, 10)
-            target_price = round(price + atr * 3, 10)
+            target_price = round(price + atr * 8, 10)
         else:
             stop_price = round(price * 0.92, 10)
-            target_price = round(price * 1.20, 10)
+            target_price = round(price * 1.40, 10)
 
         entry_reason = " | ".join(reasons) if reasons else None
         entry_ob_ratio = orderbook.get("bid_ask_ratio") if orderbook else None
