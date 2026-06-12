@@ -209,7 +209,7 @@ def get_klines(symbol, interval="4h", limit=100):
         r = requests.get(
             "https://api.mexc.com/api/v3/klines",
             params={"symbol": sym_usdt, "interval": interval, "limit": limit},
-            timeout=8
+            timeout=5
         )
         if r.status_code == 200:
             data = r.json()
@@ -225,13 +225,11 @@ def get_klines(symbol, interval="4h", limit=100):
         r = requests.get(
             "https://api.gateio.ws/api/v4/spot/candlesticks",
             params={"currency_pair": sym_gate, "interval": gate_interval, "limit": limit},
-            timeout=8
+            timeout=5
         )
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list) and len(data) > 10:
-                # Gate.io: [timestamp, volume, close, high, low, open]
-                # Binance formatına çevir: [time, open, high, low, close, volume]
                 converted = [
                     [int(c[0])*1000, c[5], c[3], c[4], c[2], c[1]]
                     for c in data
@@ -246,7 +244,7 @@ def get_klines(symbol, interval="4h", limit=100):
             r = requests.get(
                 f"{base_url}/api/v3/klines",
                 params={"symbol": sym_usdt, "interval": interval, "limit": limit},
-                timeout=8
+                timeout=5
             )
             if r.status_code == 200:
                 data = r.json()
@@ -259,17 +257,12 @@ def get_klines(symbol, interval="4h", limit=100):
 
 
 def get_orderbook_signal(symbol):
-    """
-    V6: MEXC order book derinliği — büyük alım/satım duvarlarını tespit eder.
-    Orta fiyatın ±%2'sindeki toplam bid/ask USD hacmini ve oranlarını döndürür.
-    Veri alınamazsa None döner (AI bu durumda order book'tan bahsetmez).
-    """
     sym_usdt = symbol.upper() + "USDT"
     try:
         r = requests.get(
             "https://api.mexc.com/api/v3/depth",
             params={"symbol": sym_usdt, "limit": 100},
-            timeout=8
+            timeout=5
         )
         if r.status_code != 200:
             return None
@@ -1390,10 +1383,10 @@ def crypto_bot_check_positions():
         print(f"🔍 {len(trades.data)} açık pozisyon kontrol...")
         for trade in trades.data:
             try:
-                k, _ = get_klines(trade["symbol"], "15m", 2)
-                if not k:
+                tech = get_technical_data(trade["symbol"])
+                if not tech:
                     continue
-                current = float(k[-1][4])
+                current = tech["price"]
                 buy_price = trade["buy_price"]
                 stop_price = trade.get("stop_price") or buy_price * 0.92
                 target_price = trade.get("target_price") or buy_price * 1.20
@@ -1401,19 +1394,17 @@ def crypto_bot_check_positions():
                 change = ((current - buy_price) / buy_price) * 100
 
                 # ── V11: DÖNÜŞ (REVERSAL) TESPİTİ ────────────────────
-                tech = get_technical_data(trade["symbol"])
                 reversal_reasons = []
 
-                if tech:
-                    # 1. OBV dönüşü: girişte up'tı, şimdi down
-                    if trade.get("entry_obv") == "up" and tech.get("obv_trend") == "down":
-                        reversal_reasons.append("OBV yön değiştirdi (birikim bitti)")
+                # 1. OBV dönüşü
+                if trade.get("entry_obv") == "up" and tech.get("obv_trend") == "down":
+                    reversal_reasons.append("OBV yön değiştirdi (birikim bitti)")
 
-                    # 2. RSI aşırı alımdan dönüş
-                    entry_rsi = trade.get("entry_rsi")
-                    cur_rsi = tech.get("rsi")
-                    if entry_rsi and cur_rsi and entry_rsi >= 70 and cur_rsi < 65:
-                        reversal_reasons.append(f"RSI {entry_rsi}→{cur_rsi} (momentum tepe yaptı)")
+                # 2. RSI aşırı alımdan dönüş
+                entry_rsi = trade.get("entry_rsi")
+                cur_rsi = tech.get("rsi")
+                if entry_rsi and cur_rsi and entry_rsi >= 70 and cur_rsi < 65:
+                    reversal_reasons.append(f"RSI {entry_rsi}→{cur_rsi} (momentum tepe yaptı)")
 
                 # 3. Order book tersine döndü
                 ob = get_orderbook_signal(trade["symbol"])
