@@ -33,6 +33,7 @@ from datetime import datetime, timezone, timedelta
 from supabase import create_client
 import firebase_admin
 from firebase_admin import credentials, messaging
+import threading
 
 # ============================================================
 # KURULUM
@@ -49,6 +50,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Hafızada cache
 signal_cache = {}       # Son 2 saatte sinyal verilen coinler
 watchlist_cache = {}    # İzleme havuzu (sembol → ilk görülme zamanı + veriler)
+balance_lock = threading.Lock()   # ← YENİ: bakiye okuma/yazma her zaman atomik
 
 try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
@@ -1255,7 +1257,8 @@ def save_and_push_signal(s, fg):
         crypto_bot_process(
             s["symbol"], price, s["conviction"],
             s["ch1h"], s["vol_chg"], s["layer"], sid,
-            s.get("rsi"), s.get("obv_trend")
+            s.get("rsi"), s.get("obv_trend"),
+            s.get("atr", 0), s.get("reasons"), s.get("orderbook")
         )
 
         send_push(
@@ -1290,7 +1293,7 @@ def crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
     return False
 
 
-def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id, rsi=None, obv=None):
+def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id, rsi=None, obv=None, atr=0, reasons=None, orderbook=None):
     try:
         if not crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
             return
@@ -1302,18 +1305,18 @@ def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_i
         for p in portfolios.data:
             user_id = p["user_id"]
             balance = p.get("crypto_balance", 0) or 0
-            if balance < 10:
+            if balance < 5:
                 continue
             profile = supabase.table("profiles").select("is_pro") \
                 .eq("id", user_id).limit(1).execute()
             is_pro = profile.data[0].get("is_pro", False) if profile.data else False
-            _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer, rsi, obv)
+            _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer, rsi, obv, atr, reasons, orderbook)
             time.sleep(0.2)
     except Exception as e:
         print(f"❌ Kripto bot: {e}")
 
 
-def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None, atr=0, reasons=None):
+def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None, atr=0, reasons=None, orderbook=None):
     try:
         if not is_pro:
             month_start = datetime.now(timezone.utc).replace(
@@ -1321,20 +1324,16 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
             mt = supabase.table("demo_trades").select("id") \
                 .eq("user_id", user_id).eq("market", "CRYPTO") \
                 .gte("created_at", month_start).execute()
-            if len(mt.data) >= 5:
+            if len(mt.data) >= 3:
                 return
             op = supabase.table("demo_trades").select("id") \
                 .eq("user_id", user_id).eq("market", "CRYPTO") \
                 .eq("status", "open").execute()
-            if len(op.data) >= 2:
+            if len(op.data) >= 3:
                 return
 
         pct = 0.20 if conviction == "CRITICAL" else 0.15 if conviction == "HIGH" else 0.10
-        invest = min(balance * pct, 200)
-        if invest < 10:
-            return
 
-        # ATR-bazlı stop/hedef — volatiliteye uyarlanır. ATR yoksa %8/%20 fallback.
         if atr and atr > 0:
             stop_price = round(price - atr * 1.5, 10)
             target_price = round(price + atr * 3, 10)
@@ -1343,27 +1342,39 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
             target_price = round(price * 1.20, 10)
 
         entry_reason = " | ".join(reasons) if reasons else None
+        entry_ob_ratio = orderbook.get("bid_ask_ratio") if orderbook else None
 
-        supabase.table("demo_trades").insert({
-            "user_id": user_id, "symbol": symbol, "market": "CRYPTO",
-            "signal_id": signal_id, "buy_price": price,
-            "buy_date": datetime.now(timezone.utc).isoformat(),
-            "quantity": round(invest / price, 6), "status": "open",
-            "signal_layer": layer,
-            "entry_rsi": rsi,
-            "entry_obv": obv,
-            "entry_conviction": conviction,
-            "entry_atr": atr,
-            "stop_price": stop_price,
-            "target_price": target_price,
-            "current_price": price,
-            "entry_reason": entry_reason,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
+        with balance_lock:
+            # Bakiyeyi tekrar oku — check_positions arada kapatmış olabilir
+            fresh = supabase.table("demo_portfolios").select("crypto_balance") \
+                .eq("user_id", user_id).limit(1).execute()
+            current_balance = fresh.data[0]["crypto_balance"] if fresh.data else balance
+            invest = min(current_balance * pct, 50)
+            if invest < 5:
+                return
 
-        supabase.table("demo_portfolios").update({
-            "crypto_balance": round(balance - invest, 2)
-        }).eq("user_id", user_id).execute()
+            supabase.table("demo_trades").insert({
+                "user_id": user_id, "symbol": symbol, "market": "CRYPTO",
+                "signal_id": signal_id, "buy_price": price,
+                "buy_date": datetime.now(timezone.utc).isoformat(),
+                "quantity": round(invest / price, 6), "status": "open",
+                "signal_layer": layer,
+                "entry_rsi": rsi,
+                "entry_obv": obv,
+                "entry_conviction": conviction,
+                "entry_atr": atr,
+                "entry_ob_ratio": entry_ob_ratio,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "current_price": price,
+                "peak_price": price,
+                "entry_reason": entry_reason,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+
+            supabase.table("demo_portfolios").update({
+                "crypto_balance": round(current_balance - invest, 2)
+            }).eq("user_id", user_id).execute()
 
         print(f"  ✅ Bot alım: {user_id} → {symbol} ${invest:.0f} | {layer} | Stop:{stop_price} Hedef:{target_price}")
     except Exception as e:
@@ -1386,27 +1397,78 @@ def crypto_bot_check_positions():
                 buy_price = trade["buy_price"]
                 stop_price = trade.get("stop_price") or buy_price * 0.92
                 target_price = trade.get("target_price") or buy_price * 1.20
+                peak_price = max(trade.get("peak_price") or buy_price, current)
                 change = ((current - buy_price) / buy_price) * 100
 
-                # TRAILING STOP: fiyat hedefin %50'sine ulaştıysa,
-                # stop'u giriş fiyatına çek (kayıp riskini sıfırla, kârı kilitle)
+                # ── V11: DÖNÜŞ (REVERSAL) TESPİTİ ────────────────────
+                tech = get_technical_data(trade["symbol"])
+                reversal_reasons = []
+
+                if tech:
+                    # 1. OBV dönüşü: girişte up'tı, şimdi down
+                    if trade.get("entry_obv") == "up" and tech.get("obv_trend") == "down":
+                        reversal_reasons.append("OBV yön değiştirdi (birikim bitti)")
+
+                    # 2. RSI aşırı alımdan dönüş
+                    entry_rsi = trade.get("entry_rsi")
+                    cur_rsi = tech.get("rsi")
+                    if entry_rsi and cur_rsi and entry_rsi >= 70 and cur_rsi < 65:
+                        reversal_reasons.append(f"RSI {entry_rsi}→{cur_rsi} (momentum tepe yaptı)")
+
+                # 3. Order book tersine döndü
+                ob = get_orderbook_signal(trade["symbol"])
+                entry_ob = trade.get("entry_ob_ratio")
+                if ob and entry_ob and entry_ob >= 1.5 and ob.get("bid_ask_ratio", 0) <= 0.7:
+                    reversal_reasons.append(f"Order book tersine döndü ({entry_ob}x→{ob['bid_ask_ratio']}x)")
+
+                # 4. Zirveden %5+ geri çekilme (kâr varken)
+                if peak_price > buy_price:
+                    drawdown = ((peak_price - current) / peak_price) * 100
+                    if drawdown >= 5 and current > buy_price:
+                        reversal_reasons.append(f"Zirveden %{drawdown:.1f} geri çekildi")
+
+                # Trailing stop: hedefin yarısına ulaştıysa stop'u girişe çek
                 halfway = buy_price + (target_price - buy_price) * 0.5
                 new_stop = stop_price
                 if current >= halfway and stop_price < buy_price:
                     new_stop = buy_price
-                    print(f"  🔒 {trade['symbol']} stop giriş fiyatına çekildi (trailing)")
 
-                # Canlı fiyat ve stop'u her taramada güncelle
+                # Canlı veriyi güncelle
                 supabase.table("demo_trades").update({
                     "current_price": current,
+                    "peak_price": peak_price,
                     "stop_price": new_stop,
                 }).eq("id", trade["id"]).execute()
 
-                if current >= target_price or current <= new_stop:
-                    pl = (current - buy_price) * trade["quantity"]
-                    exit_reason = "Hedef Vuruldu (Take Profit)" if current >= target_price else (
-                        "Trailing Stop — Kâr Korundu" if new_stop > buy_price else "Stop Loss"
+                # ── SAT PUSH — reversal varsa, henüz kapatmadan uyar ──
+                if reversal_reasons and not trade.get("sell_warning_sent"):
+                    reason_str = " | ".join(reversal_reasons)
+                    send_push(
+                        title=f"⚠️ SAT — {trade['symbol']}",
+                        body=f"%{change:+.1f} | {reason_str}",
+                        signal_id=trade.get("signal_id")
                     )
+                    supabase.table("demo_trades").update({
+                        "sell_warning_sent": True,
+                        "exit_reason": f"Erken uyarı: {reason_str}"
+                    }).eq("id", trade["id"]).execute()
+                    print(f"  ⚠️ SAT UYARISI: {trade['symbol']} — {reason_str}")
+
+                # ── Hedef/Stop/Reversal+kâr → kapat ───────────────────
+                should_close = current >= target_price or current <= new_stop or \
+                    (reversal_reasons and current > buy_price)
+
+                if should_close:
+                    pl = (current - buy_price) * trade["quantity"]
+                    if current >= target_price:
+                        exit_reason = "Hedef Vuruldu (Take Profit)"
+                    elif reversal_reasons and current > buy_price:
+                        exit_reason = f"Dönüş tespit edildi, kârla kapatıldı: {' | '.join(reversal_reasons)}"
+                    elif new_stop > buy_price:
+                        exit_reason = "Trailing Stop — Kâr Korundu"
+                    else:
+                        exit_reason = "Stop Loss"
+
                     supabase.table("demo_trades").update({
                         "sell_price": current,
                         "sell_date": datetime.now(timezone.utc).isoformat(),
@@ -1414,16 +1476,26 @@ def crypto_bot_check_positions():
                         "profit_loss": round(pl, 2),
                         "exit_reason": exit_reason
                     }).eq("id", trade["id"]).execute()
-                    port = supabase.table("demo_portfolios").select("crypto_balance") \
-                        .eq("user_id", trade["user_id"]).limit(1).execute()
-                    if port.data:
-                        new_bal = port.data[0]["crypto_balance"] + (trade["quantity"] * current)
-                        supabase.table("demo_portfolios").update({
-                            "crypto_balance": round(new_bal, 2)
-                        }).eq("user_id", trade["user_id"]).execute()
+
+                    with balance_lock:
+                        port = supabase.table("demo_portfolios").select("crypto_balance") \
+                            .eq("user_id", trade["user_id"]).limit(1).execute()
+                        if port.data:
+                            new_bal = port.data[0]["crypto_balance"] + (trade["quantity"] * current)
+                            supabase.table("demo_portfolios").update({
+                                "crypto_balance": round(new_bal, 2)
+                            }).eq("user_id", trade["user_id"]).execute()
+
                     action = "💰 KAR" if pl > 0 else "🛑 STOP"
                     print(f"  {action}: {trade['symbol']} %{change:.1f} | ${pl:.2f} | {exit_reason}")
-            except:
+
+                    send_push(
+                        title=f"{'💰' if pl>0 else '🛑'} KAPANDI — {trade['symbol']}",
+                        body=f"%{change:+.1f} | ${pl:.2f} | {exit_reason}",
+                        signal_id=trade.get("signal_id")
+                    )
+            except Exception as e:
+                print(f"⚠️ {trade['symbol']} pozisyon kontrol hatası: {e}")
                 continue
             time.sleep(0.3)
     except Exception as e:
@@ -1442,6 +1514,17 @@ def get_last_signal_time(symbol):
     except:
         return 0
 
+# ============================================================
+# V11: POZİSYON İZLEME — AYRI THREAD (10s)
+# ============================================================
+
+def position_monitor_loop():
+    while True:
+        try:
+            crypto_bot_check_positions()
+        except Exception as e:
+            print(f"❌ Pozisyon izleme thread: {e}")
+        time.sleep(10)
 
 # ============================================================
 # ANA TARAMA
@@ -1451,11 +1534,11 @@ def scan_once(scan_count=0):
     print(f"\n🦅 KARTAL GÖZÜ v4 — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     print("=" * 55)
 
-    # Her 3 taramada bir pozisyon, sonuç takibi ve istatistik raporu
+    # Pozisyon izleme ayrı thread'de (10s). Burada sadece sonuç takibi/rapor.
     if scan_count % 3 == 0:
-        crypto_bot_check_positions()
         check_signal_outcomes()
         generate_pattern_report()
+
 
     fg = get_fear_greed()
     if fg:
@@ -1591,7 +1674,7 @@ def scan_once(scan_count=0):
 # ============================================================
 
 def main():
-    print("🚀 Atlas Kripto Kartal Gözü — v4 (V5+V6+V8)")
+    print("🚀 Atlas Kripto Kartal Gözü — v4 (V5+V6+V8+V11)")
     print("🎯 MEXC + Gate.io + Binance + CMC | RSI | OBV | Order Book | Watchlist | Scam Filter | Outcome Tracking")
     print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
@@ -1617,6 +1700,10 @@ def main():
         print("✅ signal_outcomes tablosu hazır")
     except Exception as e:
         print(f"⚠️ signal_outcomes tablosu yok: {e}")
+
+    monitor_thread = threading.Thread(target=position_monitor_loop, daemon=True)
+    monitor_thread.start()
+    print("👁️ Pozisyon izleme thread'i başlatıldı (10s aralık)")
 
     scan_count = 0
     while True:
