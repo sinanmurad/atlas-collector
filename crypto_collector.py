@@ -957,7 +957,8 @@ def save_and_push_signal(s, fg):
         # Bot işle
         crypto_bot_process(
             s["symbol"], price, s["conviction"],
-            s["ch1h"], s["vol_chg"], s["layer"], sid
+            s["ch1h"], s["vol_chg"], s["layer"], sid,
+            s.get("rsi"), s.get("obv_trend")
         )
 
         send_push(
@@ -992,7 +993,7 @@ def crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
     return False
 
 
-def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id):
+def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id, rsi=None, obv=None):
     try:
         if not crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
             return
@@ -1009,13 +1010,12 @@ def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_i
             profile = supabase.table("profiles").select("is_pro") \
                 .eq("id", user_id).limit(1).execute()
             is_pro = profile.data[0].get("is_pro", False) if profile.data else False
-            _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction)
+            _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer, rsi, obv)
             time.sleep(0.2)
     except Exception as e:
         print(f"❌ Kripto bot: {e}")
 
-
-def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction):
+def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None):
     try:
         if not is_pro:
             month_start = datetime.now(timezone.utc).replace(
@@ -1041,6 +1041,10 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
             "signal_id": signal_id, "buy_price": price,
             "buy_date": datetime.now(timezone.utc).isoformat(),
             "quantity": round(invest / price, 6), "status": "open",
+            "signal_layer": layer,
+            "entry_rsi": rsi,
+            "entry_obv": obv,
+            "entry_conviction": conviction,
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
 
@@ -1048,7 +1052,7 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
             "crypto_balance": round(balance - invest, 2)
         }).eq("user_id", user_id).execute()
 
-        print(f"  ✅ Bot alım: {user_id} → {symbol} ${invest:.0f}")
+        print(f"  ✅ Bot alım: {user_id} → {symbol} ${invest:.0f} | {layer} | RSI:{rsi}")
     except Exception as e:
         print(f"❌ Bot buy: {e}")
 
@@ -1071,11 +1075,13 @@ def crypto_bot_check_positions():
                 stop_loss = -8
                 if change >= take_profit or change <= stop_loss:
                     pl = (current - trade["buy_price"]) * trade["quantity"]
+                    exit_reason = "Kar Al (Take Profit)" if change >= take_profit else "Zarar Durdur (Stop Loss)"
                     supabase.table("demo_trades").update({
                         "sell_price": current,
                         "sell_date": datetime.now(timezone.utc).isoformat(),
                         "status": "closed",
-                        "profit_loss": round(pl, 2)
+                        "profit_loss": round(pl, 2),
+                        "exit_reason": exit_reason
                     }).eq("id", trade["id"]).execute()
                     port = supabase.table("demo_portfolios").select("crypto_balance") \
                         .eq("user_id", trade["user_id"]).limit(1).execute()
@@ -1091,7 +1097,6 @@ def crypto_bot_check_positions():
             time.sleep(0.3)
     except Exception as e:
         print(f"❌ Pozisyon kontrol: {e}")
-
 
 def get_last_signal_time(symbol):
     try:
