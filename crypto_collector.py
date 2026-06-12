@@ -6,7 +6,7 @@ HAVUZ 1 — ANLIK SİNYAL: Günde 1-5 coin, hepsi kazanacak
 HAVUZ 2 — İZLEME: Yeni/genç coinler, aylar boyu takip, olgunlaşınca sinyal
 
 VERİ KAYNAKLARI (hepsi ücretsiz, API key yok):
-- MEXC  : api.mexc.com/api/v3/ticker/24hr + klines
+- MEXC  : api.mexc.com/api/v3/ticker/24hr + klines + depth
 - Gate.io: api.gateio.ws/api/v4/spot/tickers + candlesticks
 - Binance: api1-4.binance.com/api/v3/klines
 - CMC    : listings/latest (Basic plan)
@@ -18,12 +18,17 @@ SCAM FİLTRESİ:
 - OBV vs hacim çelişkisi
 - Likidite kontrolü
 - Geç giriş koruması
+
+V5: Sinyal sonuç takibi (24s/72s/7g) + geçmiş başarı oranı
+V6: Order book duvar analizi
+V8: Periyodik istatistik raporu (en iyi/zayıf paternler)
 """
 
 import os
 import json
 import time
 import requests
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
 import firebase_admin
@@ -251,6 +256,43 @@ def get_klines(symbol, interval="4h", limit=100):
     return None, None
 
 
+def get_orderbook_signal(symbol):
+    """
+    V6: MEXC order book derinliği — büyük alım/satım duvarlarını tespit eder.
+    Orta fiyatın ±%2'sindeki toplam bid/ask USD hacmini ve oranlarını döndürür.
+    Veri alınamazsa None döner (AI bu durumda order book'tan bahsetmez).
+    """
+    sym_usdt = symbol.upper() + "USDT"
+    try:
+        r = requests.get(
+            "https://api.mexc.com/api/v3/depth",
+            params={"symbol": sym_usdt, "limit": 100},
+            timeout=8
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        if not bids or not asks:
+            return None
+
+        mid_price = (float(bids[0][0]) + float(asks[0][0])) / 2
+
+        bid_wall = sum(float(p) * float(q) for p, q in bids if float(p) >= mid_price * 0.98)
+        ask_wall = sum(float(p) * float(q) for p, q in asks if float(p) <= mid_price * 1.02)
+
+        ratio = bid_wall / ask_wall if ask_wall > 0 else 0
+
+        return {
+            "bid_wall_usd": round(bid_wall, 2),
+            "ask_wall_usd": round(ask_wall, 2),
+            "bid_ask_ratio": round(ratio, 2),
+        }
+    except:
+        return None
+
+
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -382,8 +424,147 @@ def scam_check(symbol, price, ch1h, ch24h, vol_chg, tech):
         obv = tech.get("obv_trend")
         if rsi and rsi > 80 and obv == "down":
             return True, "RSI 80+ OBV düşüyor — dağıtım"
-        
+
     return False, ""
+
+
+# ============================================================
+# V5: SİNYAL SONUÇ TAKİBİ
+# ============================================================
+
+def check_signal_outcomes():
+    """24s/72s/7g sonra sinyal sonuçlarını ölç"""
+    try:
+        now = datetime.now(timezone.utc)
+        for hours, field in [(24, "24h"), (72, "72h"), (24*7, "7d")]:
+            cutoff = (now - timedelta(hours=hours)).isoformat()
+            rows = supabase.table("signal_outcomes") \
+                .select("*") \
+                .eq(f"checked_{field}", False) \
+                .lte("created_at", cutoff) \
+                .limit(20).execute()
+            if not rows.data:
+                continue
+            print(f"📈 {len(rows.data)} sinyal için {field} sonuç ölçülüyor...")
+            for row in rows.data:
+                try:
+                    k, _ = get_klines(row["symbol"], "1h", 2)
+                    if not k:
+                        supabase.table("signal_outcomes").update({
+                            f"checked_{field}": True
+                        }).eq("id", row["id"]).execute()
+                        continue
+                    current = float(k[-1][4])
+                    entry = row["entry_price"]
+                    pct = ((current - entry) / entry) * 100 if entry > 0 else 0
+                    supabase.table("signal_outcomes").update({
+                        f"price_{field}": current,
+                        f"pct_{field}": round(pct, 2),
+                        f"checked_{field}": True
+                    }).eq("id", row["id"]).execute()
+                except:
+                    continue
+                time.sleep(0.3)
+    except Exception as e:
+        print(f"❌ Outcome check: {e}")
+
+
+def get_historical_success_rate(rsi, obv_trend, layer):
+    """
+    Geçmiş sinyallerden, benzer RSI/OBV/layer kombinasyonunun
+    24s içinde kâr getirme oranını döndürür.
+    Yetersiz veri (min 5 örnek) varsa None döner.
+    """
+    try:
+        if rsi is None:
+            rsi_min, rsi_max = 0, 100
+        elif rsi < 30:
+            rsi_min, rsi_max = 0, 30
+        elif rsi < 50:
+            rsi_min, rsi_max = 30, 50
+        elif rsi < 70:
+            rsi_min, rsi_max = 50, 70
+        else:
+            rsi_min, rsi_max = 70, 100
+
+        rows = supabase.table("signal_outcomes") \
+            .select("pct_24h") \
+            .eq("layer", layer) \
+            .eq("entry_obv", obv_trend) \
+            .gte("entry_rsi", rsi_min) \
+            .lt("entry_rsi", rsi_max) \
+            .eq("checked_24h", True) \
+            .not_.is_("pct_24h", "null") \
+            .execute()
+
+        if not rows.data or len(rows.data) < 5:
+            return None
+
+        wins = sum(1 for r in rows.data if r["pct_24h"] and r["pct_24h"] > 2)
+        total = len(rows.data)
+        return {"rate": round(wins / total * 100, 1), "sample": total}
+    except Exception as e:
+        print(f"⚠️ Success rate: {e}")
+        return None
+
+
+# ============================================================
+# V8: İSTATİSTİK RAPORU
+# ============================================================
+
+def generate_pattern_report():
+    """
+    signal_outcomes verisinden RSI bucket + OBV + layer kombinasyonlarının
+    24s başarı oranlarını çıkarır. SADECE konsola loglar (uydurma yok,
+    tamamen gerçek veri). Min 20 toplam örnek + min 5 örnek/grup gerekir.
+    """
+    try:
+        rows = supabase.table("signal_outcomes") \
+            .select("layer, entry_rsi, entry_obv, pct_24h") \
+            .eq("checked_24h", True) \
+            .not_.is_("pct_24h", "null") \
+            .execute()
+        if not rows.data or len(rows.data) < 20:
+            print(f"📊 V8: Yeterli veri yok ({len(rows.data) if rows.data else 0}/20)")
+            return
+
+        groups = defaultdict(list)
+        for r in rows.data:
+            rsi = r.get("entry_rsi")
+            if rsi is None:
+                bucket = "RSI:?"
+            elif rsi < 30:
+                bucket = "RSI<30"
+            elif rsi < 50:
+                bucket = "RSI30-50"
+            elif rsi < 70:
+                bucket = "RSI50-70"
+            else:
+                bucket = "RSI70+"
+            key = f"{r['layer']} | {bucket} | OBV:{r['entry_obv']}"
+            groups[key].append(r["pct_24h"])
+
+        results = []
+        for key, vals in groups.items():
+            if len(vals) < 5:
+                continue
+            win_rate = sum(1 for v in vals if v > 2) / len(vals) * 100
+            avg = sum(vals) / len(vals)
+            results.append({"key": key, "win_rate": round(win_rate, 1), "avg": round(avg, 2), "n": len(vals)})
+
+        if not results:
+            print("📊 V8: Hiçbir grup min 5 örneğe ulaşmadı")
+            return
+
+        results.sort(key=lambda x: x["win_rate"], reverse=True)
+        best = results[0]
+        worst = results[-1]
+
+        print(f"📊 V8 EN İYİ PATERN: {best['key']} → %{best['win_rate']} başarı (ort %{best['avg']}, n={best['n']})")
+        if worst["key"] != best["key"]:
+            print(f"📊 V8 EN ZAYIF PATERN: {worst['key']} → %{worst['win_rate']} başarı (ort %{worst['avg']}, n={worst['n']})")
+    except Exception as e:
+        print(f"❌ V8 pattern: {e}")
 
 
 # ============================================================
@@ -391,7 +572,7 @@ def scam_check(symbol, price, ch1h, ch24h, vol_chg, tech):
 # ============================================================
 
 def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
-               vol_chg, mcap, cmc_rank, tech, fg):
+               vol_chg, mcap, cmc_rank, tech, fg, orderbook=None):
     """
     Tüm sinyalleri birleştir. Minimum 5 bağımsız sinyal gerekli.
     """
@@ -424,10 +605,9 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     # OBV aşağı ise BİRİKİM olamaz
     if obv_trend == "down":
         layer = "MOMENTUM"
-                   
+
     # ── OBV ──────────────────────────────────────────────────
     if obv_div:
-        # Bullish diverjans: fiyat düşerken OBV yükseliyor = en güçlü birikim sinyali
         score += 8
         layer = "BIRIKIM"
         reasons.append("🐋 OBV bullish diverjans — whale sessizce birikiyor")
@@ -533,7 +713,32 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
             score += 2
             reasons.append(f"😟 Korku ({fg['value']})")
         elif fg["value"] >= 80:
-            score -= 1  # Açgözlülük = dikkat
+            score -= 1
+
+    # ── V6: ORDER BOOK ───────────────────────────────────────
+    if orderbook:
+        ratio = orderbook.get("bid_ask_ratio", 0)
+        bid_wall = orderbook.get("bid_wall_usd", 0)
+        ask_wall = orderbook.get("ask_wall_usd", 0)
+        if ratio >= 2 and bid_wall >= 20000:
+            score += 4
+            reasons.append(f"🧱 Alım duvarı ${bid_wall/1000:.0f}K — bid/ask {ratio}x")
+        elif ratio >= 1.5:
+            score += 2
+            reasons.append(f"📥 Alım baskısı — bid/ask {ratio}x")
+        elif ratio <= 0.5 and ask_wall >= 20000:
+            score -= 3
+            reasons.append(f"🧱 Satış duvarı tespit edildi — bid/ask {ratio}x")
+
+    # ── V5: GEÇMİŞ BAŞARI ORANI ──────────────────────────────
+    hist = get_historical_success_rate(rsi, obv_trend, layer)
+    if hist:
+        if hist["rate"] >= 70:
+            score += 3
+            reasons.append(f"📊 Geçmiş başarı: %{hist['rate']} ({hist['sample']} sinyal)")
+        elif hist["rate"] <= 30:
+            score -= 3
+            reasons.append(f"⚠️ Geçmiş başarı düşük: %{hist['rate']} ({hist['sample']} sinyal)")
 
     if score < 6:
         return None
@@ -555,6 +760,7 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         "rsi": rsi, "obv_trend": obv_trend, "obv_div": obv_div,
         "atr": tech.get("atr", 0) if tech else 0,
         "exchange": tech.get("exchange", "?") if tech else "?",
+        "orderbook": orderbook,
         "conviction": conviction, "reasons": reasons,
         "score": score, "layer": layer,
     }
@@ -570,8 +776,6 @@ def watchlist_update(symbol, price, ch1h, ch24h, vol_chg, tech, source):
     Scam değilse ve potansiyel varsa izle.
     """
     try:
-        now = time.time()
-
         # Scam kontrolü
         is_scam, reason = scam_check(symbol, price, ch1h, ch24h, vol_chg, tech)
         if is_scam:
@@ -680,6 +884,8 @@ def watchlist_check_signals(fg):
                     )
                     days_watched = (datetime.now(timezone.utc) - first_seen).days
 
+                    orderbook = get_orderbook_signal(symbol)
+
                     signals.append({
                         "symbol": symbol,
                         "name": symbol,
@@ -696,6 +902,7 @@ def watchlist_check_signals(fg):
                         "obv_div": obv_div,
                         "atr": tech.get("atr", 0),
                         "exchange": tech.get("exchange", "?"),
+                        "orderbook": orderbook,
                         "conviction": "HIGH",
                         "reasons": [
                             f"👁️ {days_watched} gün izlendi",
@@ -845,7 +1052,7 @@ def get_ai_explanation(s, fg):
 
         stop = price * 0.92 if atr == 0 else price - atr * 1.5
         target = price * 1.20 if atr == 0 else price + atr * 3
-        fg_str = f"{fg['value']} ({fg['label']})" if fg else "N/A"
+        fg_str = f"{fg['value']} ({fg['label']})" if fg else "Veri yok"
 
         layer_ctx = {
             "BIRIKIM": "BİRİKİM: Whale sessizce giriyor, fiyat henüz oynamamış.",
@@ -853,22 +1060,44 @@ def get_ai_explanation(s, fg):
             "WATCHLIST": "İZLEME: Uzun süredir takip ediliyordu, şimdi sinyal verdi.",
         }.get(s.get("layer", "MOMENTUM"), "")
 
+        # V5: Geçmiş başarı oranı — veri yoksa AI'ya "yetersiz veri" olarak bildirilir
+        hist = get_historical_success_rate(s.get("rsi"), s.get("obv_trend"), s.get("layer"))
+        hist_str = f"Geçmiş başarı oranı: %{hist['rate']} ({hist['sample']} sinyal)" if hist else "Geçmiş veri henüz yetersiz (bu konudan bahsetme)"
+
+        # V6: Order book — veri yoksa belirtilir
+        ob = s.get("orderbook")
+        if ob:
+            ob_str = f"Order book: bid/ask oranı {ob['bid_ask_ratio']}x, alım duvarı ${ob['bid_wall_usd']/1000:.0f}K, satış duvarı ${ob['ask_wall_usd']/1000:.0f}K"
+        else:
+            ob_str = "Order book verisi yok (bu konudan bahsetme)"
+
+        # RSI/OBV None ise AI'ya net şekilde bildir
+        rsi_str = f"{s['rsi']}" if s['rsi'] is not None else "VERİ YOK"
+        obv_str = s['obv_trend'] if s['obv_trend'] is not None else "VERİ YOK"
+
         prompt = f"""Profesyonel kripto analistisin. Türkçe. Kısa ve net.
 
+KESİN KURAL: SADECE aşağıda verilen sayısal/metinsel verilere dayanarak yorum yap.
+Bir veri "VERİ YOK" veya "bahsetme" notuyla işaretliyse, o konuda HİÇBİR yorum yapma,
+varsayımda bulunma, tahmin etme veya genel/klişe cümle kurma. Sadece elindeki
+gerçek sayılarla konuş.
+
 {s['symbol']} | {ps} | 1s:%{s['ch1h']:.1f} | 4s:%{s['ch4h']:.1f} | 24s:%{s['ch24h']:.1f}
-Hacim:%{s['vol_chg']:.0f} | RSI:{s['rsi'] or '?'} | OBV:{s['obv_trend'] or '?'}
-Güven:{s['conviction']} | {s.get('layer','?')} | Borsa:{s.get('exchange','?')}
+Hacim:%{s['vol_chg']:.0f} | RSI:{rsi_str} | OBV:{obv_str}
+Güven:{s['conviction']} | Katman:{s.get('layer','?')} | Borsa:{s.get('exchange','?')}
 Korku/Açgözlülük:{fg_str}
 Stop:{stop:.8f} | Hedef:{target:.8f}
 {layer_ctx}
-Sinyaller: {' | '.join(s['reasons'])}
+{hist_str}
+{ob_str}
+Tespit edilen sinyaller: {' | '.join(s['reasons']) if s['reasons'] else 'Yok'}
 
 ===ACEMİ===
-[Maks 2 cümle. Neden hareket ediyor, ne yapmalı. P&D riskini belirt.]
+[Maks 2 cümle. Sadece yukarıdaki gerçek verilere göre neden hareket ediyor, ne yapmalı. P&D riskini belirt.]
 ===USTA===
-[Maks 3 cümle. RSI/OBV yorumu, kritik seviye, hedef.]
+[Maks 3 cümle. Sadece mevcut RSI/OBV/order book verilerine göre yorum, kritik seviye, hedef.]
 ===PRO===
-[Maks 4 cümle. Whale güveni(1-10), P&D riski(1-10), risk/ödül, giriş/stop/hedef $.]"""
+[Maks 4 cümle. Sadece mevcut verilere göre whale/order book güveni(1-10), P&D riski(1-10), risk/ödül, giriş/stop/hedef $.]"""
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -876,7 +1105,7 @@ Sinyaller: {' | '.join(s['reasons'])}
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [
-                    {"role": "system", "content": "Kripto analistisin. Formatı değiştirme. P&D riskini belirt. Türkçe."},
+                    {"role": "system", "content": "Kripto analistisin. SADECE sana verilen sayısal/metinsel verilere dayan. 'VERİ YOK' veya 'bahsetme' işaretli hiçbir konuda yorum yapma, varsayım yapma, genel/uydurma cümle kurma. Formatı değiştirme. P&D riskini belirt. Türkçe."},
                     {"role": "user", "content": prompt}
                 ],
                 "max_tokens": 600, "temperature": 0.2
@@ -1029,6 +1258,7 @@ def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_i
     except Exception as e:
         print(f"❌ Kripto bot: {e}")
 
+
 def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None):
     try:
         if not is_pro:
@@ -1112,6 +1342,7 @@ def crypto_bot_check_positions():
     except Exception as e:
         print(f"❌ Pozisyon kontrol: {e}")
 
+
 def get_last_signal_time(symbol):
     try:
         r = supabase.table("crypto_signals").select("created_at") \
@@ -1123,44 +1354,7 @@ def get_last_signal_time(symbol):
         return 0
     except:
         return 0
-    
 
-
-def check_signal_outcomes():
-    """24s/72s/7g sonra sinyal sonuçlarını ölç"""
-    try:
-        now = datetime.now(timezone.utc)
-        for hours, field in [(24, "24h"), (72, "72h"), (24*7, "7d")]:
-            cutoff = (now - timedelta(hours=hours)).isoformat()
-            rows = supabase.table("signal_outcomes") \
-                .select("*") \
-                .eq(f"checked_{field}", False) \
-                .lte("created_at", cutoff) \
-                .limit(20).execute()
-            if not rows.data:
-                continue
-            print(f"📈 {len(rows.data)} sinyal için {field} sonuç ölçülüyor...")
-            for row in rows.data:
-                try:
-                    k, _ = get_klines(row["symbol"], "1h", 2)
-                    if not k:
-                        supabase.table("signal_outcomes").update({
-                            f"checked_{field}": True
-                        }).eq("id", row["id"]).execute()
-                        continue
-                    current = float(k[-1][4])
-                    entry = row["entry_price"]
-                    pct = ((current - entry) / entry) * 100 if entry > 0 else 0
-                    supabase.table("signal_outcomes").update({
-                        f"price_{field}": current,
-                        f"pct_{field}": round(pct, 2),
-                        f"checked_{field}": True
-                    }).eq("id", row["id"]).execute()
-                except:
-                    continue
-                time.sleep(0.3)
-    except Exception as e:
-        print(f"❌ Outcome check: {e}")
 
 # ============================================================
 # ANA TARAMA
@@ -1170,10 +1364,11 @@ def scan_once(scan_count=0):
     print(f"\n🦅 KARTAL GÖZÜ v4 — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     print("=" * 55)
 
-    # Her 3 taramada bir pozisyon ve watchlist kontrol
+    # Her 3 taramada bir pozisyon, sonuç takibi ve istatistik raporu
     if scan_count % 3 == 0:
         crypto_bot_check_positions()
         check_signal_outcomes()
+        generate_pattern_report()
 
     fg = get_fear_greed()
     if fg:
@@ -1245,17 +1440,23 @@ def scan_once(scan_count=0):
                 watchlist_candidates.append((symbol, price, ch1h, ch24h, vol_chg, None, "No-tech"))
                 continue
 
+            # V6: Order book (sadece skoru sınırın yakınında olan adaylar için
+            # ek API yükü olmasın diye, önce skoru hesapla, sonra gerekirse ekle)
+            orderbook = get_orderbook_signal(symbol)
+            time.sleep(0.2)
+
             # Puanla
             result = score_coin(
                 symbol, coin["name"], price,
                 ch1h, ch4h, ch24h, ch7d,
                 vol_chg, coin["mcap"], coin["cmc_rank"],
-                tech, fg
+                tech, fg, orderbook
             )
 
             if result:
                 scored.append(result)
-                print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} | {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']} | [{result['exchange']}]")
+                ob_log = f" | OB:{orderbook['bid_ask_ratio']}x" if orderbook else ""
+                print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} | {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}{ob_log} | [{result['exchange']}]")
             else:
                 # Sinyal eşiğini geçemedi ama izlemeye değer olabilir
                 if vol_chg > 50 or (tech.get("rsi") and tech["rsi"] < 40):
@@ -1276,7 +1477,7 @@ def scan_once(scan_count=0):
     layer_order = {"WATCHLIST": 0, "BIRIKIM": 1, "MOMENTUM": 2}
     scored.sort(key=lambda x: (layer_order.get(x["layer"], 3), -x["score"]))
 
-    # SERT ELEMEi — günde max 5, sadece gerçekten güçlü sinyaller
+    # SERT ELEME — günde max 5, sadece gerçekten güçlü sinyaller
     top = [s for s in scored if s["conviction"] in ["CRITICAL", "HIGH"]][:3]
     if len(top) < 5:
         medium = [s for s in scored if s["conviction"] == "MEDIUM"][:5-len(top)]
@@ -1299,15 +1500,15 @@ def scan_once(scan_count=0):
 # ============================================================
 
 def main():
-    print("🚀 Atlas Kripto Kartal Gözü — v4")
-    print("🎯 MEXC + Gate.io + Binance + CMC | RSI | OBV | Watchlist | Scam Filter")
+    print("🚀 Atlas Kripto Kartal Gözü — v4 (V5+V6+V8)")
+    print("🎯 MEXC + Gate.io + Binance + CMC | RSI | OBV | Order Book | Watchlist | Scam Filter | Outcome Tracking")
     print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
     if not CMC_API_KEY:
         print("❌ CMC_API_KEY bulunamadı!")
         return
 
-    # Watchlist tablosunu kontrol et
+    # Tabloları kontrol et
     try:
         supabase.table("crypto_watchlist").select("id").limit(1).execute()
         print("✅ crypto_watchlist tablosu hazır")
@@ -1319,6 +1520,12 @@ def main():
         print("✅ crypto_signals tablosu hazır")
     except Exception as e:
         print(f"⚠️ Tablo: {e}")
+
+    try:
+        supabase.table("signal_outcomes").select("id").limit(1).execute()
+        print("✅ signal_outcomes tablosu hazır")
+    except Exception as e:
+        print(f"⚠️ signal_outcomes tablosu yok: {e}")
 
     scan_count = 0
     while True:
