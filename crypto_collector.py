@@ -954,6 +954,20 @@ def save_and_push_signal(s, fg):
         signal_cache[s["symbol"]] = time.time()
         sid = res.data[0].get("id") if res.data else None
 
+        # V5: Sinyal sonuç takibi
+        try:
+            supabase.table("signal_outcomes").insert({
+                "signal_id": sid,
+                "symbol": s["symbol"],
+                "layer": s["layer"],
+                "conviction": s["conviction"],
+                "entry_rsi": s.get("rsi"),
+                "entry_obv": s.get("obv_trend"),
+                "entry_price": price,
+            }).execute()
+        except Exception as e:
+            print(f"⚠️ Outcome kayıt: {e}")
+
         # Bot işle
         crypto_bot_process(
             s["symbol"], price, s["conviction"],
@@ -1109,7 +1123,44 @@ def get_last_signal_time(symbol):
         return 0
     except:
         return 0
+    
 
+
+def check_signal_outcomes():
+    """24s/72s/7g sonra sinyal sonuçlarını ölç"""
+    try:
+        now = datetime.now(timezone.utc)
+        for hours, field in [(24, "24h"), (72, "72h"), (24*7, "7d")]:
+            cutoff = (now - timedelta(hours=hours)).isoformat()
+            rows = supabase.table("signal_outcomes") \
+                .select("*") \
+                .eq(f"checked_{field}", False) \
+                .lte("created_at", cutoff) \
+                .limit(20).execute()
+            if not rows.data:
+                continue
+            print(f"📈 {len(rows.data)} sinyal için {field} sonuç ölçülüyor...")
+            for row in rows.data:
+                try:
+                    k, _ = get_klines(row["symbol"], "1h", 2)
+                    if not k:
+                        supabase.table("signal_outcomes").update({
+                            f"checked_{field}": True
+                        }).eq("id", row["id"]).execute()
+                        continue
+                    current = float(k[-1][4])
+                    entry = row["entry_price"]
+                    pct = ((current - entry) / entry) * 100 if entry > 0 else 0
+                    supabase.table("signal_outcomes").update({
+                        f"price_{field}": current,
+                        f"pct_{field}": round(pct, 2),
+                        f"checked_{field}": True
+                    }).eq("id", row["id"]).execute()
+                except:
+                    continue
+                time.sleep(0.3)
+    except Exception as e:
+        print(f"❌ Outcome check: {e}")
 
 # ============================================================
 # ANA TARAMA
@@ -1122,6 +1173,7 @@ def scan_once(scan_count=0):
     # Her 3 taramada bir pozisyon ve watchlist kontrol
     if scan_count % 3 == 0:
         crypto_bot_check_positions()
+        check_signal_outcomes()
 
     fg = get_fear_greed()
     if fg:
