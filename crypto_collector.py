@@ -629,7 +629,8 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     # ── HACİM DEĞİŞİMİ ───────────────────────────────────────
     if vol_chg >= 1000:
         score += 7
-        layer = "BIRIKIM"
+        if obv_trend != "down":
+            layer = "BIRIKIM"
         reasons.append(f"🔥 Hacim %{vol_chg:.0f} — olağandışı whale")
     elif vol_chg >= 500:
         score += 5
@@ -656,21 +657,18 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     if vol_chg < 30 and (rsi is None or rsi > 55) and obv_trend != "up":
         return None
 
-    # ── FİYAT MOMENTUM ───────────────────────────────────────
-    if ch1h >= 15:
-        score += 5
-        reasons.append(f"%{ch1h:.1f} güçlü yükseliş (1s)")
-    elif ch1h >= 8:
-        score += 4
-        reasons.append(f"%{ch1h:.1f} yükseliş (1s)")
-    elif ch1h >= 5:
-        score += 3
-        reasons.append(f"%{ch1h:.1f} yükseliş (1s)")
-    elif ch1h >= 2:
+    # ── FİYAT MOMENTUM (ERKEN YAKALAMA) ──────────────────────
+    # Fiyat henüz az hareket etmişken (≤%3) bonus — "trene binmek" istemiyoruz.
+    # %6+ hareket etmiş coinler için ceza — zaten geç.
+    if 0 <= ch1h <= 3:
         score += 2
-        reasons.append(f"%{ch1h:.1f} yükseliş (1s)")
-    elif ch1h >= 0.5:
+        reasons.append(f"%{ch1h:.1f} — erken aşama, henüz oynamamış")
+    elif ch1h <= 6:
         score += 1
+        reasons.append(f"%{ch1h:.1f} — hafif hareket başladı")
+    elif ch1h > 6:
+        score -= 2
+        reasons.append(f"⚠️ %{ch1h:.1f} — zaten hareket etmiş, geç giriş riski")
 
     if ch4h >= 10:
         score += 4
@@ -734,11 +732,13 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     hist = get_historical_success_rate(rsi, obv_trend, layer)
     if hist:
         if hist["rate"] >= 70:
-            score += 3
+            score += 5
             reasons.append(f"📊 Geçmiş başarı: %{hist['rate']} ({hist['sample']} sinyal)")
         elif hist["rate"] <= 30:
+            return None  # Kanıtlanmış kötü patern — sinyal verme
+        elif hist["rate"] <= 50:
             score -= 3
-            reasons.append(f"⚠️ Geçmiş başarı düşük: %{hist['rate']} ({hist['sample']} sinyal)")
+            reasons.append(f"⚠️ Geçmiş başarı zayıf: %{hist['rate']} ({hist['sample']} sinyal)")
 
     if score < 6:
         return None
@@ -764,7 +764,6 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         "conviction": conviction, "reasons": reasons,
         "score": score, "layer": layer,
     }
-
 
 # ============================================================
 # HAVUZ 2 — İZLEME SİSTEMİ
@@ -1413,9 +1412,10 @@ def scan_once(scan_count=0):
             price = coin["price"]
 
             # Hızlı ön eleme
+            # Hızlı ön eleme
             if price <= 0 or price > 2.0:
                 continue
-            if ch1h >= 30 or ch1h < -3:
+            if ch1h >= 6 or ch1h < -3:  # %6+ zaten geç, atla — erken yakalama hedefi
                 continue
             if ch4h < -8:
                 continue
@@ -1477,12 +1477,10 @@ def scan_once(scan_count=0):
     layer_order = {"WATCHLIST": 0, "BIRIKIM": 1, "MOMENTUM": 2}
     scored.sort(key=lambda x: (layer_order.get(x["layer"], 3), -x["score"]))
 
-    # SERT ELEME — günde max 5, sadece gerçekten güçlü sinyaller
-    top = [s for s in scored if s["conviction"] in ["CRITICAL", "HIGH"]][:3]
-    if len(top) < 5:
-        medium = [s for s in scored if s["conviction"] == "MEDIUM"][:5-len(top)]
-        top.extend(medium)
-    top = top[:5]
+    # SERT ELEME — sayı sabit DEĞİL, kalite sabit.
+    # MEDIUM tek başına asla yeterli değil. Doldurma yapılmaz, 0 sinyal de olabilir.
+    top = [s for s in scored if s["conviction"] in ["CRITICAL", "HIGH"] and s["score"] >= 14]
+    top = top[:5]  # üst sınır 5, alt sınır yok
 
     print(f"\n📋 {len(scored)} aday → {len(top)} sinyal seçildi")
 
