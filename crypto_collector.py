@@ -507,7 +507,65 @@ def get_historical_success_rate(rsi, obv_trend, layer):
         print(f"⚠️ Success rate: {e}")
         return None
 
+# ============================================================
+# V9: PROJE YAŞ KONTROLÜ (CMC → CoinGecko fallback)
+# ============================================================
 
+_coingecko_list_cache = {"data": None, "ts": 0}
+
+
+def get_coingecko_id(symbol):
+    """CoinGecko coin listesini 24s cache'le, sembolden id bul."""
+    global _coingecko_list_cache
+    now = time.time()
+    if _coingecko_list_cache["data"] is None or now - _coingecko_list_cache["ts"] > 86400:
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/coins/list", timeout=15)
+            if r.status_code == 200:
+                _coingecko_list_cache["data"] = r.json()
+                _coingecko_list_cache["ts"] = now
+        except:
+            return None
+    if not _coingecko_list_cache["data"]:
+        return None
+    sym_lower = symbol.lower()
+    matches = [c for c in _coingecko_list_cache["data"] if c["symbol"] == sym_lower]
+    return matches[0]["id"] if matches else None
+
+
+def get_coin_age_days(symbol, date_added=None):
+    """
+    1. CMC date_added varsa kullan.
+    2. Yoksa CoinGecko genesis_date'i dene.
+    3. İkisi de yoksa None — yaş bilinmiyor, kontrol atlanır.
+    """
+    if date_added:
+        try:
+            added = datetime.fromisoformat(date_added.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - added).days
+        except:
+            pass
+
+    try:
+        cg_id = get_coingecko_id(symbol)
+        if not cg_id:
+            return None
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{cg_id}",
+            params={"localization": "false", "tickers": "false",
+                    "market_data": "false", "community_data": "false",
+                    "developer_data": "false"},
+            timeout=8
+        )
+        if r.status_code != 200:
+            return None
+        genesis = r.json().get("genesis_date")
+        if genesis:
+            added = datetime.fromisoformat(genesis).replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - added).days
+    except:
+        pass
+    return None
 # ============================================================
 # V8: İSTATİSTİK RAPORU
 # ============================================================
@@ -935,10 +993,6 @@ def watchlist_check_signals(fg):
 # ============================================================
 
 def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
-    """
-    3 kaynaktan gelen veriyi birleştir.
-    Aynı sembol varsa birbirini doğrulasın.
-    """
     merged = {}
 
     # CMC verisi — en güvenilir fiyat/hacim
@@ -962,6 +1016,7 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
             "vol_chg": float(q.get("volume_change_24h", 0) or 0),
             "mcap": float(q.get("market_cap", 0) or 0),
             "cmc_rank": c.get("cmc_rank", 9999),
+            "date_added": c.get("date_added"),   # ← YENİ SATIR
             "sources": ["CMC"],
         }
 
@@ -1454,6 +1509,11 @@ def scan_once(scan_count=0):
             )
 
             if result:
+                 # V9: Proje yaş kontrolü — sadece skorlamayı geçenler için
+                age_days = get_coin_age_days(symbol, coin.get("date_added"))
+                if age_days is not None and age_days < 30:
+                    print(f"  ⏭️ {symbol} elendi — {age_days} gün önce listelendi (rug riski)")
+                    continue
                 scored.append(result)
                 ob_log = f" | OB:{orderbook['bid_ask_ratio']}x" if orderbook else ""
                 print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} | {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}{ob_log} | [{result['exchange']}]")
