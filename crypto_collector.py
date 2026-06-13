@@ -983,7 +983,30 @@ def watchlist_check_signals(fg):
         print(f"❌ Watchlist check: {e}")
         return []
 
+# ============================================================
+# STABİLCOİN FİLTRESİ
+# ============================================================
 
+STABLECOIN_BASES = {
+    "USDT", "USDC", "FDUSD", "TUSD", "USDP", "GUSD", "PYUSD", "RLUSD",
+    "USDG", "USDGO", "USD1", "BUSD", "USDD",
+    "DAI", "USDS", "SUSDS", "USDX", "CRVUSD", "LISUSD",
+    "USDE", "SUSDE", "USDY", "USDM", "USDL", "USDO", "USDN",
+    "USD0", "USD0PP", "SFRXUSD", "FRAX", "SYRUPUSDC", "BUIDL",
+    "USTC", "USDF",
+    "EURT", "EURS", "EURC", "XAUT", "PAXG",
+}
+
+
+def is_stablecoin(symbol, price=None, ch1h=None, ch24h=None):
+    base = symbol.upper().strip()
+    if base in STABLECOIN_BASES:
+        return True
+    if price is not None and 0.97 <= price <= 1.03:
+        if ch1h is not None and ch24h is not None:
+            if abs(ch1h) < 0.3 and abs(ch24h) < 1.0:
+                return True
+    return False
 # ============================================================
 # VERİ BİRLEŞTİRME — MEXC + Gate.io → Ortak Format
 # ============================================================
@@ -997,6 +1020,8 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
         symbol = c.get("symbol", "")
         price = float(q.get("price", 0) or 0)
         if price <= 0 or price > 2.0:
+            continue
+        if is_stablecoin(symbol, price, float(q.get("percent_change_1h", 0) or 0), float(q.get("percent_change_24h", 0) or 0)):
             continue
         vol = float(q.get("volume_24h", 0) or 0)
         if vol < 100_000:
@@ -1024,6 +1049,8 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
         base = sym[:-4]  # BTCUSDT → BTC
         price = float(t.get("lastPrice", 0) or 0)
         if price <= 0 or price > 2.0:
+            continue
+        if is_stablecoin(base, price, 0, float(t.get("priceChangePercent", 0) or 0)):
             continue
         vol_usdt = float(t.get("quoteVolume", 0) or 0)
         if vol_usdt < 100_000:
@@ -1055,6 +1082,8 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
         base = pair[:-5]  # BTC_USDT → BTC
         price = float(t.get("last", 0) or 0)
         if price <= 0 or price > 2.0:
+            continue
+        if is_stablecoin(base, price, 0, float(t.get("change_percentage", 0) or 0)):
             continue
         vol_usdt = float(t.get("quote_volume", 0) or 0)
         if vol_usdt < 100_000:
