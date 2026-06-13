@@ -690,8 +690,11 @@ def bot_check_open_positions():
                 should_sell, exit_reason, new_peak = us_bot_should_sell(trade, current_price)
                 if should_sell:
                     bot_sell(trade, current_price, exit_reason)
-                elif new_peak != (trade.get("peak_price") or trade["buy_price"]):
-                    supabase.table("demo_trades").update({"peak_price": new_peak}).eq("id", trade["id"]).execute()
+                else:
+                    update_data = {"current_price": current_price}
+                    if new_peak != (trade.get("peak_price") or trade["buy_price"]):
+                        update_data["peak_price"] = new_peak
+                    supabase.table("demo_trades").update(update_data).eq("id", trade["id"]).execute()
             except:
                 continue
             time.sleep(0.3)
