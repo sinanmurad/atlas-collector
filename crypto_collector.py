@@ -878,27 +878,39 @@ def check_watchlist_movement():
 
                 cur_price = tech["price"]
                 cur_rsi = tech.get("rsi")
-                first_price = float(row.get("first_price") or cur_price)
-                first_rsi = float(row.get("last_rsi") or 50)
-                first_vol = float(row.get("last_vol_chg") or 0)
                 cur_vol_surge = tech.get("vol_surge_4h", 1) * 100
 
-                price_change = abs(cur_price - first_price) / first_price if first_price > 0 else 0
-                rsi_drop = (first_rsi - cur_rsi) if (cur_rsi is not None and first_rsi) else 0
-                vol_jump = cur_vol_surge - first_vol
+                # Referans = ÖNCEKİ KONTROL (last_*), ilk görülme değil.
+                # observation_count == 1 ise henüz ikinci kontrol yok,
+                # bu turda sadece referans güncellenir, hareket ölçülmez.
+                prev_price = row.get("last_price")
+                prev_rsi = row.get("last_rsi")
+                prev_vol = row.get("last_vol_chg")
 
                 hareketlendi = False
                 trigger = ""
 
-                if price_change >= WATCH_MOVE_PRICE_PCT:
-                    hareketlendi = True
-                    trigger = f"Fiyat %{price_change*100:.1f} değişti"
-                elif rsi_drop >= WATCH_MOVE_RSI_DROP:
-                    hareketlendi = True
-                    trigger = f"RSI {first_rsi:.0f}→{cur_rsi:.0f} düştü"
-                elif vol_jump >= WATCH_MOVE_VOL_PCT:
-                    hareketlendi = True
-                    trigger = f"Hacim sıçraması %{vol_jump:.0f}"
+                if row.get("observation_count", 0) >= 1 and prev_price:
+                    prev_price_f = float(prev_price)
+                    price_change = abs(cur_price - prev_price_f) / prev_price_f if prev_price_f > 0 else 0
+
+                    rsi_drop = 0
+                    if cur_rsi is not None and prev_rsi is not None:
+                        rsi_drop = float(prev_rsi) - cur_rsi
+
+                    vol_jump = 0
+                    if prev_vol is not None:
+                        vol_jump = cur_vol_surge - float(prev_vol)
+
+                    if price_change >= WATCH_MOVE_PRICE_PCT:
+                        hareketlendi = True
+                        trigger = f"Fiyat %{price_change*100:.1f} değişti (son kontrolden)"
+                    elif rsi_drop >= WATCH_MOVE_RSI_DROP:
+                        hareketlendi = True
+                        trigger = f"RSI {float(prev_rsi):.0f}→{cur_rsi:.0f} düştü (son kontrolden)"
+                    elif vol_jump >= WATCH_MOVE_VOL_PCT:
+                        hareketlendi = True
+                        trigger = f"Hacim sıçraması %{vol_jump:.0f} (son kontrolden)"
 
                 if hareketlendi:
                     supabase.table("crypto_watchlist").update({
@@ -907,6 +919,7 @@ def check_watchlist_movement():
                         "last_seen": now.isoformat(),
                         "last_price": cur_price,
                         "last_rsi": cur_rsi,
+                        "last_vol_chg": cur_vol_surge,
                     }).eq("id", row["id"]).execute()
                     moved += 1
                     print(f"  🔥 HAREKETLENDİ: {symbol} — {trigger}")
@@ -915,6 +928,7 @@ def check_watchlist_movement():
                         "last_seen": now.isoformat(),
                         "last_price": cur_price,
                         "last_rsi": cur_rsi,
+                        "last_vol_chg": cur_vol_surge,
                         "observation_count": row["observation_count"] + 1,
                     }).eq("id", row["id"]).execute()
 
