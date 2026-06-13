@@ -106,6 +106,17 @@ MAX_INVEST_USD = 50           # Pozisyon başı max $50
 MIN_INVEST_USD = 5            # Pozisyon başı min $5
 SIGNAL_COOLDOWN_H = 4         # Aynı coin için min 4 saat arayla sinyal
 
+# ── İZLEME LİSTESİ (13'ün katları) ──────────────────────────
+WATCHLIST_MAX = 39             # 3x13 — maksimum kapasite
+WATCHLIST_TIER1 = 13           # 0-13: serbest giriş
+WATCHLIST_TIER2 = 26           # 13-26: orta skor da girebilir
+WATCHLIST_TTL_DAYS = 7         # 7 gün hareketsiz kalan silinir
+WATCHLIST_MIN_SCORE = 9        # İzlemeye girmek için min skor (MEDIUM eşiği)
+# "Hareketlendi" eşikleri — ilk görüldüğüne göre kıyas
+WATCH_MOVE_RSI_DROP = 15        # RSI bu kadar düşerse hareketlendi
+WATCH_MOVE_PRICE_PCT = 0.05     # Fiyat %5+ değiştiyse hareketlendi
+WATCH_MOVE_VOL_PCT = 200        # Hacim değişimi bu kadar farklılaştıysa hareketlendi
+
 STABLECOIN_BASES = {
     "USDT", "USDC", "FDUSD", "TUSD", "USDP", "GUSD", "PYUSD", "RLUSD",
     "USDG", "USDGO", "USD1", "BUSD", "USDD", "DAI", "USDS", "SUSDS",
@@ -757,8 +768,168 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     }
 
 # ============================================================
-# VERİ BİRLEŞTİRME
+# İZLEME LİSTESİ — bilgi amaçlı, bot kararına karışmaz
 # ============================================================
+# Kapasite: max 39 (3x13). Doluyken yeni aday, en düşük skorlu
+# kayıttan yüksekse onun yerine geçer. 7 gün hareketsiz kalan silinir.
+# "Hareketlendi" tespit edilirse status='signaled' yapılır (push yok,
+# sadece Flutter tarafında etiketleme için).
+
+def watchlist_update(symbol, price, rsi, obv_trend, vol_chg, score, source="CMC"):
+    """MEDIUM (9-13) skorlu, sinyal eşiğini geçemeyen adayı izleme listesine ekle/güncelle."""
+    try:
+        existing = supabase.table("crypto_watchlist") \
+            .select("id, last_score, observation_count") \
+            .eq("symbol", symbol).eq("status", "watching") \
+            .limit(1).execute()
+
+        if existing.data:
+            row = existing.data[0]
+            supabase.table("crypto_watchlist").update({
+                "last_seen": datetime.now(timezone.utc).isoformat(),
+                "last_price": price,
+                "last_rsi": rsi,
+                "last_obv": obv_trend,
+                "last_vol_chg": vol_chg,
+                "last_score": score,
+                "observation_count": row["observation_count"] + 1,
+            }).eq("id", row["id"]).execute()
+            return
+
+        # Yeni kayıt — kapasite kontrolü
+        count_res = supabase.table("crypto_watchlist") \
+            .select("id").eq("status", "watching").execute()
+        current_count = len(count_res.data or [])
+
+        if current_count >= WATCHLIST_MAX:
+            # En düşük skorlu kaydı bul
+            weakest = supabase.table("crypto_watchlist") \
+                .select("id, symbol, last_score") \
+                .eq("status", "watching") \
+                .order("last_score", desc=False) \
+                .limit(1).execute()
+            if not weakest.data:
+                return
+            weak = weakest.data[0]
+            if score <= (weak["last_score"] or 0):
+                # Yeni aday mevcut en zayıftan güçlü değil — alma
+                return
+            # Zayıfı sil, yenisi için yer aç
+            supabase.table("crypto_watchlist").delete().eq("id", weak["id"]).execute()
+            print(f"  🔄 İzleme listesi: {weak['symbol']} (skor:{weak['last_score']}) "
+                  f"çıktı, {symbol} (skor:{score}) girdi")
+
+        supabase.table("crypto_watchlist").insert({
+            "symbol": symbol,
+            "source": source,
+            "first_seen": datetime.now(timezone.utc).isoformat(),
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+            "first_price": price,
+            "last_price": price,
+            "observation_count": 1,
+            "last_rsi": rsi,
+            "last_obv": obv_trend,
+            "last_vol_chg": vol_chg,
+            "last_score": score,
+            "status": "watching",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        print(f"  👁️ İZLEMEYE ALINDI: {symbol} (skor:{score}) @ ${price}")
+
+    except Exception as e:
+        print(f"⚠️ Watchlist update {symbol}: {e}")
+
+
+def check_watchlist_movement():
+    """
+    Her taramanın BAŞINDA çalışır:
+    1. İzlemedeki coinlerin güncel RSI/OBV/fiyat/hacmini kontrol et.
+    2. "Hareketlendi" eşiğini geçen varsa status='signaled' yap (push yok).
+    3. 7 gün hareketsiz kalan 'watching' kayıtları sil.
+    """
+    try:
+        watching = supabase.table("crypto_watchlist") \
+            .select("*").eq("status", "watching").execute()
+        if not watching.data:
+            return
+
+        print(f"👁️ İzleme listesi: {len(watching.data)} coin kontrol ediliyor...")
+        now = datetime.now(timezone.utc)
+        moved = 0
+        expired = 0
+
+        for row in watching.data:
+            symbol = row["symbol"]
+            try:
+                # TTL kontrolü
+                first_seen = datetime.fromisoformat(row["first_seen"].replace("Z", "+00:00"))
+                if first_seen.tzinfo is None:
+                    first_seen = first_seen.replace(tzinfo=timezone.utc)
+                age_days = (now - first_seen).total_seconds() / 86400
+
+                if age_days >= WATCHLIST_TTL_DAYS:
+                    supabase.table("crypto_watchlist").delete().eq("id", row["id"]).execute()
+                    expired += 1
+                    continue
+
+                tech = get_technical_data(symbol)
+                if not tech:
+                    continue
+
+                cur_price = tech["price"]
+                cur_rsi = tech.get("rsi")
+                first_price = float(row.get("first_price") or cur_price)
+                first_rsi = float(row.get("last_rsi") or 50)
+                first_vol = float(row.get("last_vol_chg") or 0)
+                cur_vol_surge = tech.get("vol_surge_4h", 1) * 100
+
+                price_change = abs(cur_price - first_price) / first_price if first_price > 0 else 0
+                rsi_drop = (first_rsi - cur_rsi) if (cur_rsi is not None and first_rsi) else 0
+                vol_jump = cur_vol_surge - first_vol
+
+                hareketlendi = False
+                trigger = ""
+
+                if price_change >= WATCH_MOVE_PRICE_PCT:
+                    hareketlendi = True
+                    trigger = f"Fiyat %{price_change*100:.1f} değişti"
+                elif rsi_drop >= WATCH_MOVE_RSI_DROP:
+                    hareketlendi = True
+                    trigger = f"RSI {first_rsi:.0f}→{cur_rsi:.0f} düştü"
+                elif vol_jump >= WATCH_MOVE_VOL_PCT:
+                    hareketlendi = True
+                    trigger = f"Hacim sıçraması %{vol_jump:.0f}"
+
+                if hareketlendi:
+                    supabase.table("crypto_watchlist").update({
+                        "status": "signaled",
+                        "signal_date": now.isoformat(),
+                        "last_seen": now.isoformat(),
+                        "last_price": cur_price,
+                        "last_rsi": cur_rsi,
+                    }).eq("id", row["id"]).execute()
+                    moved += 1
+                    print(f"  🔥 HAREKETLENDİ: {symbol} — {trigger}")
+                else:
+                    supabase.table("crypto_watchlist").update({
+                        "last_seen": now.isoformat(),
+                        "last_price": cur_price,
+                        "last_rsi": cur_rsi,
+                        "observation_count": row["observation_count"] + 1,
+                    }).eq("id", row["id"]).execute()
+
+                time.sleep(0.2)
+
+            except Exception:
+                continue
+
+        if moved or expired:
+            print(f"  📊 İzleme: {moved} hareketlendi, {expired} süresi doldu (silindi)")
+
+    except Exception as e:
+        print(f"❌ check_watchlist_movement: {e}")
+
+
 
 def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
     merged = {}
@@ -1261,6 +1432,9 @@ def scan_once(scan_count=0):
     print(f"\n🦅 KARTAL GÖZÜ V12 — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     print("=" * 55)
 
+    # ── ÖNCE izleme listesini kontrol et ───────────────────
+    check_watchlist_movement()
+
     fg = get_fear_greed()
     if fg:
         e = "😱" if fg["value"] <= 25 else "😐" if fg["value"] <= 50 else "😊" if fg["value"] <= 75 else "🤑"
@@ -1339,10 +1513,19 @@ def scan_once(scan_count=0):
                 if age is not None and age < 30:
                     print(f"  ⏭️ {symbol} elendi — {age} gün önce listelendi")
                     continue
-                scored.append(result)
-                ob_log = f" | OB:{orderbook['bid_ask_ratio']}x" if orderbook else ""
-                print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} "
-                      f"| {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}{ob_log}")
+
+                if result["conviction"] in ["CRITICAL", "HIGH"] and result["score"] >= 14:
+                    scored.append(result)
+                    ob_log = f" | OB:{orderbook['bid_ask_ratio']}x" if orderbook else ""
+                    print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} "
+                          f"| {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}{ob_log}")
+                elif result["score"] >= WATCHLIST_MIN_SCORE:
+                    # Sinyal eşiğini geçemedi ama izlemeye değer (MEDIUM)
+                    watchlist_update(
+                        symbol, price, result.get("rsi"), result.get("obv_trend"),
+                        result.get("vol_chg", 0), result["score"],
+                        source=coin.get("sources", ["CMC"])[0] if coin.get("sources") else "CMC",
+                    )
 
         except Exception:
             continue
@@ -1361,9 +1544,8 @@ def scan_once(scan_count=0):
             print(f"  ⚖️ {len(buy_candidates)} CRITICAL+BİRİKİM aday — "
                   f"sadece {best_buy['symbol']} (score:{best_buy['score']}) alım yapıyor")
 
-    # Sinyal kayıt — sadece CRITICAL ve HIGH
-    top = [s for s in scored if s["conviction"] in ["CRITICAL", "HIGH"] and s["score"] >= 14]
-    top = sorted(top, key=lambda x: -x["score"])[:5]
+    # Sinyal kayıt — scored zaten CRITICAL/HIGH + score>=14 olarak filtrelendi
+    top = sorted(scored, key=lambda x: -x["score"])[:5]
 
     print(f"\n📋 {len(scored)} aday → {len(top)} sinyal kaydedilecek")
 
