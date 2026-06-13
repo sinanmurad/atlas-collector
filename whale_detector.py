@@ -5,6 +5,7 @@ import time
 import requests
 import websocket
 import yfinance as yf
+import threading
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
 import firebase_admin
@@ -215,7 +216,6 @@ def get_news_catalyst(symbol, company_name=""):
             headline = news.get("headline", "").lower()
             summary = news.get("summary", "").lower()
 
-            # Haber bu hisseyle alakalı mı — sembol veya şirket adı geçmeli
             is_relevant = (
                 symbol_lower in headline or
                 symbol_lower in summary or
@@ -224,11 +224,9 @@ def get_news_catalyst(symbol, company_name=""):
             if not is_relevant:
                 continue
 
-            # Negatif haber = geç
             if any(kw in headline for kw in negative_keywords):
                 continue
 
-            # Pozitif kataliz
             for kw in catalyst_keywords:
                 if kw in headline or kw in summary:
                     return {
@@ -535,78 +533,143 @@ class VolumeTracker:
 tracker = VolumeTracker()
 
 
+# ============================================================
+# BOT — SAVAŞ MİMARİSİ (Kripto V12 → US uyarlaması)
+# ============================================================
+
+def get_open_us_trades(user_id):
+    r = supabase.table("demo_trades").select("*") \
+        .eq("user_id", user_id).eq("status", "open").eq("market", "US").execute()
+    return r.data or []
+
+
+def get_us_hist_rate(user_id):
+    r = supabase.table("demo_trades").select("profit_loss") \
+        .eq("user_id", user_id).eq("market", "US").eq("status", "closed").execute()
+    if not r.data:
+        return 0
+    wins = sum(1 for t in r.data if (t.get("profit_loss") or 0) > 0)
+    return (wins / len(r.data)) * 100
+
+
+def calc_us_levels(price, trend_data):
+    """ATR yerine — 5 günlük değişimden günlük volatilite tahmini.
+    Stop = volatilite x1.5, Hedef = volatilite x8 (kripto V12 oranı)"""
+    daily_vol = abs(trend_data.get("5d_change", 0)) / 5 if trend_data else 2.0
+    daily_vol = max(daily_vol, 1.5)
+    stop = price * (1 - daily_vol * 1.5 / 100)
+    target = price * (1 + daily_vol * 8 / 100)
+    return round(stop, 2), round(target, 2)
+
+
 def bot_should_buy(price_change, volume_ratio, conviction):
-    if price_change < 0:
-        return False
-    if conviction in ["CRITICAL", "HIGH"]:
-        return True
-    if price_change >= 3 and volume_ratio >= 3:
-        return True
-    if conviction == "MEDIUM" and price_change >= 2 and volume_ratio >= 2:
-        return True
-    if volume_ratio >= 5 and price_change > 0:
-        return True
-    return False
+    # Savaş mimarisi — sadece en yüksek güven
+    return conviction == "CRITICAL" and price_change > 0
 
 
-def bot_should_sell(buy_price, current_price):
+def us_bot_should_sell(trade, current_price):
+    buy_price = trade["buy_price"]
+    stop = trade.get("stop_price") or buy_price * 0.97
+    target = trade.get("target_price") or buy_price * 1.12
+    peak = max(trade.get("peak_price") or buy_price, current_price)
     change = ((current_price - buy_price) / buy_price) * 100
-    if change >= 10:
-        print(f"  💰 %{change:.1f} kar — SAT")
-        return True
-    if change <= -5:
-        print(f"  🛑 %{change:.1f} zarar — STOP LOSS")
-        return True
-    return False
+
+    if current_price <= stop:
+        print(f"  🛑 STOP: %{change:.1f}")
+        return True, "stop_loss", peak
+
+    if current_price >= target:
+        print(f"  🎯 HEDEF: %{change:.1f}")
+        return True, "target_hit", peak
+
+    # Reversal — kâr varken tepeden geri çekiliş
+    if peak > buy_price:
+        drawdown = (peak - current_price) / peak * 100
+        if change >= 1.5 and drawdown >= 2.0:
+            print(f"  ⚠️ REVERSAL: tepe ${peak:.2f}'den ${current_price:.2f}'ye, kâr hâlâ %{change:.1f}")
+            return True, "reversal", peak
+
+    return False, "", peak
 
 
-def bot_buy(user_id, symbol, price, signal_id, is_pro, balance):
+def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons, trend_data):
     try:
+        open_trades = get_open_us_trades(user_id)
+        open_count = len(open_trades)
+        stop, target = calc_us_levels(price, trend_data)
+        entry_reason = " | ".join(reasons[:3]) if reasons else conviction
+        is_exceptional = False
+
         if not is_pro:
             month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0).isoformat()
-            month_trades = supabase.table("demo_trades").select("id").eq("user_id", user_id).gte("created_at", month_start).execute()
+            month_trades = supabase.table("demo_trades").select("id").eq("user_id", user_id).eq("market", "US").gte("created_at", month_start).execute()
             if len(month_trades.data) >= 3:
                 print(f"⚠️ {user_id} aylik limit doldu")
                 return False
-            open_trades = supabase.table("demo_trades").select("id").eq("user_id", user_id).eq("status", "open").execute()
-            if len(open_trades.data) >= 1:
-                print(f"⚠️ {user_id} acik pozisyon var")
+            if open_count >= 3:
+                print(f"⚠️ {user_id} 3 açık pozisyon dolu (Free)")
                 return False
+        else:
+            BASE_CAP = 3
+            EXCEPTIONAL_CAP = 2
+            MAX_TOTAL = BASE_CAP + EXCEPTIONAL_CAP
+
+            if open_count >= MAX_TOTAL:
+                print(f"⚠️ {user_id} max {MAX_TOTAL} pozisyon dolu (Pro)")
+                return False
+
+            if open_count >= BASE_CAP:
+                hist_rate = get_us_hist_rate(user_id)
+                if not (score >= 10 and hist_rate >= 90):
+                    print(f"⚠️ {user_id} istisna kriteri karşılanmadı (score={score}, hist={hist_rate:.0f}%)")
+                    return False
+                exceptional_open = sum(1 for t in open_trades if t.get("is_exceptional"))
+                if exceptional_open >= EXCEPTIONAL_CAP:
+                    print(f"⚠️ {user_id} istisna slotları dolu")
+                    return False
+                is_exceptional = True
+
         invest = min(balance * 0.10, 100)
         if invest < 10:
             return False
         quantity = invest / price
+
         supabase.table("demo_trades").insert({
             "user_id": user_id, "symbol": symbol, "market": "US",
             "signal_id": signal_id, "buy_price": price,
             "buy_date": datetime.now(timezone.utc).isoformat(),
             "quantity": round(quantity, 4), "status": "open",
+            "stop_price": stop, "target_price": target, "peak_price": price,
+            "entry_reason": entry_reason, "entry_conviction": conviction,
+            "entry_score": score, "is_exceptional": is_exceptional,
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
         supabase.table("demo_portfolios").update({
-            "balance": round(balance - invest, 2)
+            "us_balance": round(balance - invest, 2)
         }).eq("user_id", user_id).execute()
-        print(f"✅ BOT ALIM: {user_id} → {symbol} @ ${price:.2f}")
+        tag = " 🌟İSTİSNA" if is_exceptional else ""
+        print(f"✅ BOT ALIM{tag}: {user_id} → {symbol} @ ${price:.2f} | Stop:${stop} Hedef:${target}")
         return True
     except Exception as e:
         print(f"❌ Bot alım hatası: {e}")
         return False
 
 
-def bot_sell(trade, current_price):
+def bot_sell(trade, current_price, exit_reason=""):
     try:
         profit_loss = (current_price - trade["buy_price"]) * trade["quantity"]
         supabase.table("demo_trades").update({
             "sell_price": current_price,
             "sell_date": datetime.now(timezone.utc).isoformat(),
             "status": "closed",
-            "profit_loss": round(profit_loss, 2)
+            "profit_loss": round(profit_loss, 2),
+            "exit_reason": exit_reason
         }).eq("id", trade["id"]).execute()
-        portfolio = supabase.table("demo_portfolios").select("balance").eq("user_id", trade["user_id"]).maybeSingle().execute()
+        portfolio = supabase.table("demo_portfolios").select("us_balance").eq("user_id", trade["user_id"]).maybeSingle().execute()
         if portfolio.data:
-            new_balance = portfolio.data["balance"] + (trade["quantity"] * current_price)
-            supabase.table("demo_portfolios").update({"balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
-        print(f"✅ BOT SATIŞ: {trade['symbol']} | K/Z: ${profit_loss:.2f}")
+            new_balance = portfolio.data["us_balance"] + (trade["quantity"] * current_price)
+            supabase.table("demo_portfolios").update({"us_balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
+        print(f"✅ BOT SATIŞ ({exit_reason}): {trade['symbol']} | K/Z: ${profit_loss:.2f}")
     except Exception as e:
         print(f"❌ Bot satış hatası: {e}")
 
@@ -624,8 +687,11 @@ def bot_check_open_positions():
                 if hist.empty:
                     continue
                 current_price = float(hist["Close"].iloc[-1])
-                if bot_should_sell(trade["buy_price"], current_price):
-                    bot_sell(trade, current_price)
+                should_sell, exit_reason, new_peak = us_bot_should_sell(trade, current_price)
+                if should_sell:
+                    bot_sell(trade, current_price, exit_reason)
+                elif new_peak != (trade.get("peak_price") or trade["buy_price"]):
+                    supabase.table("demo_trades").update({"peak_price": new_peak}).eq("id", trade["id"]).execute()
             except:
                 continue
             time.sleep(0.3)
@@ -633,26 +699,30 @@ def bot_check_open_positions():
         print(f"❌ Pozisyon kontrol hatası: {e}")
 
 
-def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id):
+def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id, score=0, reasons=None, trend_data=None):
     try:
         if not bot_should_buy(price_change, volume_ratio, conviction):
             return
         print(f"🤖 Bot {symbol}: AL")
-        portfolios = supabase.table("demo_portfolios").select("user_id, balance").execute()
+        portfolios = supabase.table("demo_portfolios").select("user_id, us_balance").execute()
         if not portfolios.data:
             return
         for portfolio in portfolios.data:
             user_id = portfolio["user_id"]
-            balance = portfolio["balance"]
+            balance = portfolio.get("us_balance", 0) or 0
             if balance < 10:
                 continue
             profile = supabase.table("profiles").select("is_pro").eq("id", user_id).limit(1).execute()
             is_pro = profile.data[0].get("is_pro", False) if profile.data else False
-            bot_buy(user_id, symbol, price, signal_id, is_pro, balance)
+            bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons or [], trend_data)
             time.sleep(0.2)
     except Exception as e:
         print(f"❌ Bot sinyal hatası: {e}")
 
+
+# ============================================================
+# SİNYAL MOTORU
+# ============================================================
 
 def run_premarket_scan():
     """Gece analizi — sinyalleri DB'ye kaydet, push GÖNDERME"""
@@ -909,7 +979,13 @@ def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
         signal_id = result.data[0].get("id") if result.data else None
         print(f"✅ KAYDEDİLDİ: {description}")
 
-        bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id)
+        trend_for_levels = get_5day_trend(symbol)
+        bot_process_signal(
+            symbol, price, price_change, volume_ratio, conviction, signal_id,
+            score=score,
+            reasons=[catalyst["headline"]] if catalyst else [],
+            trend_data=trend_for_levels
+        )
 
         push_body = f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x"
         if company_name:
@@ -982,6 +1058,13 @@ def connect_websocket():
         on_close=on_close
     )
     ws.run_forever()
+
+
+def position_monitor_loop():
+    """Borsa açıkken 60sn'de bir açık pozisyonları kontrol eder (stop/hedef/reversal)"""
+    while is_market_open():
+        bot_check_open_positions()
+        time.sleep(60)
 
 
 def start():
@@ -1057,12 +1140,13 @@ def start():
 
             # ============================================================
             # BORSA AÇIK: 13:30-20:00 UTC (16:30-23:00 TR)
-            # WebSocket ile canlı takip
+            # WebSocket ile canlı takip + 60sn'de pozisyon izleme
             # ============================================================
             elif is_market_open():
                 night_scan_done = False
                 morning_signals_sent = False
                 print(f"📡 US WebSocket bağlanıyor... ({len(active_symbols)} hisse)")
+                threading.Thread(target=position_monitor_loop, daemon=True).start()
                 connect_websocket()
 
             # ============================================================
