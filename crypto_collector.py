@@ -816,6 +816,7 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         "orderbook": orderbook,
         "conviction": conviction, "reasons": reasons,
         "score": score, "layer": layer,
+        "hist_rate": hist["rate"] if hist else None,
     }
 
 # ============================================================
@@ -1185,7 +1186,7 @@ def parse_ai(text):
 # SİNYAL KAYDET & GÖNDER
 # ============================================================
 
-def save_and_push_signal(s, fg):
+def save_and_push_signal(s, fg, allow_buy=True):
     try:
         price = s["price"]
         if price < 0.0001:
@@ -1246,13 +1247,15 @@ def save_and_push_signal(s, fg):
         except Exception as e:
             print(f"⚠️ Outcome kayıt: {e}")
 
-        # Bot işle
-        crypto_bot_process(
-            s["symbol"], price, s["conviction"],
-            s["ch1h"], s["vol_chg"], s["layer"], sid,
-            s.get("rsi"), s.get("obv_trend"),
-            s.get("atr", 0), s.get("reasons"), s.get("orderbook")
-        )
+        # Bot işle — sadece bu tarama için seçilen "en iyi" sinyal alım yapar
+        if allow_buy:
+            crypto_bot_process(
+                s["symbol"], price, s["conviction"],
+                s["ch1h"], s["vol_chg"], s["layer"], sid,
+                s.get("rsi"), s.get("obv_trend"),
+                s.get("atr", 0), s.get("reasons"), s.get("orderbook"),
+                s.get("score", 0), s.get("hist_rate")
+            )
 
         send_push(
             title=f"{emoji} {s['symbol']} — {s['conviction']}",
@@ -1272,18 +1275,14 @@ def save_and_push_signal(s, fg):
 # KRİPTO BOT
 # ============================================================
 
-def crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
-    if ch1h < 0:
-        return False
+def crypto_bot_should_buy(conviction, layer):
     # Sadece en yüksek güven + birikim paterni — "savaş mimarisi"
-    if conviction == "CRITICAL" and layer == "BIRIKIM":
-        return True
-    return False
+    return conviction == "CRITICAL" and layer == "BIRIKIM"
 
 
-def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id, rsi=None, obv=None, atr=0, reasons=None, orderbook=None):
+def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id, rsi=None, obv=None, atr=0, reasons=None, orderbook=None, score=0, hist_rate=None):
     try:
-        if not crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
+        if not crypto_bot_should_buy(conviction, layer):
             return
         print(f"🤖 Kripto Bot {symbol}: AL")
         portfolios = supabase.table("demo_portfolios") \
@@ -1298,15 +1297,23 @@ def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_i
             profile = supabase.table("profiles").select("is_pro") \
                 .eq("id", user_id).limit(1).execute()
             is_pro = profile.data[0].get("is_pro", False) if profile.data else False
-            _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer, rsi, obv, atr, reasons, orderbook)
+            _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer, rsi, obv, atr, reasons, orderbook, score, hist_rate)
             time.sleep(0.2)
     except Exception as e:
         print(f"❌ Kripto bot: {e}")
 
 
-def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None, atr=0, reasons=None, orderbook=None):
+def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None, atr=0, reasons=None, orderbook=None, score=0, hist_rate=None):
     try:
+        op = supabase.table("demo_trades").select("*") \
+            .eq("user_id", user_id).eq("market", "CRYPTO") \
+            .eq("status", "open").execute()
+        open_trades = op.data or []
+        open_count = len(open_trades)
+        is_exceptional_buy = False
+
         if not is_pro:
+            # ── FREE: sabit limitler, rotasyon/istisna YOK ──────────
             month_start = datetime.now(timezone.utc).replace(
                 day=1, hour=0, minute=0, second=0).isoformat()
             mt = supabase.table("demo_trades").select("id") \
@@ -1314,10 +1321,60 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
                 .gte("created_at", month_start).execute()
             if len(mt.data) >= 3:
                 return
-            op = supabase.table("demo_trades").select("id") \
+            if open_count >= 3:
+                return
+        else:
+            # ── PRO: kapasite + rotasyon + istisna mantığı ──────────
+            exceptional_count = sum(1 for t in open_trades if t.get("is_exceptional"))
+
+            if open_count >= 3:
+                is_exceptional_candidate = (
+                    score >= 24 and hist_rate is not None and hist_rate >= 90
+                    and exceptional_count < 2
+                )
+
+                if is_exceptional_candidate and open_count < 5:
+                    is_exceptional_buy = True
+                    print(f"  🌟 İSTİSNAİ SİNYAL: {symbol} (score={score}, geçmiş=%{hist_rate}) — {open_count+1}. slot açılıyor")
+                else:
+                    weakest = min(open_trades, key=lambda t: (
+                        ((t.get("current_price") or t["buy_price"]) - t["buy_price"]) / t["buy_price"]
+                    ))
+                    weakest_change = ((weakest.get("current_price") or weakest["buy_price"]) - weakest["buy_price"]) / weakest["buy_price"]
+
+                    if weakest_change < 0:
+                        exit_price = weakest.get("current_price") or weakest["buy_price"]
+                        pl = (exit_price - weakest["buy_price"]) * weakest["quantity"]
+                        supabase.table("demo_trades").update({
+                            "sell_price": exit_price,
+                            "sell_date": datetime.now(timezone.utc).isoformat(),
+                            "status": "closed",
+                            "profit_loss": round(pl, 2),
+                            "exit_reason": f"Rotasyon — daha güçlü sinyal bulundu ({symbol})"
+                        }).eq("id", weakest["id"]).execute()
+
+                        with balance_lock:
+                            port = supabase.table("demo_portfolios").select("crypto_balance") \
+                                .eq("user_id", user_id).limit(1).execute()
+                            if port.data:
+                                new_bal = port.data[0]["crypto_balance"] + (weakest["quantity"] * exit_price)
+                                supabase.table("demo_portfolios").update({
+                                    "crypto_balance": round(new_bal, 2)
+                                }).eq("user_id", user_id).execute()
+
+                        print(f"  🔄 ROTASYON: {weakest['symbol']} kapatıldı (%{weakest_change*100:.1f}) → {symbol} için yer açıldı")
+                    else:
+                        return
+
+        pct = 0.20 if conviction == "CRITICAL" else 0.15 if conviction == "HIGH" else 0.10
+
+        if not is_pro:
+            month_start = datetime.now(timezone.utc).replace(
+                day=1, hour=0, minute=0, second=0).isoformat()
+            mt = supabase.table("demo_trades").select("id") \
                 .eq("user_id", user_id).eq("market", "CRYPTO") \
-                .eq("status", "open").execute()
-            if len(op.data) >= 3:
+                .gte("created_at", month_start).execute()
+            if len(mt.data) >= 3:
                 return
 
         pct = 0.20 if conviction == "CRITICAL" else 0.15 if conviction == "HIGH" else 0.10
@@ -1333,7 +1390,6 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
         entry_ob_ratio = orderbook.get("bid_ask_ratio") if orderbook else None
 
         with balance_lock:
-            # Bakiyeyi tekrar oku — check_positions arada kapatmış olabilir
             fresh = supabase.table("demo_portfolios").select("crypto_balance") \
                 .eq("user_id", user_id).limit(1).execute()
             current_balance = fresh.data[0]["crypto_balance"] if fresh.data else balance
@@ -1357,6 +1413,7 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
                 "current_price": price,
                 "peak_price": price,
                 "entry_reason": entry_reason,
+                "is_exceptional": is_exceptional_buy,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }).execute()
 
@@ -1364,7 +1421,8 @@ def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, convicti
                 "crypto_balance": round(current_balance - invest, 2)
             }).eq("user_id", user_id).execute()
 
-        print(f"  ✅ Bot alım: {user_id} → {symbol} ${invest:.0f} | {layer} | Stop:{stop_price} Hedef:{target_price}")
+        tag = "🌟" if is_exceptional_buy else "✅"
+        print(f"  {tag} Bot alım: {user_id} → {symbol} ${invest:.0f} | {layer} | Stop:{stop_price} Hedef:{target_price}")
     except Exception as e:
         print(f"❌ Bot buy: {e}")
 
@@ -1649,9 +1707,18 @@ def scan_once(scan_count=0):
 
     print(f"\n📋 {len(scored)} aday → {len(top)} sinyal seçildi")
 
+    # Bu taramada CRITICAL+BİRİKİM olanlar arasından SADECE en yüksek skorlu
+    # olan bota alım yaptırır (istisnai +2 mantığı _crypto_bot_buy içinde).
+    buy_candidates = [s for s in top if s["conviction"] == "CRITICAL" and s["layer"] == "BIRIKIM"]
+    best_buy_symbol = None
+    if buy_candidates:
+        best_buy_symbol = max(buy_candidates, key=lambda x: x["score"])["symbol"]
+        if len(buy_candidates) > 1:
+            print(f"  ⚖️ {len(buy_candidates)} CRITICAL+BİRİKİM aday — sadece {best_buy_symbol} (en yüksek skor) bota gidiyor")
+
     signals_found = 0
     for s in top:
-        if save_and_push_signal(s, fg):
+        if save_and_push_signal(s, fg, allow_buy=(s["symbol"] == best_buy_symbol)):
             signals_found += 1
         time.sleep(0.5)
 
