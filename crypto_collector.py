@@ -443,12 +443,14 @@ def close_confirmation_score(trade, tech, ob):
         }
         return 99, [label_map.get(trail_label, "Stop vuruldu")], False, trailing_stop
 
-    # Tutma süresi
+    # Tutma süresi — Supabase tarihleri tz bilgisi olmadan dönebilir
     try:
         buy_dt = datetime.fromisoformat(trade["buy_date"].replace("Z", "+00:00"))
+        if buy_dt.tzinfo is None:
+            buy_dt = buy_dt.replace(tzinfo=timezone.utc)
         hold_hours = (datetime.now(timezone.utc) - buy_dt).total_seconds() / 3600
     except Exception:
-        hold_hours = 0
+        hold_hours = MIN_HOLD_HOURS  # parse hatasında güvenli taraf: kilitleme
 
     # VETO: 4 saat dolmadan doğrulama katmanı çıkışı yok (stop hariç)
     if hold_hours < MIN_HOLD_HOURS:
