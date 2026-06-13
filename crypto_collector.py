@@ -1275,13 +1275,8 @@ def save_and_push_signal(s, fg):
 def crypto_bot_should_buy(conviction, ch1h, vol_chg, layer):
     if ch1h < 0:
         return False
-    if conviction == "CRITICAL":
-        return True
-    if conviction == "HIGH" and layer in ["BIRIKIM", "WATCHLIST"]:
-        return True
-    if conviction == "HIGH" and ch1h >= 5 and vol_chg >= 200:
-        return True
-    if conviction == "MEDIUM" and layer == "BIRIKIM" and vol_chg >= 500:
+    # Sadece en yüksek güven + birikim paterni — "savaş mimarisi"
+    if conviction == "CRITICAL" and layer == "BIRIKIM":
         return True
     return False
 
@@ -1446,8 +1441,11 @@ def crypto_bot_check_positions():
                     print(f"  ⚠️ SAT UYARISI: {trade['symbol']} — {reason_str}")
 
                 # ── Hedef/Stop/Reversal+kâr → kapat ───────────────────
+                # Reversal ile kapanış için en az %1.5 kâr şartı — küçük titremelerle çıkmayalım
+                reversal_profit_ok = current >= buy_price * 1.015
+
                 should_close = current >= target_price or current <= new_stop or \
-                    (reversal_reasons and current > buy_price)
+                    (reversal_reasons and reversal_profit_ok)
 
                 if should_close:
                     pl = (current - buy_price) * trade["quantity"]
