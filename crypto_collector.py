@@ -43,6 +43,7 @@ VERİ KAYNAKLARI:
 import os
 import json
 import time
+import math
 import requests
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -116,6 +117,17 @@ WATCHLIST_MIN_SCORE = 9        # İzlemeye girmek için min skor (MEDIUM eşiği
 WATCH_MOVE_RSI_DROP = 15        # RSI bu kadar düşerse hareketlendi
 WATCH_MOVE_PRICE_PCT = 0.05     # Fiyat %5+ değiştiyse hareketlendi
 WATCH_MOVE_VOL_PCT = 200        # Hacim değişimi bu kadar farklılaştıysa hareketlendi
+
+# ── OTOMATİK ÖĞRENME SİSTEMİ ─────────────────────────────────
+# 90 gün veri toplar, yeterli örnek + istatistiksel anlamlılık
+# varsa score_coin'e küçük bir katsayı olarak otomatik uygulanır.
+# Manuel müdahale gerektirmez.
+LEARNING_MIN_SAMPLES = 30        # Grup başına min örnek (akademik standart: 30+)
+LEARNING_MIN_ABS_Z = 1.96         # ~p<0.05 için z-skor eşiği
+LEARNING_MAX_BONUS = 3            # score_coin'e uygulanacak max ek/eksi puan
+LEARNING_BASELINE_WINRATE = 0.45  # "Başarı" referansı: 24s içinde >%2 kâr oranı
+OUTCOME_CHECK_HOURS = [24, 72, 168]   # 24s, 72s, 7g sonuç ölçümü
+
 
 STABLECOIN_BASES = {
     "USDT", "USDC", "FDUSD", "TUSD", "USDP", "GUSD", "PYUSD", "RLUSD",
@@ -746,6 +758,13 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     if score < 6:
         return None
 
+    # ── OTOMATİK ÖĞRENME KATSAYISI ───────────────────────────
+    # 90 gün veri biriktikçe otomatik devreye girer, manuel müdahale yok.
+    learning_bonus = get_learning_bonus(layer, rsi, obv_trend)
+    if learning_bonus != 0:
+        score += learning_bonus
+        reasons.append(f"🧠 Öğrenme katsayısı: {learning_bonus:+d}")
+
     if score >= 20:
         conviction = "CRITICAL"
     elif score >= 14:
@@ -768,8 +787,193 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     }
 
 # ============================================================
-# İZLEME LİSTESİ — bilgi amaçlı, bot kararına karışmaz
+# OTOMATİK ÖĞRENME SİSTEMİ
 # ============================================================
+# Akış:
+# 1. Her bot alımında signal_outcomes'a kayıt atılır (record_signal_outcome)
+# 2. Her taramada check_signal_outcomes() 24s/72s/7g dolan kayıtların
+#    gerçek sonucunu ölçer (fiyat şu an ne oldu, kâr/zarar %)
+# 3. update_learning_weights() yeterli örnek (>=30) + istatistiksel
+#    anlamlılık (|z|>=1.96) varsa learning_weights tablosuna katsayı yazar
+# 4. score_coin() bu katsayıyı okuyup ±LEARNING_MAX_BONUS uygular
+# Hiçbir adım manuel müdahale gerektirmez — sistem kendi kendine evrilir.
+
+def rsi_bucket(rsi):
+    if rsi is None:
+        return "RSI_YOK"
+    if rsi < 30:
+        return "RSI<30"
+    if rsi < 50:
+        return "RSI30-50"
+    if rsi < 70:
+        return "RSI50-70"
+    return "RSI70+"
+
+
+def record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv_trend, entry_price):
+    """Bot alımı yapıldığında çağrılır — 24s/72s/7g sonuç takibi için kayıt at."""
+    try:
+        supabase.table("signal_outcomes").insert({
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "layer": layer,
+            "conviction": conviction,
+            "entry_rsi": rsi,
+            "entry_obv": obv_trend,
+            "entry_price": entry_price,
+            "checked_24h": False,
+            "checked_72h": False,
+            "checked_7d": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ signal_outcomes kayıt: {e}")
+
+
+def check_signal_outcomes():
+    """
+    24s/72s/7g eşiklerini dolduran kayıtların gerçek sonucunu ölçer.
+    Her taramada bir kerelik küçük bir iş — ağır değil (max ~20 sorgu).
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        field_map = {24: "24h", 72: "72h", 168: "7d"}
+
+        for hours in OUTCOME_CHECK_HOURS:
+            field = field_map[hours]
+            cutoff = (now - timedelta(hours=hours)).isoformat()
+
+            rows = supabase.table("signal_outcomes") \
+                .select("*") \
+                .eq(f"checked_{field}", False) \
+                .lte("created_at", cutoff) \
+                .limit(20).execute()
+
+            if not rows.data:
+                continue
+
+            for row in rows.data:
+                try:
+                    tech = get_technical_data(row["symbol"])
+                    if not tech:
+                        supabase.table("signal_outcomes").update({
+                            f"checked_{field}": True
+                        }).eq("id", row["id"]).execute()
+                        continue
+
+                    current = tech["price"]
+                    entry = float(row["entry_price"])
+                    pct = ((current - entry) / entry) * 100 if entry > 0 else 0
+
+                    supabase.table("signal_outcomes").update({
+                        f"price_{field}": current,
+                        f"pct_{field}": round(pct, 2),
+                        f"checked_{field}": True,
+                    }).eq("id", row["id"]).execute()
+
+                except Exception:
+                    continue
+                time.sleep(0.2)
+
+    except Exception as e:
+        print(f"❌ check_signal_outcomes: {e}")
+
+
+def update_learning_weights():
+    """
+    layer + RSI bucket + OBV kombinasyonu başına 24s sonuçlarını analiz eder.
+    >=30 örnek VE |z|>=1.96 (yaklaşık p<0.05) ise learning_weights'e
+    küçük bir katsayı yazar. Aksi halde dokunmaz (veri yetersiz).
+    """
+    try:
+        rows = supabase.table("signal_outcomes") \
+            .select("layer, entry_rsi, entry_obv, pct_24h") \
+            .eq("checked_24h", True) \
+            .not_.is_("pct_24h", "null") \
+            .execute()
+
+        if not rows.data or len(rows.data) < LEARNING_MIN_SAMPLES:
+            return
+
+        groups = defaultdict(list)
+        for r in rows.data:
+            bucket = rsi_bucket(r.get("entry_rsi"))
+            key = (r.get("layer") or "?", bucket, r.get("entry_obv") or "?")
+            groups[key].append(r["pct_24h"])
+
+        updated = 0
+        for (layer, bucket, obv), pcts in groups.items():
+            n = len(pcts)
+            if n < LEARNING_MIN_SAMPLES:
+                continue
+
+            wins = sum(1 for p in pcts if p > 2)
+            win_rate = wins / n
+
+            # z-test: gözlenen oran vs baseline (0.45)
+            p0 = LEARNING_BASELINE_WINRATE
+            se = math.sqrt(p0 * (1 - p0) / n)
+            z = (win_rate - p0) / se if se > 0 else 0
+
+            if abs(z) < LEARNING_MIN_ABS_Z:
+                continue  # istatistiksel olarak anlamsız, dokunma
+
+            # z=1.96 → bonus=1, z=3+ → bonus=LEARNING_MAX_BONUS, doğrusal ölçek
+            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS
+            bonus = round(magnitude) if z > 0 else -round(magnitude)
+            bonus = max(-LEARNING_MAX_BONUS, min(LEARNING_MAX_BONUS, bonus))
+
+            if bonus == 0:
+                continue
+
+            key_str = f"{layer}|{bucket}|{obv}"
+            supabase.table("learning_weights").upsert({
+                "pattern_key": key_str,
+                "layer": layer,
+                "rsi_bucket": bucket,
+                "obv_trend": obv,
+                "sample_size": n,
+                "win_rate": round(win_rate * 100, 1),
+                "z_score": round(z, 2),
+                "bonus": bonus,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="pattern_key").execute()
+
+            updated += 1
+            print(f"  🧠 ÖĞRENME: {key_str} → bonus:{bonus:+d} "
+                  f"(n={n}, win_rate=%{win_rate*100:.1f}, z={z:.2f})")
+
+        if updated:
+            print(f"  🧠 {updated} patern güncellendi")
+
+    except Exception as e:
+        print(f"❌ update_learning_weights: {e}")
+
+
+_learning_cache = {"data": {}, "ts": 0}
+
+
+def get_learning_bonus(layer, rsi, obv_trend):
+    """
+    score_coin tarafından çağrılır. learning_weights'ten önceden
+    hesaplanmış katsayıyı okur. 10 dakika cache'lenir — her coin
+    için ayrı sorgu atmaz.
+    """
+    global _learning_cache
+    now = time.time()
+    if now - _learning_cache["ts"] > 600:
+        try:
+            rows = supabase.table("learning_weights").select("*").execute()
+            _learning_cache["data"] = {r["pattern_key"]: r["bonus"] for r in (rows.data or [])}
+            _learning_cache["ts"] = now
+        except Exception:
+            pass
+
+    bucket = rsi_bucket(rsi)
+    key = f"{layer}|{bucket}|{obv_trend}"
+    return _learning_cache["data"].get(key, 0)
+
+
 # Kapasite: max 39 (3x13). Doluyken yeni aday, en düşük skorlu
 # kayıttan yüksekse onun yerine geçer. 7 gün hareketsiz kalan silinir.
 # "Hareketlendi" tespit edilirse status='signaled' yapılır (push yok,
@@ -1310,6 +1514,9 @@ def _execute_buy(user_id, symbol, price, signal_id, conviction, layer,
         print(f"  {tag} ALIM: {user_id[:8]} → {symbol} ${invest:.0f} "
               f"| Başlangıç stop:{stop_price:.8f} (%{STOP_PCT*100:.0f})")
 
+        # Öğrenme sistemi — 24s/72s/7g sonuç takibi için kayıt
+        record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv, price)
+
         # PUSH — sadece alım anında
         if price < 0.0001:
             ps = f"${price:.8f}"
@@ -1448,6 +1655,11 @@ def scan_once(scan_count=0):
 
     # ── ÖNCE izleme listesini kontrol et ───────────────────
     check_watchlist_movement()
+
+    # ── Öğrenme sistemi — 3 taramada bir (ağır işlem) ──────
+    if scan_count % 3 == 0:
+        check_signal_outcomes()
+        update_learning_weights()
 
     fg = get_fear_greed()
     if fg:
