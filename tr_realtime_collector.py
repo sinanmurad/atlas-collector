@@ -382,7 +382,7 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance):
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
         supabase.table("demo_portfolios").update({
-            "balance": round(balance - invest, 2)
+            "bist_balance": round(balance - invest, 2)
         }).eq("user_id", user_id).execute()
         print(f"✅ BOT ALIM: {user_id} → {symbol} @ {price:.2f} TL")
         return True
@@ -400,10 +400,10 @@ def bot_sell(trade, current_price):
             "status": "closed",
             "profit_loss": round(profit_loss, 2)
         }).eq("id", trade["id"]).execute()
-        portfolio = supabase.table("demo_portfolios").select("balance").eq("user_id", trade["user_id"]).maybeSingle().execute()
+        portfolio = supabase.table("demo_portfolios").select("bist_balance").eq("user_id", trade["user_id"]).maybeSingle().execute()
         if portfolio.data:
-            new_balance = portfolio.data["balance"] + (trade["quantity"] * current_price)
-            supabase.table("demo_portfolios").update({"balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
+            new_balance = portfolio.data["bist_balance"] + (trade["quantity"] * current_price)
+            supabase.table("demo_portfolios").update({"bist_balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
         print(f"✅ BOT SATIŞ: {trade['symbol']} | K/Z: {profit_loss:.2f} TL")
     except Exception as e:
         print(f"❌ Bot satış hatası: {e}")
@@ -431,12 +431,12 @@ def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, si
         if not bot_should_buy(price_change, volume_ratio, conviction):
             return
         print(f"🤖 Bot {symbol}: AL")
-        portfolios = supabase.table("demo_portfolios").select("user_id, balance").execute()
+        portfolios = supabase.table("demo_portfolios").select("user_id, bist_balance").execute()
         if not portfolios.data:
             return
         for portfolio in portfolios.data:
             user_id = portfolio["user_id"]
-            balance = portfolio["balance"]
+            balance = portfolio.get("bist_balance", 0) or 0
             if balance < 10:
                 continue
             profile = supabase.table("profiles").select("is_pro").eq("id", user_id).limit(1).execute()
