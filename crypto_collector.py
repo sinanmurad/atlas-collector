@@ -1,27 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-ATLAS KRİPTO KARTAL GÖZÜ v4
-================================
-HAVUZ 1 — ANLIK SİNYAL: Günde 1-5 coin, hepsi kazanacak
-HAVUZ 2 — İZLEME: Yeni/genç coinler, aylar boyu takip, olgunlaşınca sinyal
+ATLAS KRİPTO KARTAL GÖZÜ — V12 SAVAŞ MİMARİSİ
+================================================
+HEDEF: Az sinyal, yüksek kalite. Gerçek dünya simülasyonu.
 
-VERİ KAYNAKLARI (hepsi ücretsiz, API key yok):
-- MEXC  : api.mexc.com/api/v3/ticker/24hr + klines + depth
-- Gate.io: api.gateio.ws/api/v4/spot/tickers + candlesticks
-- Binance: api1-4.binance.com/api/v3/klines
-- CMC    : listings/latest (Basic plan)
-- Fear & Greed: alternative.me
+3 KATMAN:
+1. SİNYAL LİSTESİ (Keşfet/anlık) — CRITICAL+HIGH, kullanıcı görür, push alır.
+   Bot kararını etkilemez, sadece bilgilendirme.
+2. BOT — sadece CRITICAL+BİRİKİM, tarama başına TEK aday (en yüksek skor).
+3. TRAILING STOP — coin yükseldikçe stop yukarı çekilir, sabit hedef YOK.
 
-SCAM FİLTRESİ:
-- Sahte hacim tespiti (wash trading)
-- Bid-ask spread kontrolü
-- OBV vs hacim çelişkisi
-- Likidite kontrolü
-- Geç giriş koruması
+KURALLAR:
+- Max 3 açık pozisyon (Pro: +2 istisna = max 5)
+- Tarama başına MAX 1 alım (en yüksek skorlu CRITICAL+BİRİKİM)
+- Trailing stop:
+    kâr <%3      → stop = giriş - %8 (sabit)
+    kâr %3-%8    → stop = giriş (breakeven)
+    kâr %8-%15   → stop = zirveden -%4
+    kâr >=%15    → stop = zirveden -%6
+- Min tutma: 4 saat (doğrulama katmanı çıkışları için — stop her zaman aktif)
+- Kapatma: stop/trailing HER ZAMAN aktif. Doğrulama katmanı ≥5 puan + 4 saat
+- Rotasyon: TAMAMEN KALDIRILDI
+- Push: Sadece AL ve SAT anında
 
-V5: Sinyal sonuç takibi (24s/72s/7g) + geçmiş başarı oranı
-V6: Order book duvar analizi
-V8: Periyodik istatistik raporu (en iyi/zayıf paternler)
+DOĞRULAMA KATMANI (4 saat sonrası, stop dışı çıkışlar için):
+- OBV 4h "down" geçti          → +3 puan
+- RSI giriş - 15+ düştü        → +2 puan
+- Order book giriş oranının
+  yarısına düştü               → +3 puan
+- Zirveden %7+ çekilme (kârda) → +2 puan
+- 4h hacim %70+ azaldı         → +1 puan
+- Kâr < %3                     → -3 puan (erken çıkışı engeller)
+Minimum: ≥5 puan VE tutma ≥4 saat
+
+VERİ KAYNAKLARI:
+- MEXC, Gate.io, Binance (teknik)
+- CMC Basic (hacim/mcap/momentum)
+- Fear & Greed (alternative.me)
+- Order Book (MEXC depth)
 """
 
 import os
@@ -47,16 +63,14 @@ CMC_API_KEY = os.environ.get("CMC_API_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Hafızada cache
-signal_cache = {}       # Son 2 saatte sinyal verilen coinler
-watchlist_cache = {}    # İzleme havuzu (sembol → ilk görülme zamanı + veriler)
-balance_lock = threading.Lock()   # ← YENİ: bakiye okuma/yazma her zaman atomik
+signal_cache = {}
+balance_lock = threading.Lock()
 
 try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
         firebase_admin.initialize_app(cred)
-        print("✅ Firebase Admin başlatıldı")
+        print("✅ Firebase başlatıldı")
 except Exception as e:
     print(f"⚠️ Firebase: {e}")
 
@@ -72,9 +86,36 @@ BINANCE_URLS = [
     "https://api4.binance.com",
 ]
 
+# ============================================================
+# SABİT PARAMETRELER
+# ============================================================
+
+STOP_PCT = 0.08              # %8 sabit stop (kâr <%3 iken)
+TRAIL_ACTIVATE_PCT = 0.03    # %3 kârdan sonra breakeven
+TRAIL_4_PCT = 0.08           # %8-15 kâr arası → zirveden -%4
+TRAIL_6_PCT = 0.15           # %15+ kâr → zirveden -%6
+MIN_HOLD_HOURS = 4            # 4 saat tutmadan doğrulama katmanı çıkışı yok
+CLOSE_SCORE_MIN = 5           # Doğrulama katmanı minimum puan
+MIN_PROFIT_PCT = 0.03         # Doğrulama çıkışı için min %3 kâr
+MAX_OPEN_FREE = 3             # Free kullanıcı max açık pozisyon
+MAX_OPEN_PRO = 3              # Pro max normal pozisyon
+MAX_OPEN_PRO_EXCEPTIONAL = 5  # Pro istisna ile max
+INVEST_PCT_CRITICAL = 0.20    # CRITICAL sinyalde bakiyenin %20'si
+INVEST_PCT_HIGH = 0.15        # HIGH sinyalde %15
+MAX_INVEST_USD = 50           # Pozisyon başı max $50
+MIN_INVEST_USD = 5            # Pozisyon başı min $5
+SIGNAL_COOLDOWN_H = 4         # Aynı coin için min 4 saat arayla sinyal
+
+STABLECOIN_BASES = {
+    "USDT", "USDC", "FDUSD", "TUSD", "USDP", "GUSD", "PYUSD", "RLUSD",
+    "USDG", "USDGO", "USD1", "BUSD", "USDD", "DAI", "USDS", "SUSDS",
+    "USDX", "CRVUSD", "LISUSD", "USDE", "SUSDE", "USDY", "USDM", "USDL",
+    "USDO", "USDN", "USD0", "USD0PP", "SFRXUSD", "FRAX", "SYRUPUSDC",
+    "BUIDL", "USTC", "USDF", "EURT", "EURS", "EURC", "XAUT", "PAXG",
+}
 
 # ============================================================
-# PUSH BİLDİRİM
+# PUSH BİLDİRİM — Sadece AL ve SAT
 # ============================================================
 
 def send_push(title, body, signal_id=None, market="CRYPTO"):
@@ -95,31 +136,32 @@ def send_push(title, body, signal_id=None, market="CRYPTO"):
                     },
                     android=messaging.AndroidConfig(
                         priority="high",
-                        notification=messaging.AndroidNotification(channel_id="atlas_signals"),
+                        notification=messaging.AndroidNotification(
+                            channel_id="atlas_signals"
+                        ),
                     ),
                     apns=messaging.APNSConfig(
-                        payload=messaging.APNSPayload(aps=messaging.Aps(sound="default", badge=1))
+                        payload=messaging.APNSPayload(
+                            aps=messaging.Aps(sound="default", badge=1)
+                        )
                     ),
                     token=token,
                 )
                 messaging.send(msg)
-            except:
+            except Exception:
                 pass
-        print(f"📱 Push gönderildi: {len(tokens)} kullanıcı")
+        print(f"📱 Push: {title}")
     except Exception as e:
-        print(f"❌ Push: {e}")
-
+        print(f"❌ Push hatası: {e}")
 
 # ============================================================
-# VERİ KAYNAKLARI — 3 BORSA
+# VERİ KAYNAKLARI
 # ============================================================
 
 def get_mexc_tickers():
-    """MEXC tüm spot pariteler — API key yok"""
     try:
         r = requests.get(
-            "https://api.mexc.com/api/v3/ticker/24hr",
-            timeout=15
+            "https://api.mexc.com/api/v3/ticker/24hr", timeout=15
         )
         if r.status_code == 200:
             data = r.json()
@@ -131,11 +173,9 @@ def get_mexc_tickers():
 
 
 def get_gateio_tickers():
-    """Gate.io tüm spot pariteler — API key yok"""
     try:
         r = requests.get(
-            "https://api.gateio.ws/api/v4/spot/tickers",
-            timeout=15
+            "https://api.gateio.ws/api/v4/spot/tickers", timeout=15
         )
         if r.status_code == 200:
             data = r.json()
@@ -147,39 +187,30 @@ def get_gateio_tickers():
 
 
 def get_cmc_coins():
-    """CMC Basic plan — aux yok, price_min/max yok"""
     try:
         all_coins = {}
-
         r1 = requests.get(
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
             headers=CMC_HEADERS,
             params={"limit": 500, "convert": "USD", "sort": "volume_24h", "sort_dir": "desc"},
-            timeout=30
+            timeout=30,
         )
         if r1.status_code == 200:
             for c in r1.json().get("data", []):
                 all_coins[c["id"]] = c
             print(f"  → CMC hacim: {len(all_coins)} coin")
-        else:
-            print(f"⚠️ CMC-1: {r1.status_code}")
-
         time.sleep(2)
-
         r2 = requests.get(
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
             headers=CMC_HEADERS,
             params={"limit": 500, "convert": "USD", "sort": "percent_change_1h", "sort_dir": "desc"},
-            timeout=30
+            timeout=30,
         )
         if r2.status_code == 200:
             for c in r2.json().get("data", []):
                 if c["id"] not in all_coins:
                     all_coins[c["id"]] = c
             print(f"  → CMC momentum: toplam {len(all_coins)} coin")
-        else:
-            print(f"⚠️ CMC-2: {r2.status_code}")
-
         return list(all_coins.values())
     except Exception as e:
         print(f"❌ CMC: {e}")
@@ -191,78 +222,73 @@ def get_fear_greed():
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
         d = r.json()["data"][0]
         return {"value": int(d["value"]), "label": d["value_classification"]}
-    except:
+    except Exception:
         return None
 
-
 # ============================================================
-# TEKNİK ANALİZ — MEXC → Gate.io → Binance
+# TEKNİK ANALİZ
 # ============================================================
 
 def get_klines(symbol, interval="4h", limit=100):
-    """3 borsadan sırayla dene — en geniş kapsam"""
     sym_usdt = symbol.upper() + "USDT" if not symbol.upper().endswith("USDT") else symbol.upper()
     sym_gate = symbol.upper() + "_USDT"
 
-    # 1. MEXC
     try:
         r = requests.get(
             "https://api.mexc.com/api/v3/klines",
             params={"symbol": sym_usdt, "interval": interval, "limit": limit},
-            timeout=5
+            timeout=5,
         )
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list) and len(data) > 10:
                 return data, "MEXC"
-    except:
+    except Exception:
         pass
 
-    # 2. Gate.io
     try:
-        interval_map = {"1h": "3600", "4h": "14400", "15m": "900", "1d": "86400"}
-        gate_interval = interval_map.get(interval, "14400")
+        imap = {"1h": "3600", "4h": "14400", "15m": "900", "1d": "86400"}
+        gi = imap.get(interval, "14400")
         r = requests.get(
             "https://api.gateio.ws/api/v4/spot/candlesticks",
-            params={"currency_pair": sym_gate, "interval": gate_interval, "limit": limit},
-            timeout=5
+            params={"currency_pair": sym_gate, "interval": gi, "limit": limit},
+            timeout=5,
         )
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list) and len(data) > 10:
                 converted = [
-                    [int(c[0])*1000, c[5], c[3], c[4], c[2], c[1]]
+                    [int(c[0]) * 1000, c[5], c[3], c[4], c[2], c[1]]
                     for c in data
                 ]
                 return converted, "Gate.io"
-    except:
+    except Exception:
         pass
 
-    # 3. Binance
-    for base_url in BINANCE_URLS:
+    for base in BINANCE_URLS:
         try:
             r = requests.get(
-                f"{base_url}/api/v3/klines",
+                f"{base}/api/v3/klines",
                 params={"symbol": sym_usdt, "interval": interval, "limit": limit},
-                timeout=5
+                timeout=5,
             )
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list) and len(data) > 10:
                     return data, "Binance"
-        except:
+        except Exception:
             continue
 
     return None, None
 
 
-def get_orderbook_signal(symbol):
+def get_orderbook(symbol):
     sym_usdt = symbol.upper() + "USDT"
     try:
         r = requests.get(
             "https://api.mexc.com/api/v3/depth",
             params={"symbol": sym_usdt, "limit": 100},
-            timeout=5
+            timeout=5,
         )
         if r.status_code != 200:
             return None
@@ -271,20 +297,16 @@ def get_orderbook_signal(symbol):
         asks = data.get("asks", [])
         if not bids or not asks:
             return None
-
-        mid_price = (float(bids[0][0]) + float(asks[0][0])) / 2
-
-        bid_wall = sum(float(p) * float(q) for p, q in bids if float(p) >= mid_price * 0.98)
-        ask_wall = sum(float(p) * float(q) for p, q in asks if float(p) <= mid_price * 1.02)
-
+        mid = (float(bids[0][0]) + float(asks[0][0])) / 2
+        bid_wall = sum(float(p) * float(q) for p, q in bids if float(p) >= mid * 0.98)
+        ask_wall = sum(float(p) * float(q) for p, q in asks if float(p) <= mid * 1.02)
         ratio = bid_wall / ask_wall if ask_wall > 0 else 0
-
         return {
             "bid_wall_usd": round(bid_wall, 2),
             "ask_wall_usd": round(ask_wall, 2),
             "bid_ask_ratio": round(ratio, 2),
         }
-    except:
+    except Exception:
         return None
 
 
@@ -293,7 +315,7 @@ def calculate_rsi(closes, period=14):
         return None
     gains, losses = [], []
     for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
+        diff = closes[i] - closes[i - 1]
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
     if len(gains) < period:
@@ -311,25 +333,22 @@ def calculate_obv(closes, volumes):
     obv_list = [0]
     obv = 0
     for i in range(1, len(closes)):
-        if closes[i] > closes[i-1]:
+        if closes[i] > closes[i - 1]:
             obv += volumes[i]
-        elif closes[i] < closes[i-1]:
+        elif closes[i] < closes[i - 1]:
             obv -= volumes[i]
         obv_list.append(obv)
     trend = "up" if obv_list[-1] > obv_list[-10] else "down"
-    # OBV vs fiyat diverjansı
     price_trend = "up" if closes[-1] > closes[-10] else "down"
-    divergence = (trend == "up" and price_trend == "down")  # Bullish diverjans = BİRİKİM
+    divergence = trend == "up" and price_trend == "down"
     return trend, divergence
 
 
 def get_technical_data(symbol):
-    """RSI, OBV, ATR, 4s/1s trend. Binance yoksa MEXC veya Gate.io'dan."""
     try:
         k4h, exchange = get_klines(symbol, "4h", 100)
         if not k4h or len(k4h) < 20:
             return None
-
         closes = [float(k[4]) for k in k4h]
         volumes = [float(k[5]) for k in k4h]
         highs = [float(k[2]) for k in k4h]
@@ -337,288 +356,228 @@ def get_technical_data(symbol):
 
         rsi = calculate_rsi(closes)
         obv_trend, obv_divergence = calculate_obv(closes, volumes)
-
-        # 4s değişim
         ch4h = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if closes[-2] > 0 else 0
 
-        # Hacim trend — son 5 mum vs önceki 5 mum
         vol_recent = sum(volumes[-5:]) / 5
         vol_prev = sum(volumes[-10:-5]) / 5
         vol_surge = vol_recent / vol_prev if vol_prev > 0 else 1
 
-        # ATR(14)
-        atrs = []
-        for i in range(1, min(15, len(closes))):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i-1]),
-                abs(lows[i] - closes[i-1])
-            )
-            atrs.append(tr)
-        atr = sum(atrs) / len(atrs) if atrs else 0
-
-        # SAHTE HACİM TESPİTİ
-        # Hacim yüksek ama fiyat hiç oynamamış = wash trading şüphesi
-        avg_candle_body = sum(abs(float(k[4]) - float(k[1])) for k in k4h[-20:]) / 20
+        avg_body = sum(abs(float(k[4]) - float(k[1])) for k in k4h[-20:]) / 20
         last_body = abs(closes[-1] - float(k4h[-1][1]))
-        suspicious_volume = (vol_surge > 5 and last_body < avg_candle_body * 0.3)
+        suspicious = vol_surge > 5 and last_body < avg_body * 0.3
 
         return {
             "rsi": rsi,
             "obv_trend": obv_trend,
-            "obv_divergence": obv_divergence,  # True = bullish diverjans = birikim
+            "obv_divergence": obv_divergence,
             "ch4h": round(ch4h, 2),
             "vol_surge_4h": round(vol_surge, 2),
-            "atr": atr,
+            "vol_recent": vol_recent,
             "exchange": exchange,
-            "suspicious_volume": suspicious_volume,
+            "suspicious_volume": suspicious,
             "price": closes[-1],
+            "closes": closes,
+            "volumes": volumes,
         }
-    except:
+    except Exception:
         return None
 
+# ============================================================
+# DOĞRULAMA KATLANI — Pozisyon kapatma kararı
+# ============================================================
+
+def compute_trailing_stop(buy_price, current, peak):
+    """
+    Coin yükseldikçe stop yukarı çekilir. Sabit hedef YOK.
+
+    - Kâr < %3        → stop = giriş - %8 (sabit stop)
+    - Kâr %3 - %8     → stop = giriş (breakeven koruması)
+    - Kâr %8 - %15    → stop = zirveden %4 geri çekilme
+    - Kâr >= %15      → stop = zirveden %6 geri çekilme (büyük harekete nefes alanı)
+
+    Döner: (stop_price, etiket)
+    """
+    profit_pct = (peak - buy_price) / buy_price
+
+    if profit_pct < TRAIL_ACTIVATE_PCT:
+        return buy_price * (1 - STOP_PCT), "sabit_stop"
+    elif profit_pct < TRAIL_4_PCT:
+        return buy_price, "breakeven"
+    elif profit_pct < TRAIL_6_PCT:
+        return peak * (1 - 0.04), "trail_4pct"
+    else:
+        return peak * (1 - 0.06), "trail_6pct"
+
+
+def close_confirmation_score(trade, tech, ob):
+    """
+    Kapatma kararını çok kaynaktan doğrula.
+    Döner: (puan, [gerekçe listesi], veto_var_mı, trailing_stop_price)
+
+    - Trailing/sabit stop HER ZAMAN aktif — veto'dan etkilenmez.
+    - Doğrulama katmanı (puan >= CLOSE_SCORE_MIN) sadece tutma süresi
+      >= 4 saat ise devreye girer.
+    """
+    score = 0
+    reasons = []
+
+    if not tech:
+        return 0, [], True, None
+
+    buy_price = float(trade["buy_price"])
+    current = tech["price"]
+    peak = max(float(trade.get("peak_price") or buy_price), current)
+    entry_rsi = float(trade.get("entry_rsi") or 50)
+    entry_ob_ratio = float(trade.get("entry_ob_ratio") or 0)
+    entry_vol = float(trade.get("entry_vol_recent") or 0)
+
+    trailing_stop, trail_label = compute_trailing_stop(buy_price, current, peak)
+
+    # ── STOP/TRAILING — her zaman aktif ─────────────────────
+    if current <= trailing_stop:
+        label_map = {
+            "sabit_stop": "Sabit stop (%8) vuruldu",
+            "breakeven": "Breakeven stop vuruldu (kâr korunuyor)",
+            "trail_4pct": "Trailing stop (zirveden %4) vuruldu",
+            "trail_6pct": "Trailing stop (zirveden %6) vuruldu",
+        }
+        return 99, [label_map.get(trail_label, "Stop vuruldu")], False, trailing_stop
+
+    # Tutma süresi
+    try:
+        buy_dt = datetime.fromisoformat(trade["buy_date"].replace("Z", "+00:00"))
+        hold_hours = (datetime.now(timezone.utc) - buy_dt).total_seconds() / 3600
+    except Exception:
+        hold_hours = 0
+
+    # VETO: 4 saat dolmadan doğrulama katmanı çıkışı yok (stop hariç)
+    if hold_hours < MIN_HOLD_HOURS:
+        return 0, [f"VETO: {hold_hours:.1f}s/{MIN_HOLD_HOURS}s tutma — sadece stop aktif"], True, trailing_stop
+
+    profit_pct = (current - buy_price) / buy_price
+
+    # ── KAYNAK 1: OBV dönüşü ────────────────────────────────
+    if trade.get("entry_obv") == "up" and tech.get("obv_trend") == "down":
+        score += 3
+        reasons.append("OBV down geçti (birikim bitti)")
+
+    # ── KAYNAK 2: RSI düşüşü ────────────────────────────────
+    cur_rsi = tech.get("rsi")
+    if cur_rsi and entry_rsi and (entry_rsi - cur_rsi) >= 15:
+        score += 2
+        reasons.append(f"RSI {entry_rsi:.0f}→{cur_rsi:.0f} (momentum tepe yaptı)")
+
+    # ── KAYNAK 3: Order book bozulması ──────────────────────
+    if ob and entry_ob_ratio > 0:
+        cur_ob = ob.get("bid_ask_ratio", 0)
+        if entry_ob_ratio >= 1.5 and cur_ob <= entry_ob_ratio * 0.5:
+            score += 3
+            reasons.append(f"OB oranı {entry_ob_ratio:.2f}x → {cur_ob:.2f}x (satış baskısı)")
+        elif entry_ob_ratio >= 1.5 and cur_ob <= 0.7:
+            score += 2
+            reasons.append(f"OB oranı {cur_ob:.2f}x (alım duvarı çöktü)")
+
+    # ── KAYNAK 4: Zirveden çekilme (kâr varken) ─────────────
+    if peak > buy_price and current < peak:
+        drawdown = (peak - current) / peak
+        if drawdown >= 0.07:
+            score += 2
+            reasons.append(f"Zirveden %{drawdown*100:.1f} geri çekildi")
+
+    # ── KAYNAK 5: Hacim kuruması ─────────────────────────────
+    if entry_vol > 0:
+        vol_drop = 1 - (tech.get("vol_recent", entry_vol) / entry_vol)
+        if vol_drop >= 0.70:
+            score += 1
+            reasons.append(f"Hacim %{vol_drop*100:.0f} azaldı")
+
+    # ── Kâr <%3 → erken çıkışı caydır ───────────────────────
+    if profit_pct < MIN_PROFIT_PCT:
+        score -= 3
+        reasons.append(f"Kâr %{profit_pct*100:.1f} < %{MIN_PROFIT_PCT*100:.0f} (erken çıkış değil)")
+
+    return score, reasons, False, trailing_stop
 
 # ============================================================
-# SCAM / SAHTE HACİM FİLTRESİ
+# SCAM FİLTRESİ
 # ============================================================
 
 def scam_check(symbol, price, ch1h, ch24h, vol_chg, tech):
-    """
-    Scam ve sahte hacim tespiti.
-    True döndürürse = ŞÜPHELİ, sinyal verme.
-    """
-    # 1. Fiyat çok düşük = çöp coin riski
     if price < 0.000001:
         return True, "Fiyat çok düşük"
-
-    # 2. 24 saatte %300+ = pump & dump döngüsünde
     if ch24h >= 300:
         return True, "24s %300+ pump & dump"
-
-    # 3. 1 saatte %50+ = zaten geç
-    if ch1h >= 50:
-        return True, "1s %50+ geç giriş"
-
-    # 4. Teknik veri yoksa = borsada yok = likit değil
+    if ch1h >= 6:
+        return True, "1s %6+ zaten geç"
     if not tech:
-        return True, "Borsa bulunamadı / likit değil"
-
-    # 5. Wash trading şüphesi
+        return True, "Teknik veri yok"
     if tech.get("suspicious_volume"):
-        return True, "Sahte hacim şüphesi (wash trading)"
-
-    # 6. OBV düşüyor ama fiyat ve hacim yükseliyor = dağıtım
+        return True, "Sahte hacim şüphesi"
     if tech.get("obv_trend") == "down" and ch1h > 10 and vol_chg > 200:
-        return True, "OBV düşüyor — dağıtım (insiderlar satıyor)"
-
-    # 7. 4 saatte sert düşüş
+        return True, "OBV düşüyor — dağıtım"
     if tech.get("ch4h", 0) < -10:
-        return True, "4s %10+ düşüş — trend kötü"
-    if tech:
-        rsi = tech.get("rsi")
-        obv = tech.get("obv_trend")
-        if rsi and rsi > 80 and obv == "down":
-            return True, "RSI 80+ OBV düşüyor — dağıtım"
-
+        return True, "4s %10+ düşüş"
+    rsi = tech.get("rsi")
+    if rsi and rsi > 80 and tech.get("obv_trend") == "down":
+        return True, "RSI 80+ OBV düşüyor"
     return False, ""
 
 
-# ============================================================
-# V5: SİNYAL SONUÇ TAKİBİ
-# ============================================================
-
-def check_signal_outcomes():
-    """24s/72s/7g sonra sinyal sonuçlarını ölç"""
-    try:
-        now = datetime.now(timezone.utc)
-        for hours, field in [(24, "24h"), (72, "72h"), (24*7, "7d")]:
-            cutoff = (now - timedelta(hours=hours)).isoformat()
-            rows = supabase.table("signal_outcomes") \
-                .select("*") \
-                .eq(f"checked_{field}", False) \
-                .lte("created_at", cutoff) \
-                .limit(20).execute()
-            if not rows.data:
-                continue
-            print(f"📈 {len(rows.data)} sinyal için {field} sonuç ölçülüyor...")
-            for row in rows.data:
-                try:
-                    k, _ = get_klines(row["symbol"], "1h", 2)
-                    if not k:
-                        supabase.table("signal_outcomes").update({
-                            f"checked_{field}": True
-                        }).eq("id", row["id"]).execute()
-                        continue
-                    current = float(k[-1][4])
-                    entry = row["entry_price"]
-                    pct = ((current - entry) / entry) * 100 if entry > 0 else 0
-                    supabase.table("signal_outcomes").update({
-                        f"price_{field}": current,
-                        f"pct_{field}": round(pct, 2),
-                        f"checked_{field}": True
-                    }).eq("id", row["id"]).execute()
-                except:
-                    continue
-                time.sleep(0.3)
-    except Exception as e:
-        print(f"❌ Outcome check: {e}")
-
-
-def get_historical_success_rate(rsi, obv_trend, layer):
-    """
-    Geçmiş sinyallerden, benzer RSI/OBV/layer kombinasyonunun
-    24s içinde kâr getirme oranını döndürür.
-    Yetersiz veri (min 5 örnek) varsa None döner.
-    """
-    try:
-        if rsi is None:
-            rsi_min, rsi_max = 0, 100
-        elif rsi < 30:
-            rsi_min, rsi_max = 0, 30
-        elif rsi < 50:
-            rsi_min, rsi_max = 30, 50
-        elif rsi < 70:
-            rsi_min, rsi_max = 50, 70
-        else:
-            rsi_min, rsi_max = 70, 100
-
-        rows = supabase.table("signal_outcomes") \
-            .select("pct_24h") \
-            .eq("layer", layer) \
-            .eq("entry_obv", obv_trend) \
-            .gte("entry_rsi", rsi_min) \
-            .lt("entry_rsi", rsi_max) \
-            .eq("checked_24h", True) \
-            .not_.is_("pct_24h", "null") \
-            .execute()
-
-        if not rows.data or len(rows.data) < 5:
-            return None
-
-        wins = sum(1 for r in rows.data if r["pct_24h"] and r["pct_24h"] > 2)
-        total = len(rows.data)
-        return {"rate": round(wins / total * 100, 1), "sample": total}
-    except Exception as e:
-        print(f"⚠️ Success rate: {e}")
-        return None
+def is_stablecoin(symbol, price=None, ch1h=None, ch24h=None):
+    if symbol.upper().strip() in STABLECOIN_BASES:
+        return True
+    if price and 0.97 <= price <= 1.03:
+        if ch1h is not None and ch24h is not None:
+            if abs(ch1h) < 0.3 and abs(ch24h) < 1.0:
+                return True
+    return False
 
 # ============================================================
-# V9: PROJE YAŞ KONTROLÜ (CMC → CoinGecko fallback)
+# PROJE YAŞ KONTROLÜ
 # ============================================================
 
-_coingecko_list_cache = {"data": None, "ts": 0}
-
-
-def get_coingecko_id(symbol):
-    """CoinGecko coin listesini 24s cache'le, sembolden id bul."""
-    global _coingecko_list_cache
-    now = time.time()
-    if _coingecko_list_cache["data"] is None or now - _coingecko_list_cache["ts"] > 86400:
-        try:
-            r = requests.get("https://api.coingecko.com/api/v3/coins/list", timeout=15)
-            if r.status_code == 200:
-                _coingecko_list_cache["data"] = r.json()
-                _coingecko_list_cache["ts"] = now
-        except:
-            return None
-    if not _coingecko_list_cache["data"]:
-        return None
-    sym_lower = symbol.lower()
-    matches = [c for c in _coingecko_list_cache["data"] if c["symbol"] == sym_lower]
-    return matches[0]["id"] if matches else None
+_cg_list_cache = {"data": None, "ts": 0}
 
 
 def get_coin_age_days(symbol, date_added=None):
-    """
-    1. CMC date_added varsa kullan.
-    2. Yoksa CoinGecko genesis_date'i dene.
-    3. İkisi de yoksa None — yaş bilinmiyor, kontrol atlanır.
-    """
     if date_added:
         try:
             added = datetime.fromisoformat(date_added.replace("Z", "+00:00"))
             return (datetime.now(timezone.utc) - added).days
-        except:
+        except Exception:
             pass
-
-    try:
-        cg_id = get_coingecko_id(symbol)
-        if not cg_id:
+    global _cg_list_cache
+    now = time.time()
+    if _cg_list_cache["data"] is None or now - _cg_list_cache["ts"] > 86400:
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/coins/list", timeout=15)
+            if r.status_code == 200:
+                _cg_list_cache["data"] = r.json()
+                _cg_list_cache["ts"] = now
+        except Exception:
             return None
+    if not _cg_list_cache["data"]:
+        return None
+    sym_lower = symbol.lower()
+    matches = [c for c in _cg_list_cache["data"] if c["symbol"] == sym_lower]
+    if not matches:
+        return None
+    try:
         r = requests.get(
-            f"https://api.coingecko.com/api/v3/coins/{cg_id}",
+            f"https://api.coingecko.com/api/v3/coins/{matches[0]['id']}",
             params={"localization": "false", "tickers": "false",
                     "market_data": "false", "community_data": "false",
                     "developer_data": "false"},
-            timeout=8
+            timeout=8,
         )
-        if r.status_code != 200:
-            return None
-        genesis = r.json().get("genesis_date")
-        if genesis:
-            added = datetime.fromisoformat(genesis).replace(tzinfo=timezone.utc)
-            return (datetime.now(timezone.utc) - added).days
-    except:
+        if r.status_code == 200:
+            genesis = r.json().get("genesis_date")
+            if genesis:
+                added = datetime.fromisoformat(genesis).replace(tzinfo=timezone.utc)
+                return (datetime.now(timezone.utc) - added).days
+    except Exception:
         pass
     return None
-# ============================================================
-# V8: İSTATİSTİK RAPORU
-# ============================================================
-
-def generate_pattern_report():
-    """
-    signal_outcomes verisinden RSI bucket + OBV + layer kombinasyonlarının
-    24s başarı oranlarını çıkarır. SADECE konsola loglar (uydurma yok,
-    tamamen gerçek veri). Min 20 toplam örnek + min 5 örnek/grup gerekir.
-    """
-    try:
-        rows = supabase.table("signal_outcomes") \
-            .select("layer, entry_rsi, entry_obv, pct_24h") \
-            .eq("checked_24h", True) \
-            .not_.is_("pct_24h", "null") \
-            .execute()
-        if not rows.data or len(rows.data) < 20:
-            print(f"📊 V8: Yeterli veri yok ({len(rows.data) if rows.data else 0}/20)")
-            return
-
-        groups = defaultdict(list)
-        for r in rows.data:
-            rsi = r.get("entry_rsi")
-            if rsi is None:
-                bucket = "RSI:?"
-            elif rsi < 30:
-                bucket = "RSI<30"
-            elif rsi < 50:
-                bucket = "RSI30-50"
-            elif rsi < 70:
-                bucket = "RSI50-70"
-            else:
-                bucket = "RSI70+"
-            key = f"{r['layer']} | {bucket} | OBV:{r['entry_obv']}"
-            groups[key].append(r["pct_24h"])
-
-        results = []
-        for key, vals in groups.items():
-            if len(vals) < 5:
-                continue
-            win_rate = sum(1 for v in vals if v > 2) / len(vals) * 100
-            avg = sum(vals) / len(vals)
-            results.append({"key": key, "win_rate": round(win_rate, 1), "avg": round(avg, 2), "n": len(vals)})
-
-        if not results:
-            print("📊 V8: Hiçbir grup min 5 örneğe ulaşmadı")
-            return
-
-        results.sort(key=lambda x: x["win_rate"], reverse=True)
-        best = results[0]
-        worst = results[-1]
-
-        print(f"📊 V8 EN İYİ PATERN: {best['key']} → %{best['win_rate']} başarı (ort %{best['avg']}, n={best['n']})")
-        if worst["key"] != best["key"]:
-            print(f"📊 V8 EN ZAYIF PATERN: {worst['key']} → %{worst['win_rate']} başarı (ort %{worst['avg']}, n={worst['n']})")
-    except Exception as e:
-        print(f"❌ V8 pattern: {e}")
-
 
 # ============================================================
 # PUANLAMA SİSTEMİ
@@ -626,9 +585,6 @@ def generate_pattern_report():
 
 def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
                vol_chg, mcap, cmc_rank, tech, fg, orderbook=None):
-    """
-    Tüm sinyalleri birleştir. Minimum 5 bağımsız sinyal gerekli.
-    """
     score = 0
     reasons = []
     layer = "MOMENTUM"
@@ -655,10 +611,6 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         elif rsi > 60:
             score += 1
 
-    # OBV aşağı ise BİRİKİM olamaz
-    if obv_trend == "down":
-        layer = "MOMENTUM"
-
     # ── OBV ──────────────────────────────────────────────────
     if obv_div:
         score += 8
@@ -677,9 +629,11 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         reasons.append("📈 OBV yükseliyor — alım baskısı")
     elif obv_trend == "down" and ch1h > 3:
         score -= 2
-        reasons.append("⚠️ OBV düşüyor — zayıf rally")
 
-    # ── HACİM DEĞİŞİMİ ───────────────────────────────────────
+    if obv_trend == "down":
+        layer = "MOMENTUM"
+
+    # ── HACİM ────────────────────────────────────────────────
     if vol_chg >= 1000:
         score += 7
         if obv_trend != "down":
@@ -697,7 +651,6 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     elif vol_chg >= 50:
         score += 1
 
-    # 4s hacim artışı (Binance/MEXC/Gate.io'dan)
     if vol_surge >= 3 and ch1h < 5:
         score += 3
         if layer != "BIRIKIM" and obv_trend != "down":
@@ -706,13 +659,11 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     elif vol_surge >= 2:
         score += 1
 
-    # Kataliz zorunlu
+    # Kataliz zorunlu — hiçbir şey yoksa eleme
     if vol_chg < 30 and (rsi is None or rsi > 55) and obv_trend != "up":
         return None
 
-    # ── FİYAT MOMENTUM (ERKEN YAKALAMA) ──────────────────────
-    # Fiyat henüz az hareket etmişken (≤%3) bonus — "trene binmek" istemiyoruz.
-    # %6+ hareket etmiş coinler için ceza — zaten geç.
+    # ── FİYAT HAREKET (ERKEN YAKALAMA) ───────────────────────
     if 0 <= ch1h <= 3:
         score += 2
         reasons.append(f"%{ch1h:.1f} — erken aşama, henüz oynamamış")
@@ -721,7 +672,6 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         reasons.append(f"%{ch1h:.1f} — hafif hareket başladı")
     elif ch1h > 6:
         score -= 2
-        reasons.append(f"⚠️ %{ch1h:.1f} — zaten hareket etmiş, geç giriş riski")
 
     if ch4h >= 10:
         score += 4
@@ -766,7 +716,7 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         elif fg["value"] >= 80:
             score -= 1
 
-    # ── V6: ORDER BOOK ───────────────────────────────────────
+    # ── ORDER BOOK ───────────────────────────────────────────
     if orderbook:
         ratio = orderbook.get("bid_ask_ratio", 0)
         bid_wall = orderbook.get("bid_wall_usd", 0)
@@ -779,29 +729,15 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
             reasons.append(f"📥 Alım baskısı — bid/ask {ratio}x")
         elif ratio <= 0.5 and ask_wall >= 20000:
             score -= 3
-            reasons.append(f"🧱 Satış duvarı tespit edildi — bid/ask {ratio}x")
-
-    # ── V5: GEÇMİŞ BAŞARI ORANI ──────────────────────────────
-    hist = get_historical_success_rate(rsi, obv_trend, layer)
-    if hist:
-        if hist["rate"] >= 70:
-            score += 5
-            reasons.append(f"📊 Geçmiş başarı: %{hist['rate']} ({hist['sample']} sinyal)")
-        elif hist["rate"] <= 30:
-            return None  # Kanıtlanmış kötü patern — sinyal verme
-        elif hist["rate"] <= 50:
-            score -= 3
-            reasons.append(f"⚠️ Geçmiş başarı zayıf: %{hist['rate']} ({hist['sample']} sinyal)")
 
     if score < 6:
         return None
 
-    # Conviction eşikleri — sert filtre
-    if score >= 18:
+    if score >= 20:
         conviction = "CRITICAL"
-    elif score >= 13:
+    elif score >= 14:
         conviction = "HIGH"
-    elif score >= 8:
+    elif score >= 9:
         conviction = "MEDIUM"
     else:
         return None
@@ -811,217 +747,29 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         "ch1h": ch1h, "ch4h": ch4h, "ch24h": ch24h, "ch7d": ch7d,
         "vol_chg": vol_chg, "mcap": mcap, "cmc_rank": cmc_rank,
         "rsi": rsi, "obv_trend": obv_trend, "obv_div": obv_div,
-        "atr": tech.get("atr", 0) if tech else 0,
+        "vol_recent": tech.get("vol_recent", 0) if tech else 0,
         "exchange": tech.get("exchange", "?") if tech else "?",
         "orderbook": orderbook,
         "conviction": conviction, "reasons": reasons,
         "score": score, "layer": layer,
-        "hist_rate": hist["rate"] if hist else None,
     }
 
 # ============================================================
-# HAVUZ 2 — İZLEME SİSTEMİ
-# ============================================================
-
-def watchlist_update(symbol, price, ch1h, ch24h, vol_chg, tech, source):
-    """
-    Yeni veya genç coinleri izleme havuzuna ekle.
-    Scam değilse ve potansiyel varsa izle.
-    """
-    try:
-        # Scam kontrolü
-        is_scam, reason = scam_check(symbol, price, ch1h, ch24h, vol_chg, tech)
-        if is_scam:
-            return
-
-        # Minimum koşullar — izlemeye değer mi?
-        if price <= 0 or price > 10:
-            return
-        if ch24h < -20:  # %20'den fazla düşmüş = zayıf
-            return
-
-        # Supabase'de var mı?
-        existing = supabase.table("crypto_watchlist") \
-            .select("id, observation_count, first_seen, last_score") \
-            .eq("symbol", symbol).limit(1).execute()
-
-        rsi = tech.get("rsi") if tech else None
-        obv = tech.get("obv_trend") if tech else None
-
-        # İlk kez görülüyorsa ekle
-        if not existing.data:
-            supabase.table("crypto_watchlist").insert({
-                "symbol": symbol,
-                "source": source,
-                "first_seen": datetime.now(timezone.utc).isoformat(),
-                "last_seen": datetime.now(timezone.utc).isoformat(),
-                "first_price": price,
-                "last_price": price,
-                "observation_count": 1,
-                "last_rsi": rsi,
-                "last_obv": obv,
-                "last_vol_chg": vol_chg,
-                "last_score": 0,
-                "status": "watching",
-            }).execute()
-            print(f"  👁️ İZLEMEYE ALINDI: {symbol} @ ${price:.6f} [{source}]")
-        else:
-            # Güncelle
-            row = existing.data[0]
-            supabase.table("crypto_watchlist").update({
-                "last_seen": datetime.now(timezone.utc).isoformat(),
-                "last_price": price,
-                "observation_count": row["observation_count"] + 1,
-                "last_rsi": rsi,
-                "last_obv": obv,
-                "last_vol_chg": vol_chg,
-            }).eq("id", row["id"]).execute()
-
-    except Exception as e:
-        print(f"⚠️ Watchlist: {e}")
-
-
-def watchlist_check_signals(fg):
-    """
-    İzleme havuzundaki coinleri kontrol et.
-    Olgunlaşmış olanları sinyal havuzuna taşı.
-    """
-    try:
-        # En az 3 gözlem yapılmış coinler
-        candidates = supabase.table("crypto_watchlist") \
-            .select("*") \
-            .eq("status", "watching") \
-            .gte("observation_count", 3) \
-            .execute()
-
-        if not candidates.data:
-            return []
-
-        print(f"👁️ İzleme havuzu: {len(candidates.data)} coin kontrol ediliyor...")
-        signals = []
-
-        for row in candidates.data:
-            symbol = row["symbol"]
-            try:
-                # Güncel teknik veri
-                tech = get_technical_data(symbol)
-                if not tech:
-                    continue
-
-                price = tech["price"]
-                ch1h = 0
-                ch24h = row.get("last_vol_chg", 0)
-                vol_chg = row.get("last_vol_chg", 0)
-                rsi = tech.get("rsi")
-                obv_trend = tech.get("obv_trend")
-                obv_div = tech.get("obv_divergence", False)
-
-                # İzleme sinyali koşulları — daha sıkı
-                ready = False
-                trigger = ""
-
-                if rsi and rsi < 30 and obv_trend == "up":
-                    ready = True
-                    trigger = f"RSI {rsi} aşırı satım + OBV yükseliyor"
-                elif obv_div and vol_chg > 100:
-                    ready = True
-                    trigger = "OBV bullish diverjans + hacim artışı"
-                elif rsi and rsi < 35 and obv_div:
-                    ready = True
-                    trigger = "RSI düşük + OBV bullish diverjans"
-
-                if ready:
-                    # Gözlem süresi
-                    first_seen = datetime.fromisoformat(
-                        row["first_seen"].replace("Z", "+00:00")
-                    )
-                    days_watched = (datetime.now(timezone.utc) - first_seen).days
-
-                    orderbook = get_orderbook_signal(symbol)
-
-                    signals.append({
-                        "symbol": symbol,
-                        "name": symbol,
-                        "price": price,
-                        "ch1h": ch1h,
-                        "ch4h": tech.get("ch4h", 0),
-                        "ch24h": ch24h,
-                        "ch7d": 0,
-                        "vol_chg": vol_chg,
-                        "mcap": 0,
-                        "cmc_rank": 9999,
-                        "rsi": rsi,
-                        "obv_trend": obv_trend,
-                        "obv_div": obv_div,
-                        "atr": tech.get("atr", 0),
-                        "exchange": tech.get("exchange", "?"),
-                        "orderbook": orderbook,
-                        "conviction": "HIGH",
-                        "reasons": [
-                            f"👁️ {days_watched} gün izlendi",
-                            f"🎯 Tetikleyici: {trigger}",
-                        ],
-                        "score": 15,
-                        "layer": "WATCHLIST",
-                        "from_watchlist": True,
-                    })
-
-                    # Durumu güncelle
-                    supabase.table("crypto_watchlist").update({
-                        "status": "signaled",
-                        "signal_date": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", row["id"]).execute()
-
-                time.sleep(0.3)
-
-            except:
-                continue
-
-        return signals
-
-    except Exception as e:
-        print(f"❌ Watchlist check: {e}")
-        return []
-
-# ============================================================
-# STABİLCOİN FİLTRESİ
-# ============================================================
-
-STABLECOIN_BASES = {
-    "USDT", "USDC", "FDUSD", "TUSD", "USDP", "GUSD", "PYUSD", "RLUSD",
-    "USDG", "USDGO", "USD1", "BUSD", "USDD",
-    "DAI", "USDS", "SUSDS", "USDX", "CRVUSD", "LISUSD",
-    "USDE", "SUSDE", "USDY", "USDM", "USDL", "USDO", "USDN",
-    "USD0", "USD0PP", "SFRXUSD", "FRAX", "SYRUPUSDC", "BUIDL",
-    "USTC", "USDF",
-    "EURT", "EURS", "EURC", "XAUT", "PAXG",
-}
-
-
-def is_stablecoin(symbol, price=None, ch1h=None, ch24h=None):
-    base = symbol.upper().strip()
-    if base in STABLECOIN_BASES:
-        return True
-    if price is not None and 0.97 <= price <= 1.03:
-        if ch1h is not None and ch24h is not None:
-            if abs(ch1h) < 0.3 and abs(ch24h) < 1.0:
-                return True
-    return False
-# ============================================================
-# VERİ BİRLEŞTİRME — MEXC + Gate.io → Ortak Format
+# VERİ BİRLEŞTİRME
 # ============================================================
 
 def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
     merged = {}
 
-    # CMC verisi — en güvenilir fiyat/hacim
     for c in cmc_coins:
         q = c.get("quote", {}).get("USD", {})
         symbol = c.get("symbol", "")
         price = float(q.get("price", 0) or 0)
         if price <= 0 or price > 2.0:
             continue
-        if is_stablecoin(symbol, price, float(q.get("percent_change_1h", 0) or 0), float(q.get("percent_change_24h", 0) or 0)):
+        if is_stablecoin(symbol, price,
+                         float(q.get("percent_change_1h", 0) or 0),
+                         float(q.get("percent_change_24h", 0) or 0)):
             continue
         vol = float(q.get("volume_24h", 0) or 0)
         if vol < 100_000:
@@ -1037,89 +785,66 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
             "vol_chg": float(q.get("volume_change_24h", 0) or 0),
             "mcap": float(q.get("market_cap", 0) or 0),
             "cmc_rank": c.get("cmc_rank", 9999),
-            "date_added": c.get("date_added"),   # ← YENİ SATIR
+            "date_added": c.get("date_added"),
             "sources": ["CMC"],
         }
 
-    # MEXC verisi — CMC'de olmayan coinler
     for t in mexc_tickers:
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"):
             continue
-        base = sym[:-4]  # BTCUSDT → BTC
+        base = sym[:-4]
         price = float(t.get("lastPrice", 0) or 0)
         if price <= 0 or price > 2.0:
             continue
         if is_stablecoin(base, price, 0, float(t.get("priceChangePercent", 0) or 0)):
             continue
-        vol_usdt = float(t.get("quoteVolume", 0) or 0)
-        if vol_usdt < 100_000:
+        if float(t.get("quoteVolume", 0) or 0) < 100_000:
             continue
-        ch24h = float(t.get("priceChangePercent", 0) or 0)
-
         if base in merged:
             merged[base]["sources"].append("MEXC")
         else:
             merged[base] = {
-                "symbol": base,
-                "name": base,
-                "price": price,
-                "ch1h": 0,
-                "ch4h": 0,
-                "ch24h": ch24h,
-                "ch7d": 0,
-                "vol_chg": 0,
-                "mcap": 0,
-                "cmc_rank": 9999,
+                "symbol": base, "name": base, "price": price,
+                "ch1h": 0, "ch4h": 0,
+                "ch24h": float(t.get("priceChangePercent", 0) or 0),
+                "ch7d": 0, "vol_chg": 0, "mcap": 0, "cmc_rank": 9999,
                 "sources": ["MEXC"],
             }
 
-    # Gate.io verisi
     for t in gateio_tickers:
         pair = t.get("currency_pair", "")
         if not pair.endswith("_USDT"):
             continue
-        base = pair[:-5]  # BTC_USDT → BTC
+        base = pair[:-5]
         price = float(t.get("last", 0) or 0)
         if price <= 0 or price > 2.0:
             continue
         if is_stablecoin(base, price, 0, float(t.get("change_percentage", 0) or 0)):
             continue
-        vol_usdt = float(t.get("quote_volume", 0) or 0)
-        if vol_usdt < 100_000:
+        if float(t.get("quote_volume", 0) or 0) < 100_000:
             continue
-        ch24h = float(t.get("change_percentage", 0) or 0)
-
         if base in merged:
             merged[base]["sources"].append("Gate.io")
         else:
             merged[base] = {
-                "symbol": base,
-                "name": base,
-                "price": price,
-                "ch1h": 0,
-                "ch4h": 0,
-                "ch24h": ch24h,
-                "ch7d": 0,
-                "vol_chg": 0,
-                "mcap": 0,
-                "cmc_rank": 9999,
+                "symbol": base, "name": base, "price": price,
+                "ch1h": 0, "ch4h": 0,
+                "ch24h": float(t.get("change_percentage", 0) or 0),
+                "ch7d": 0, "vol_chg": 0, "mcap": 0, "cmc_rank": 9999,
                 "sources": ["Gate.io"],
             }
 
     print(f"  → Birleşik evren: {len(merged)} coin")
     return list(merged.values())
 
-
 # ============================================================
-# AI ANALİZ
+# AI AÇIKLAMA
 # ============================================================
 
 def get_ai_explanation(s, fg):
     try:
         price = s["price"]
-        atr = s.get("atr", 0)
-
         if price < 0.0001:
             ps = f"${price:.8f}"
         elif price < 0.01:
@@ -1129,54 +854,41 @@ def get_ai_explanation(s, fg):
         else:
             ps = f"${price:.2f}"
 
-        stop = price * 0.92 if atr == 0 else price - atr * 1.5
-        target = price * 1.40 if atr == 0 else price + atr * 8
+        stop = price * (1 - STOP_PCT)
         fg_str = f"{fg['value']} ({fg['label']})" if fg else "Veri yok"
 
         layer_ctx = {
             "BIRIKIM": "BİRİKİM: Whale sessizce giriyor, fiyat henüz oynamamış.",
             "MOMENTUM": "MOMENTUM: Fiyat ve hacim birlikte yükseliyor.",
-            "WATCHLIST": "İZLEME: Uzun süredir takip ediliyordu, şimdi sinyal verdi.",
         }.get(s.get("layer", "MOMENTUM"), "")
 
-        # V5: Geçmiş başarı oranı — veri yoksa AI'ya "yetersiz veri" olarak bildirilir
-        hist = get_historical_success_rate(s.get("rsi"), s.get("obv_trend"), s.get("layer"))
-        hist_str = f"Geçmiş başarı oranı: %{hist['rate']} ({hist['sample']} sinyal)" if hist else "Geçmiş veri henüz yetersiz (bu konudan bahsetme)"
-
-        # V6: Order book — veri yoksa belirtilir
         ob = s.get("orderbook")
-        if ob:
-            ob_str = f"Order book: bid/ask oranı {ob['bid_ask_ratio']}x, alım duvarı ${ob['bid_wall_usd']/1000:.0f}K, satış duvarı ${ob['ask_wall_usd']/1000:.0f}K"
-        else:
-            ob_str = "Order book verisi yok (bu konudan bahsetme)"
+        ob_str = (
+            f"Order book: bid/ask {ob['bid_ask_ratio']}x, alım ${ob['bid_wall_usd']/1000:.0f}K"
+            if ob else "Order book verisi yok (bu konudan bahsetme)"
+        )
 
-        # RSI/OBV None ise AI'ya net şekilde bildir
         rsi_str = f"{s['rsi']}" if s['rsi'] is not None else "VERİ YOK"
         obv_str = s['obv_trend'] if s['obv_trend'] is not None else "VERİ YOK"
 
         prompt = f"""Profesyonel kripto analistisin. Türkçe. Kısa ve net.
-
-KESİN KURAL: SADECE aşağıda verilen sayısal/metinsel verilere dayanarak yorum yap.
-Bir veri "VERİ YOK" veya "bahsetme" notuyla işaretliyse, o konuda HİÇBİR yorum yapma,
-varsayımda bulunma, tahmin etme veya genel/klişe cümle kurma. Sadece elindeki
-gerçek sayılarla konuş.
+KURAL: Sadece verilen sayısal verilere dayan. "VERİ YOK" ise o konuya hiç girme.
 
 {s['symbol']} | {ps} | 1s:%{s['ch1h']:.1f} | 4s:%{s['ch4h']:.1f} | 24s:%{s['ch24h']:.1f}
 Hacim:%{s['vol_chg']:.0f} | RSI:{rsi_str} | OBV:{obv_str}
 Güven:{s['conviction']} | Katman:{s.get('layer','?')} | Borsa:{s.get('exchange','?')}
 Korku/Açgözlülük:{fg_str}
-Stop:{stop:.8f} | Hedef:{target:.8f}
+Başlangıç stop:%{STOP_PCT*100:.0f} = {stop:.8f} (kâr arttıkça stop yukarı çekilir, sabit hedef yok)
 {layer_ctx}
-{hist_str}
 {ob_str}
-Tespit edilen sinyaller: {' | '.join(s['reasons']) if s['reasons'] else 'Yok'}
+Sinyaller: {' | '.join(s['reasons']) if s['reasons'] else 'Yok'}
 
 ===ACEMİ===
-[Maks 2 cümle. Sadece yukarıdaki gerçek verilere göre neden hareket ediyor, ne yapmalı. P&D riskini belirt.]
+[Maks 2 cümle. Neden hareket ediyor, ne yapmalı.]
 ===USTA===
-[Maks 3 cümle. Sadece mevcut RSI/OBV/order book verilerine göre yorum, kritik seviye, hedef.]
+[Maks 3 cümle. RSI/OBV/order book yorumu, kritik seviye.]
 ===PRO===
-[Maks 4 cümle. Sadece mevcut verilere göre whale/order book güveni(1-10), P&D riski(1-10), risk/ödül, giriş/stop/hedef $.]"""
+[Maks 4 cümle. Whale/OB güveni (1-10), P&D riski (1-10), risk/ödül, giriş/stop $.]"""
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -1184,16 +896,20 @@ Tespit edilen sinyaller: {' | '.join(s['reasons']) if s['reasons'] else 'Yok'}
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [
-                    {"role": "system", "content": "Kripto analistisin. SADECE sana verilen sayısal/metinsel verilere dayan. 'VERİ YOK' veya 'bahsetme' işaretli hiçbir konuda yorum yapma, varsayım yapma, genel/uydurma cümle kurma. Formatı değiştirme. P&D riskini belirt. Türkçe."},
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "system",
+                        "content": "Kripto analistisin. SADECE verilen sayısal verilere dayan. Formatı koru. Türkçe.",
+                    },
+                    {"role": "user", "content": prompt},
                 ],
-                "max_tokens": 600, "temperature": 0.2
+                "max_tokens": 600,
+                "temperature": 0.2,
             },
-            timeout=15
+            timeout=15,
         )
         resp = r.json()
         return resp["choices"][0]["message"]["content"] if "choices" in resp else ""
-    except:
+    except Exception:
         return ""
 
 
@@ -1206,16 +922,28 @@ def parse_ai(text):
             u = text.split("===USTA===")[1].split("===PRO===")[0].strip()
         if "===PRO===" in text:
             p = text.split("===PRO===")[1].strip()
-    except:
+    except Exception:
         pass
     return a, u, p
 
-
 # ============================================================
-# SİNYAL KAYDET & GÖNDER
+# SİNYAL KAYDET
 # ============================================================
 
-def save_and_push_signal(s, fg, allow_buy=True):
+def get_last_signal_time(symbol):
+    try:
+        r = supabase.table("crypto_signals").select("created_at") \
+            .eq("symbol", symbol).order("created_at", ascending=False) \
+            .limit(1).execute()
+        if r.data:
+            dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
+            return dt.timestamp()
+        return 0
+    except Exception:
+        return 0
+
+
+def save_signal(s, fg, allow_buy=False):
     try:
         price = s["price"]
         if price < 0.0001:
@@ -1231,7 +959,7 @@ def save_and_push_signal(s, fg, allow_buy=True):
         acemi, usta, pro = parse_ai(ai)
 
         emoji = "🔥" if s["conviction"] == "CRITICAL" else "⚡" if s["conviction"] == "HIGH" else "🚀"
-        le = "🐋" if s["layer"] == "BIRIKIM" else "👁️" if s["layer"] == "WATCHLIST" else "📈"
+        le = "🐋" if s["layer"] == "BIRIKIM" else "📈"
 
         desc = (
             f"{emoji} {s['symbol']}/USDT | {ps} | "
@@ -1256,41 +984,14 @@ def save_and_push_signal(s, fg, allow_buy=True):
             "usta_explanation": usta,
             "pro_explanation": pro,
             "market": "CRYPTO",
-            "created_at": datetime.now(timezone.utc).isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
 
         signal_cache[s["symbol"]] = time.time()
         sid = res.data[0].get("id") if res.data else None
 
-        # V5: Sinyal sonuç takibi
-        try:
-            supabase.table("signal_outcomes").insert({
-                "signal_id": sid,
-                "symbol": s["symbol"],
-                "layer": s["layer"],
-                "conviction": s["conviction"],
-                "entry_rsi": s.get("rsi"),
-                "entry_obv": s.get("obv_trend"),
-                "entry_price": price,
-            }).execute()
-        except Exception as e:
-            print(f"⚠️ Outcome kayıt: {e}")
-
-        # Bot işle — sadece bu tarama için seçilen "en iyi" sinyal alım yapar
         if allow_buy:
-            crypto_bot_process(
-                s["symbol"], price, s["conviction"],
-                s["ch1h"], s["vol_chg"], s["layer"], sid,
-                s.get("rsi"), s.get("obv_trend"),
-                s.get("atr", 0), s.get("reasons"), s.get("orderbook"),
-                s.get("score", 0), s.get("hist_rate")
-            )
-
-        send_push(
-            title=f"{emoji} {s['symbol']} — {s['conviction']}",
-            body=f"{ps} | RSI:{s['rsi']} | {le}{s['layer']}",
-            signal_id=sid
-        )
+            bot_buy(s, sid)
 
         print(f"✅ SİNYAL: {desc}")
         return True
@@ -1299,329 +1000,270 @@ def save_and_push_signal(s, fg, allow_buy=True):
         print(f"❌ {s.get('symbol','?')}: {e}")
         return False
 
-
 # ============================================================
-# KRİPTO BOT
+# BOT — ALIM
 # ============================================================
 
-def crypto_bot_should_buy(conviction, layer):
-    # Sadece en yüksek güven + birikim paterni — "savaş mimarisi"
-    return conviction == "CRITICAL" and layer == "BIRIKIM"
+def bot_buy(s, signal_id):
+    symbol = s["symbol"]
+    price = s["price"]
+    conviction = s["conviction"]
+    layer = s["layer"]
 
-
-def crypto_bot_process(symbol, price, conviction, ch1h, vol_chg, layer, signal_id, rsi=None, obv=None, atr=0, reasons=None, orderbook=None, score=0, hist_rate=None):
     try:
-        if not crypto_bot_should_buy(conviction, layer):
-            return
-        print(f"🤖 Kripto Bot {symbol}: AL")
         portfolios = supabase.table("demo_portfolios") \
             .select("user_id, crypto_balance").execute()
         if not portfolios.data:
             return
+
         for p in portfolios.data:
             user_id = p["user_id"]
-            balance = p.get("crypto_balance", 0) or 0
-            if balance < 5:
-                continue
-            profile = supabase.table("profiles").select("is_pro") \
-                .eq("id", user_id).limit(1).execute()
-            is_pro = profile.data[0].get("is_pro", False) if profile.data else False
-            _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer, rsi, obv, atr, reasons, orderbook, score, hist_rate)
+            _execute_buy(
+                user_id=user_id,
+                symbol=symbol,
+                price=price,
+                signal_id=signal_id,
+                conviction=conviction,
+                layer=layer,
+                rsi=s.get("rsi"),
+                obv=s.get("obv_trend"),
+                ob_ratio=s["orderbook"]["bid_ask_ratio"] if s.get("orderbook") else None,
+                vol_recent=s.get("vol_recent", 0),
+                reasons=s.get("reasons"),
+                score=s.get("score", 0),
+            )
             time.sleep(0.2)
+
     except Exception as e:
-        print(f"❌ Kripto bot: {e}")
+        print(f"❌ bot_buy: {e}")
 
 
-def _crypto_bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, layer="MOMENTUM", rsi=None, obv=None, atr=0, reasons=None, orderbook=None, score=0, hist_rate=None):
+def _execute_buy(user_id, symbol, price, signal_id, conviction, layer,
+                 rsi=None, obv=None, ob_ratio=None, vol_recent=0,
+                 reasons=None, score=0):
     try:
-        op = supabase.table("demo_trades").select("*") \
+        profile = supabase.table("profiles").select("is_pro") \
+            .eq("id", user_id).limit(1).execute()
+        is_pro = profile.data[0].get("is_pro", False) if profile.data else False
+
+        open_trades = supabase.table("demo_trades").select("*") \
             .eq("user_id", user_id).eq("market", "CRYPTO") \
             .eq("status", "open").execute()
-        open_trades = op.data or []
-        open_count = len(open_trades)
-        is_exceptional_buy = False
+        open_list = open_trades.data or []
+        open_count = len(open_list)
 
+        # Kapasite kontrolü
+        max_normal = MAX_OPEN_PRO if is_pro else MAX_OPEN_FREE
+        exceptional_count = sum(1 for t in open_list if t.get("is_exceptional"))
+        is_exceptional = False
+
+        if open_count >= max_normal:
+            if is_pro and score >= 24 and exceptional_count < 2 and open_count < MAX_OPEN_PRO_EXCEPTIONAL:
+                is_exceptional = True
+                print(f"  🌟 İSTİSNAİ: {symbol} (score={score}) — slot {open_count+1}")
+            else:
+                # Rotasyon YOK — doluysa geç
+                print(f"  ⏭️ {user_id} dolu ({open_count}/{max_normal}) — {symbol} atlandı")
+                return
+
+        # Free kullanıcı aylık limit
         if not is_pro:
-            # ── FREE: sabit limitler, rotasyon/istisna YOK ──────────
             month_start = datetime.now(timezone.utc).replace(
-                day=1, hour=0, minute=0, second=0).isoformat()
+                day=1, hour=0, minute=0, second=0
+            ).isoformat()
             mt = supabase.table("demo_trades").select("id") \
                 .eq("user_id", user_id).eq("market", "CRYPTO") \
                 .gte("created_at", month_start).execute()
-            if len(mt.data) >= 3:
-                return
-            if open_count >= 3:
-                return
-        else:
-            # ── PRO: kapasite + rotasyon + istisna mantığı ──────────
-            exceptional_count = sum(1 for t in open_trades if t.get("is_exceptional"))
-
-            if open_count >= 3:
-                is_exceptional_candidate = (
-                    score >= 24 and hist_rate is not None and hist_rate >= 90
-                    and exceptional_count < 2
-                )
-
-                if is_exceptional_candidate and open_count < 5:
-                    is_exceptional_buy = True
-                    print(f"  🌟 İSTİSNAİ SİNYAL: {symbol} (score={score}, geçmiş=%{hist_rate}) — {open_count+1}. slot açılıyor")
-                else:
-                    weakest = min(open_trades, key=lambda t: (
-                        ((t.get("current_price") or t["buy_price"]) - t["buy_price"]) / t["buy_price"]
-                    ))
-                    weakest_change = ((weakest.get("current_price") or weakest["buy_price"]) - weakest["buy_price"]) / weakest["buy_price"]
-
-                    if weakest_change < 0:
-                        exit_price = weakest.get("current_price") or weakest["buy_price"]
-                        pl = (exit_price - weakest["buy_price"]) * weakest["quantity"]
-                        supabase.table("demo_trades").update({
-                            "sell_price": exit_price,
-                            "sell_date": datetime.now(timezone.utc).isoformat(),
-                            "status": "closed",
-                            "profit_loss": round(pl, 2),
-                            "exit_reason": f"Rotasyon — daha güçlü sinyal bulundu ({symbol})"
-                        }).eq("id", weakest["id"]).execute()
-
-                        with balance_lock:
-                            port = supabase.table("demo_portfolios").select("crypto_balance") \
-                                .eq("user_id", user_id).limit(1).execute()
-                            if port.data:
-                                new_bal = port.data[0]["crypto_balance"] + (weakest["quantity"] * exit_price)
-                                supabase.table("demo_portfolios").update({
-                                    "crypto_balance": round(new_bal, 2)
-                                }).eq("user_id", user_id).execute()
-
-                        print(f"  🔄 ROTASYON: {weakest['symbol']} kapatıldı (%{weakest_change*100:.1f}) → {symbol} için yer açıldı")
-                    else:
-                        return
-
-        pct = 0.20 if conviction == "CRITICAL" else 0.15 if conviction == "HIGH" else 0.10
-
-        if not is_pro:
-            month_start = datetime.now(timezone.utc).replace(
-                day=1, hour=0, minute=0, second=0).isoformat()
-            mt = supabase.table("demo_trades").select("id") \
-                .eq("user_id", user_id).eq("market", "CRYPTO") \
-                .gte("created_at", month_start).execute()
-            if len(mt.data) >= 3:
+            if len(mt.data or []) >= MAX_OPEN_FREE:
                 return
 
-        pct = 0.20 if conviction == "CRITICAL" else 0.15 if conviction == "HIGH" else 0.10
+        # Yatırım miktarı
+        pct = INVEST_PCT_CRITICAL if conviction == "CRITICAL" else INVEST_PCT_HIGH
 
-        if atr and atr > 0:
-            stop_price = round(price - atr * 1.5, 10)
-            target_price = round(price + atr * 8, 10)
-        else:
-            stop_price = round(price * 0.92, 10)
-            target_price = round(price * 1.40, 10)
-
+        stop_price = round(price * (1 - STOP_PCT), 10)
         entry_reason = " | ".join(reasons) if reasons else None
-        entry_ob_ratio = orderbook.get("bid_ask_ratio") if orderbook else None
 
         with balance_lock:
             fresh = supabase.table("demo_portfolios").select("crypto_balance") \
                 .eq("user_id", user_id).limit(1).execute()
-            current_balance = fresh.data[0]["crypto_balance"] if fresh.data else balance
-            invest = min(current_balance * pct, 50)
-            if invest < 5:
+            balance = fresh.data[0]["crypto_balance"] if fresh.data else 0
+            invest = min(balance * pct, MAX_INVEST_USD)
+            if invest < MIN_INVEST_USD:
                 return
 
             supabase.table("demo_trades").insert({
-                "user_id": user_id, "symbol": symbol, "market": "CRYPTO",
-                "signal_id": signal_id, "buy_price": price,
+                "user_id": user_id,
+                "symbol": symbol,
+                "market": "CRYPTO",
+                "signal_id": signal_id,
+                "buy_price": price,
                 "buy_date": datetime.now(timezone.utc).isoformat(),
-                "quantity": round(invest / price, 6), "status": "open",
+                "quantity": round(invest / price, 6),
+                "status": "open",
                 "signal_layer": layer,
                 "entry_rsi": rsi,
                 "entry_obv": obv,
                 "entry_conviction": conviction,
-                "entry_atr": atr,
-                "entry_ob_ratio": entry_ob_ratio,
+                "entry_ob_ratio": ob_ratio,
+                "entry_vol_recent": vol_recent,
                 "stop_price": stop_price,
-                "target_price": target_price,
                 "current_price": price,
                 "peak_price": price,
                 "entry_reason": entry_reason,
-                "is_exceptional": is_exceptional_buy,
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "is_exceptional": is_exceptional,
+                "sell_warning_sent": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
 
             supabase.table("demo_portfolios").update({
-                "crypto_balance": round(current_balance - invest, 2)
+                "crypto_balance": round(balance - invest, 2)
             }).eq("user_id", user_id).execute()
 
-        tag = "🌟" if is_exceptional_buy else "✅"
-        print(f"  {tag} Bot alım: {user_id} → {symbol} ${invest:.0f} | {layer} | Stop:{stop_price} Hedef:{target_price}")
+        tag = "🌟" if is_exceptional else "✅"
+        print(f"  {tag} ALIM: {user_id[:8]} → {symbol} ${invest:.0f} "
+              f"| Başlangıç stop:{stop_price:.8f} (%{STOP_PCT*100:.0f})")
+
+        # PUSH — sadece alım anında
+        if price < 0.0001:
+            ps = f"${price:.8f}"
+        elif price < 0.01:
+            ps = f"${price:.6f}"
+        elif price < 1:
+            ps = f"${price:.4f}"
+        else:
+            ps = f"${price:.2f}"
+
+        send_push(
+            title=f"🟢 ALINDI — {symbol}",
+            body=f"{ps} | Stop %{STOP_PCT*100:.0f} | {layer} | Trailing aktif",
+            signal_id=signal_id,
+        )
+
     except Exception as e:
-        print(f"❌ Bot buy: {e}")
+        print(f"❌ _execute_buy: {e}")
 
+# ============================================================
+# BOT — POZİSYON İZLEME VE KAPATMA
+# ============================================================
 
-def crypto_bot_check_positions():
+def check_positions():
     try:
         trades = supabase.table("demo_trades").select("*") \
             .eq("status", "open").eq("market", "CRYPTO").execute()
         if not trades.data:
             return
-        print(f"🔍 {len(trades.data)} açık pozisyon kontrol...")
+
+        print(f"🔍 {len(trades.data)} açık pozisyon kontrol ediliyor...")
+
         for trade in trades.data:
             try:
                 tech = get_technical_data(trade["symbol"])
                 if not tech:
                     continue
+
                 current = tech["price"]
-                buy_price = trade["buy_price"]
-                stop_price = trade.get("stop_price") or buy_price * 0.92
-                target_price = trade.get("target_price") or buy_price * 1.20
-                peak_price = max(trade.get("peak_price") or buy_price, current)
-                change = ((current - buy_price) / buy_price) * 100
+                buy_price = float(trade["buy_price"])
+                peak = max(float(trade.get("peak_price") or buy_price), current)
+                change_pct = (current - buy_price) / buy_price * 100
 
-                # ── V11: DÖNÜŞ (REVERSAL) TESPİTİ ────────────────────
-                reversal_reasons = []
+                # Order book çek
+                ob = get_orderbook(trade["symbol"])
 
-                # 1. OBV dönüşü
-                if trade.get("entry_obv") == "up" and tech.get("obv_trend") == "down":
-                    reversal_reasons.append("OBV yön değiştirdi (birikim bitti)")
+                # Doğrulama katmanı + trailing stop
+                score, reasons, veto, trailing_stop = close_confirmation_score(trade, tech, ob)
 
-                # 2. RSI aşırı alımdan dönüş
-                entry_rsi = trade.get("entry_rsi")
-                cur_rsi = tech.get("rsi")
-                if entry_rsi and cur_rsi and entry_rsi >= 70 and cur_rsi < 65:
-                    reversal_reasons.append(f"RSI {entry_rsi}→{cur_rsi} (momentum tepe yaptı)")
-
-                # 3. Order book tersine döndü
-                ob = get_orderbook_signal(trade["symbol"])
-                entry_ob = trade.get("entry_ob_ratio")
-                if ob and entry_ob and entry_ob >= 1.5 and ob.get("bid_ask_ratio", 0) <= 0.7:
-                    reversal_reasons.append(f"Order book tersine döndü ({entry_ob}x→{ob['bid_ask_ratio']}x)")
-
-                # 4. Zirveden %5+ geri çekilme (kâr varken)
-                if peak_price > buy_price:
-                    drawdown = ((peak_price - current) / peak_price) * 100
-                    if drawdown >= 5 and current > buy_price:
-                        reversal_reasons.append(f"Zirveden %{drawdown:.1f} geri çekildi")
-
-                # Trailing stop: hedefin yarısına ulaştıysa stop'u girişe çek
-                halfway = buy_price + (target_price - buy_price) * 0.5
-                new_stop = stop_price
-                if current >= halfway and stop_price < buy_price:
-                    new_stop = buy_price
-
-                # Canlı veriyi güncelle
+                # Canlı veri güncelle (peak + güncel trailing stop)
                 supabase.table("demo_trades").update({
                     "current_price": current,
-                    "peak_price": peak_price,
-                    "stop_price": new_stop,
+                    "peak_price": peak,
+                    "stop_price": trailing_stop,
                 }).eq("id", trade["id"]).execute()
 
-                # ── SAT PUSH — reversal varsa, henüz kapatmadan uyar ──
-                if reversal_reasons and not trade.get("sell_warning_sent"):
-                    reason_str = " | ".join(reversal_reasons)
-                    send_push(
-                        title=f"⚠️ SAT — {trade['symbol']}",
-                        body=f"%{change:+.1f} | {reason_str}",
-                        signal_id=trade.get("signal_id")
-                    )
-                    supabase.table("demo_trades").update({
-                        "sell_warning_sent": True,
-                        "exit_reason": f"Erken uyarı: {reason_str}"
-                    }).eq("id", trade["id"]).execute()
-                    print(f"  ⚠️ SAT UYARISI: {trade['symbol']} — {reason_str}")
+                if veto:
+                    print(f"  ⏳ {trade['symbol']} %{change_pct:+.1f} — {reasons[0] if reasons else 'veto'}")
+                    time.sleep(0.3)
+                    continue
 
-                # ── Hedef/Stop/Reversal+kâr → kapat ───────────────────
-                # Reversal ile kapanış için en az %1.5 kâr şartı — küçük titremelerle çıkmayalım
-                reversal_profit_ok = current >= buy_price * 1.015
+                should_close = score >= CLOSE_SCORE_MIN or score >= 99
 
-                should_close = current >= target_price or current <= new_stop or \
-                    (reversal_reasons and reversal_profit_ok)
+                if not should_close:
+                    print(f"  👁️ {trade['symbol']} %{change_pct:+.1f} — "
+                          f"doğrulama puanı {score}/{CLOSE_SCORE_MIN} (yetersiz)")
+                    time.sleep(0.3)
+                    continue
 
-                if should_close:
-                    pl = (current - buy_price) * trade["quantity"]
-                    if current >= target_price:
-                        exit_reason = "Hedef Vuruldu (Take Profit)"
-                    elif reversal_reasons and current > buy_price:
-                        exit_reason = f"Dönüş tespit edildi, kârla kapatıldı: {' | '.join(reversal_reasons)}"
-                    elif new_stop > buy_price:
-                        exit_reason = "Trailing Stop — Kâr Korundu"
-                    else:
-                        exit_reason = "Stop Loss"
+                # Kapatma kararı verildi
+                exit_reason = " | ".join(reasons) if reasons else "Doğrulama eşiği aşıldı"
+                pl = (current - buy_price) * float(trade["quantity"])
 
-                    supabase.table("demo_trades").update({
-                        "sell_price": current,
-                        "sell_date": datetime.now(timezone.utc).isoformat(),
-                        "status": "closed",
-                        "profit_loss": round(pl, 2),
-                        "exit_reason": exit_reason
-                    }).eq("id", trade["id"]).execute()
+                supabase.table("demo_trades").update({
+                    "sell_price": current,
+                    "sell_date": datetime.now(timezone.utc).isoformat(),
+                    "status": "closed",
+                    "profit_loss": round(pl, 2),
+                    "exit_reason": exit_reason,
+                }).eq("id", trade["id"]).execute()
 
-                    with balance_lock:
-                        port = supabase.table("demo_portfolios").select("crypto_balance") \
-                            .eq("user_id", trade["user_id"]).limit(1).execute()
-                        if port.data:
-                            new_bal = port.data[0]["crypto_balance"] + (trade["quantity"] * current)
-                            supabase.table("demo_portfolios").update({
-                                "crypto_balance": round(new_bal, 2)
-                            }).eq("user_id", trade["user_id"]).execute()
+                with balance_lock:
+                    port = supabase.table("demo_portfolios").select("crypto_balance") \
+                        .eq("user_id", trade["user_id"]).limit(1).execute()
+                    if port.data:
+                        new_bal = port.data[0]["crypto_balance"] + (float(trade["quantity"]) * current)
+                        supabase.table("demo_portfolios").update({
+                            "crypto_balance": round(new_bal, 2)
+                        }).eq("user_id", trade["user_id"]).execute()
 
-                    action = "💰 KAR" if pl > 0 else "🛑 STOP"
-                    print(f"  {action}: {trade['symbol']} %{change:.1f} | ${pl:.2f} | {exit_reason}")
+                action = "💰 KAR" if pl > 0 else "🛑 ZARAR" if pl < 0 else "➖ BREAKEVEN"
+                print(f"  {action}: {trade['symbol']} %{change_pct:+.1f} | ${pl:.2f} | puan:{score} | {exit_reason[:60]}")
 
-                    send_push(
-                        title=f"{'💰' if pl>0 else '🛑'} KAPANDI — {trade['symbol']}",
-                        body=f"%{change:+.1f} | ${pl:.2f} | {exit_reason}",
-                        signal_id=trade.get("signal_id")
-                    )
+                # PUSH — sadece kapanış anında
+                if current < 0.0001:
+                    ps = f"${current:.8f}"
+                elif current < 0.01:
+                    ps = f"${current:.6f}"
+                elif current < 1:
+                    ps = f"${current:.4f}"
+                else:
+                    ps = f"${current:.2f}"
+
+                emoji = "💰" if pl > 0 else "🛑" if pl < 0 else "➖"
+                send_push(
+                    title=f"{emoji} KAPANDI — {trade['symbol']}",
+                    body=f"%{change_pct:+.1f} | ${pl:.2f} | {exit_reason[:40]}",
+                    signal_id=trade.get("signal_id"),
+                )
+
             except Exception as e:
-                print(f"⚠️ {trade['symbol']} pozisyon kontrol hatası: {e}")
+                print(f"⚠️ {trade.get('symbol','?')} pozisyon hata: {e}")
                 continue
-            time.sleep(0.3)
+
+            time.sleep(0.5)
+
     except Exception as e:
-        print(f"❌ Pozisyon kontrol: {e}")
+        print(f"❌ check_positions: {e}")
 
-
-def get_last_signal_time(symbol):
-    try:
-        r = supabase.table("crypto_signals").select("created_at") \
-            .eq("symbol", symbol).order("created_at", ascending=False) \
-            .limit(1).execute()
-        if r.data:
-            dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
-            return dt.timestamp()
-        return 0
-    except:
-        return 0
-
-# ============================================================
-# V11: POZİSYON İZLEME — AYRI THREAD (10s)
-# ============================================================
 
 def position_monitor_loop():
     while True:
         try:
-            crypto_bot_check_positions()
+            check_positions()
         except Exception as e:
-            print(f"❌ Pozisyon izleme thread: {e}")
-        time.sleep(10)
+            print(f"❌ Monitor loop: {e}")
+        time.sleep(60)  # 60 saniyede bir kontrol (önceki 10s → çok sık)
 
 # ============================================================
 # ANA TARAMA
 # ============================================================
 
 def scan_once(scan_count=0):
-    print(f"\n🦅 KARTAL GÖZÜ v4 — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+    print(f"\n🦅 KARTAL GÖZÜ V12 — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     print("=" * 55)
-
-    # Pozisyon izleme ayrı thread'de (10s). Burada sadece sonuç takibi/rapor.
-    if scan_count % 3 == 0:
-        check_signal_outcomes()
-        generate_pattern_report()
-
 
     fg = get_fear_greed()
     if fg:
         e = "😱" if fg["value"] <= 25 else "😐" if fg["value"] <= 50 else "😊" if fg["value"] <= 75 else "🤑"
         print(f"{e} Korku/Açgözlülük: {fg['value']} ({fg['label']})")
 
-    # Veri topla
     print("📡 Veri toplanıyor...")
     mexc = get_mexc_tickers()
     time.sleep(1)
@@ -1629,7 +1271,6 @@ def scan_once(scan_count=0):
     time.sleep(1)
     cmc = get_cmc_coins()
 
-    # Birleştir
     coins = merge_exchange_data(mexc, gateio, cmc)
     if not coins:
         print("⚠️ Veri alınamadı")
@@ -1637,32 +1278,30 @@ def scan_once(scan_count=0):
 
     now = time.time()
     scored = []
-    watchlist_candidates = []
-
     print(f"🔍 {len(coins)} coin analiz ediliyor...")
 
     for coin in coins:
         symbol = coin["symbol"]
         try:
-            # Cache
-            if symbol in signal_cache and now - signal_cache[symbol] < 7200:
+            # Cache — aynı coin için 4 saat arayla sinyal
+            if symbol in signal_cache and now - signal_cache[symbol] < SIGNAL_COOLDOWN_H * 3600:
                 continue
-            if now - get_last_signal_time(symbol) < 7200:
+            last_signal = get_last_signal_time(symbol)
+            if now - last_signal < SIGNAL_COOLDOWN_H * 3600:
                 signal_cache[symbol] = now
                 continue
 
-            ch1h = coin["ch1h"]
-            ch4h = coin["ch4h"]
-            ch24h = coin["ch24h"]
-            ch7d = coin["ch7d"]
-            vol_chg = coin["vol_chg"]
+            ch1h = coin.get("ch1h", 0)
+            ch4h = coin.get("ch4h", 0)
+            ch24h = coin.get("ch24h", 0)
+            ch7d = coin.get("ch7d", 0)
+            vol_chg = coin.get("vol_chg", 0)
             price = coin["price"]
 
             # Hızlı ön eleme
-            # Hızlı ön eleme
             if price <= 0 or price > 2.0:
                 continue
-            if ch1h >= 6 or ch1h < -3:  # %6+ zaten geç, atla — erken yakalama hedefi
+            if ch1h >= 6 or ch1h < -3:
                 continue
             if ch4h < -8:
                 continue
@@ -1673,122 +1312,93 @@ def scan_once(scan_count=0):
             if vol_chg < 20 and ch1h < 1.5:
                 continue
 
-            # Teknik analiz
             tech = get_technical_data(symbol)
             time.sleep(0.3)
 
-            # Scam kontrolü
             is_scam, reason = scam_check(symbol, price, ch1h, ch24h, vol_chg, tech)
             if is_scam:
                 continue
-
-            # Teknik veri yoksa watchlist'e ekle, sinyal verme
             if not tech:
-                watchlist_candidates.append((symbol, price, ch1h, ch24h, vol_chg, None, "No-tech"))
                 continue
 
-            # V6: Order book (sadece skoru sınırın yakınında olan adaylar için
-            # ek API yükü olmasın diye, önce skoru hesapla, sonra gerekirse ekle)
-            orderbook = get_orderbook_signal(symbol)
+            orderbook = get_orderbook(symbol)
             time.sleep(0.2)
 
-            # Puanla
             result = score_coin(
                 symbol, coin["name"], price,
                 ch1h, ch4h, ch24h, ch7d,
-                vol_chg, coin["mcap"], coin["cmc_rank"],
-                tech, fg, orderbook
+                vol_chg, coin.get("mcap", 0), coin.get("cmc_rank", 9999),
+                tech, fg, orderbook,
             )
 
             if result:
-                 # V9: Proje yaş kontrolü — sadece skorlamayı geçenler için
-                age_days = get_coin_age_days(symbol, coin.get("date_added"))
-                if age_days is not None and age_days < 30:
-                    print(f"  ⏭️ {symbol} elendi — {age_days} gün önce listelendi (rug riski)")
+                # Yaş kontrolü
+                age = get_coin_age_days(symbol, coin.get("date_added"))
+                if age is not None and age < 30:
+                    print(f"  ⏭️ {symbol} elendi — {age} gün önce listelendi")
                     continue
                 scored.append(result)
                 ob_log = f" | OB:{orderbook['bid_ask_ratio']}x" if orderbook else ""
-                print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} | {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}{ob_log} | [{result['exchange']}]")
-            else:
-                # Sinyal eşiğini geçemedi ama izlemeye değer olabilir
-                if vol_chg > 50 or (tech.get("rsi") and tech["rsi"] < 40):
-                    watchlist_candidates.append((symbol, price, ch1h, ch24h, vol_chg, tech, coin.get("sources", ["?"])[0]))
+                print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} "
+                      f"| {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}{ob_log}")
 
-        except:
+        except Exception:
             continue
 
-    # İzleme havuzunu güncelle
-    for args in watchlist_candidates:
-        watchlist_update(*args)
+    # ── SEÇİM: SADECE CRITICAL + BİRİKİM adayları ──────────
+    # Diğerleri de kaydedilir ama bot alım yapmaz
+    buy_candidates = [
+        s for s in scored
+        if s["conviction"] == "CRITICAL" and s["layer"] == "BIRIKIM"
+    ]
 
-    # İzleme havuzundan olgunlaşmış sinyaller
-    watchlist_signals = watchlist_check_signals(fg)
-    scored.extend(watchlist_signals)
-
-    # Sırala: WATCHLIST > BİRİKİM > MOMENTUM, sonra score
-    layer_order = {"WATCHLIST": 0, "BIRIKIM": 1, "MOMENTUM": 2}
-    scored.sort(key=lambda x: (layer_order.get(x["layer"], 3), -x["score"]))
-
-    # SERT ELEME — sayı sabit DEĞİL, kalite sabit.
-    # MEDIUM tek başına asla yeterli değil. Doldurma yapılmaz, 0 sinyal de olabilir.
-    top = [s for s in scored if s["conviction"] in ["CRITICAL", "HIGH"] and s["score"] >= 14]
-    top = top[:5]  # üst sınır 5, alt sınır yok
-
-    print(f"\n📋 {len(scored)} aday → {len(top)} sinyal seçildi")
-
-    # Bu taramada CRITICAL+BİRİKİM olanlar arasından SADECE en yüksek skorlu
-    # olan bota alım yaptırır (istisnai +2 mantığı _crypto_bot_buy içinde).
-    buy_candidates = [s for s in top if s["conviction"] == "CRITICAL" and s["layer"] == "BIRIKIM"]
-    best_buy_symbol = None
+    best_buy = None
     if buy_candidates:
-        best_buy_symbol = max(buy_candidates, key=lambda x: x["score"])["symbol"]
+        best_buy = max(buy_candidates, key=lambda x: x["score"])
         if len(buy_candidates) > 1:
-            print(f"  ⚖️ {len(buy_candidates)} CRITICAL+BİRİKİM aday — sadece {best_buy_symbol} (en yüksek skor) bota gidiyor")
+            print(f"  ⚖️ {len(buy_candidates)} CRITICAL+BİRİKİM aday — "
+                  f"sadece {best_buy['symbol']} (score:{best_buy['score']}) alım yapıyor")
+
+    # Sinyal kayıt — sadece CRITICAL ve HIGH
+    top = [s for s in scored if s["conviction"] in ["CRITICAL", "HIGH"] and s["score"] >= 14]
+    top = sorted(top, key=lambda x: -x["score"])[:5]
+
+    print(f"\n📋 {len(scored)} aday → {len(top)} sinyal kaydedilecek")
 
     signals_found = 0
     for s in top:
-        if save_and_push_signal(s, fg, allow_buy=(s["symbol"] == best_buy_symbol)):
+        allow = (best_buy is not None and s["symbol"] == best_buy["symbol"])
+        if save_signal(s, fg, allow_buy=allow):
             signals_found += 1
         time.sleep(0.5)
 
     return signals_found
-
 
 # ============================================================
 # ANA DÖNGÜ
 # ============================================================
 
 def main():
-    print("🚀 Atlas Kripto Kartal Gözü — v4 (V5+V6+V8+V11)")
-    print("🎯 MEXC + Gate.io + Binance + CMC | RSI | OBV | Order Book | Watchlist | Scam Filter | Outcome Tracking")
+    print("🚀 Atlas Kripto Kartal Gözü — V12 Savaş Mimarisi")
+    print("📌 Trailing Stop: %8→breakeven→%4→%6 | Min tutma:4s | Max pozisyon:3+2 | Rotasyon:YOK")
     print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
     if not CMC_API_KEY:
         print("❌ CMC_API_KEY bulunamadı!")
         return
 
-    # Tabloları kontrol et
-    try:
-        supabase.table("crypto_watchlist").select("id").limit(1).execute()
-        print("✅ crypto_watchlist tablosu hazır")
-    except:
-        print("⚠️ crypto_watchlist tablosu yok — Supabase'de oluştur!")
+    # Tablo kontrol
+    for tbl in ["crypto_signals", "demo_trades", "demo_portfolios", "profiles"]:
+        try:
+            supabase.table(tbl).select("id").limit(1).execute()
+            print(f"✅ {tbl} hazır")
+        except Exception as e:
+            print(f"⚠️ {tbl}: {e}")
 
-    try:
-        supabase.table("crypto_signals").select("id").limit(1).execute()
-        print("✅ crypto_signals tablosu hazır")
-    except Exception as e:
-        print(f"⚠️ Tablo: {e}")
-
-    try:
-        supabase.table("signal_outcomes").select("id").limit(1).execute()
-        print("✅ signal_outcomes tablosu hazır")
-    except Exception as e:
-        print(f"⚠️ signal_outcomes tablosu yok: {e}")
-
-    monitor_thread = threading.Thread(target=position_monitor_loop, daemon=True)
-    monitor_thread.start()
-    print("👁️ Pozisyon izleme thread'i başlatıldı (10s aralık)")
+    # Pozisyon izleme thread
+    monitor = threading.Thread(target=position_monitor_loop, daemon=True)
+    monitor.start()
+    print("👁️ Pozisyon izleme başlatıldı (60s aralık)")
 
     scan_count = 0
     while True:
@@ -1798,7 +1408,7 @@ def main():
             print(f"\n✅ Tarama #{scan_count} bitti. {found} sinyal. 15 dk bekleniyor...")
             time.sleep(900)
         except Exception as e:
-            print(f"❌ Döngü: {e}")
+            print(f"❌ Ana döngü: {e}")
             time.sleep(120)
 
 
