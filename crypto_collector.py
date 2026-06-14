@@ -900,6 +900,18 @@ def check_signal_outcomes():
                     entry = float(row["entry_price"])
                     pct = ((current - entry) / entry) * 100 if entry > 0 else 0
 
+                    # Borsa çapraz-kontaminasyon koruması: 24s içinde
+                    # |%95|'i aşan bir değişim, gerçek bir hareket değil,
+                    # farklı bir borsadan/pariteden yanlış fiyat okunduğu
+                    # anlamına gelir (örn. "U" sembolü stablecoin ile
+                    # karışmış, fiyat $0.0003 → $1.00 gibi). Bu durumda
+                    # kaydı "checked" yapma, bir sonraki taramada tekrar
+                    # denensin — istatistiği bozmasın.
+                    if abs(pct) > 95:
+                        print(f"⚠️ {row['symbol']} {field} sonucu şüpheli "
+                              f"(%{pct:.1f}, {entry}→{current}) — atlanıyor")
+                        continue
+
                     supabase.table("signal_outcomes").update({
                         f"price_{field}": current,
                         f"pct_{field}": round(pct, 2),
