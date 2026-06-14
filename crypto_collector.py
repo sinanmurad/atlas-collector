@@ -1050,6 +1050,30 @@ def watchlist_update(symbol, price, rsi, obv_trend, vol_chg, score, source="CMC"
             print(f"  🔄 İzleme listesi: {weak['symbol']} (skor:{weak['last_score']}) "
                   f"çıktı, {symbol} (skor:{score}) girdi")
 
+        # Symbol unique constraint nedeniyle, herhangi bir status'ta
+        # önceden kayıtlı mı kontrol et (örn. eski 'signaled' kaydı)
+        any_existing = supabase.table("crypto_watchlist") \
+            .select("id").eq("symbol", symbol).limit(1).execute()
+
+        if any_existing.data:
+            # Var olan kaydı 'watching' olarak yeniden aktifleştir
+            supabase.table("crypto_watchlist").update({
+                "source": source,
+                "first_seen": datetime.now(timezone.utc).isoformat(),
+                "last_seen": datetime.now(timezone.utc).isoformat(),
+                "first_price": price,
+                "last_price": price,
+                "observation_count": 1,
+                "last_rsi": rsi,
+                "last_obv": obv_trend,
+                "last_vol_chg": vol_chg,
+                "last_score": score,
+                "status": "watching",
+                "signal_date": None,
+            }).eq("id", any_existing.data[0]["id"]).execute()
+            print(f"  👁️ İZLEMEYE ALINDI: {symbol} (skor:{score}) @ ${price} (yeniden aktif)")
+            return
+
         supabase.table("crypto_watchlist").insert({
             "symbol": symbol,
             "source": source,
