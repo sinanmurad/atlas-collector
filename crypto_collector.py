@@ -138,6 +138,29 @@ STABLECOIN_BASES = {
 }
 
 # ============================================================
+# BOT AKTİVİTE LOGU — canlı izleme için (Flutter ekranı)
+# ============================================================
+
+def log_activity(event_type, symbol=None, price=None, pnl=None, pnl_pct=None,
+                  detail=None, conviction=None, layer=None, market="CRYPTO"):
+    """ALIM/SATIM/SİNYAL/ÖĞRENME/İZLEME olaylarını bot_activity_log'a yazar."""
+    try:
+        supabase.table("bot_activity_log").insert({
+            "event_type": event_type,
+            "symbol": symbol,
+            "market": market,
+            "price": price,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "detail": detail,
+            "conviction": conviction,
+            "layer": layer,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ log_activity: {e}")
+
+# ============================================================
 # PUSH BİLDİRİM — Sadece AL ve SAT
 # ============================================================
 
@@ -943,6 +966,10 @@ def update_learning_weights():
             print(f"  🧠 ÖĞRENME: {key_str} → bonus:{bonus:+d} "
                   f"(n={n}, win_rate=%{win_rate*100:.1f}, z={z:.2f})")
 
+            log_activity("OGRENME", detail=f"{key_str} → bonus:{bonus:+d} "
+                          f"(n={n}, win_rate=%{win_rate*100:.1f}, z={z:.2f})",
+                          layer=layer)
+
         if updated:
             print(f"  🧠 {updated} patern güncellendi")
 
@@ -1127,6 +1154,8 @@ def check_watchlist_movement():
                     }).eq("id", row["id"]).execute()
                     moved += 1
                     print(f"  🔥 HAREKETLENDİ: {symbol} — {trigger}")
+                    log_activity("IZLEME", symbol=symbol, price=cur_price,
+                                  detail=trigger)
                 else:
                     supabase.table("crypto_watchlist").update({
                         "last_seen": now.isoformat(),
@@ -1381,6 +1410,10 @@ def save_signal(s, fg, allow_buy=False):
         signal_cache[s["symbol"]] = time.time()
         sid = res.data[0].get("id") if res.data else None
 
+        log_activity("SINYAL", symbol=s["symbol"], price=price,
+                      detail=f"Score:{s['score']} | RSI:{s['rsi']} | OBV:{s['obv_trend']}",
+                      conviction=s["conviction"], layer=s["layer"])
+
         if allow_buy:
             bot_buy(s, sid)
 
@@ -1517,6 +1550,10 @@ def _execute_buy(user_id, symbol, price, signal_id, conviction, layer,
         # Öğrenme sistemi — 24s/72s/7g sonuç takibi için kayıt
         record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv, price)
 
+        log_activity("ALIM", symbol=symbol, price=price,
+                      detail=f"${invest:.0f} yatırım | Stop:{stop_price:.8f}{' | İSTİSNAİ' if is_exceptional else ''}",
+                      conviction=conviction, layer=layer)
+
         # PUSH — sadece alım anında
         if price < 0.0001:
             ps = f"${price:.8f}"
@@ -1609,6 +1646,12 @@ def check_positions():
 
                 action = "💰 KAR" if pl > 0 else "🛑 ZARAR" if pl < 0 else "➖ BREAKEVEN"
                 print(f"  {action}: {trade['symbol']} %{change_pct:+.1f} | ${pl:.2f} | puan:{score} | {exit_reason[:60]}")
+
+                log_activity("SATIM", symbol=trade["symbol"], price=current,
+                              pnl=round(pl, 2), pnl_pct=round(change_pct, 2),
+                              detail=exit_reason[:120],
+                              conviction=trade.get("entry_conviction"),
+                              layer=trade.get("signal_layer"))
 
                 # PUSH — sadece kapanış anında
                 if current < 0.0001:
