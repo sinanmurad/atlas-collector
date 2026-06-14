@@ -711,15 +711,27 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     if vol_chg < 30 and (rsi is None or rsi > 55) and obv_trend != "up":
         return None
 
-    # ── FİYAT HAREKET (ERKEN YAKALAMA) ───────────────────────
-    if 0 <= ch1h <= 3:
-        score += 2
-        reasons.append(f"%{ch1h:.1f} — erken aşama, henüz oynamamış")
+    # ── FİYAT HAREKET (İĞNE DELİĞİ — yukarı kırılma teyidi) ──
+    # Amaç: "henüz oynamamış" (ch1h≈0) veya "düşüyor" (ch1h<0) coinleri
+    # değil, "şimdi yukarı kırılmaya BAŞLAMIŞ" (ch1h pozitif ve makul)
+    # coinleri öne çıkarmak. Aşırı pump (>6%) trene atlama riski.
+    if ch1h < 0:
+        score -= 3
+        reasons.append(f"%{ch1h:.1f} — düşüş sürüyor, teyit yok")
+    elif ch1h == 0:
+        reasons.append(f"%{ch1h:.1f} — durağan, henüz kırılım yok")
+    elif ch1h <= 1.5:
+        score += 1
+        reasons.append(f"%{ch1h:.1f} — hafif yukarı kırılım başladı")
+    elif ch1h <= 4:
+        score += 3
+        reasons.append(f"%{ch1h:.1f} — yukarı kırılım teyitli")
     elif ch1h <= 6:
         score += 1
-        reasons.append(f"%{ch1h:.1f} — hafif hareket başladı")
-    elif ch1h > 6:
+        reasons.append(f"%{ch1h:.1f} — hareket güçlü, dikkat")
+    else:
         score -= 2
+        reasons.append(f"%{ch1h:.1f} — aşırı hareket, trene atlama riski")
 
     if ch4h >= 10:
         score += 4
