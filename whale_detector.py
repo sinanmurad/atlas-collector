@@ -2,10 +2,12 @@
 import os
 import json
 import time
+import math
 import requests
 import websocket
 import yfinance as yf
 import threading
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
 import firebase_admin
@@ -28,6 +30,13 @@ company_cache = {}
 analyst_cache = {}
 premarket_signal_cache = {}
 
+# ── OTOMATİK ÖĞRENME SİSTEMİ — sabitler (crypto_collector.py ile aynı) ──
+LEARNING_MIN_SAMPLES = 30        # Grup başına min örnek (akademik standart: 30+)
+LEARNING_MIN_ABS_Z = 1.96         # ~p<0.05 için z-skor eşiği
+LEARNING_MAX_BONUS = 3            # skora uygulanacak max ek/eksi puan
+LEARNING_BASELINE_WINRATE = 0.45  # "Başarı" referansı: 24s içinde >%2 kâr oranı
+OUTCOME_CHECK_HOURS = [24, 72, 168]   # 24s, 72s, 7g sonuç ölçümü
+
 try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
@@ -35,6 +44,242 @@ try:
         print("✅ Firebase Admin baslatildi")
 except Exception as e:
     print(f"⚠️ Firebase baslatma hatası: {e}")
+
+
+def log_activity(event_type, symbol=None, price=None, pnl=None, pnl_pct=None,
+                  detail=None, conviction=None, layer=None, market="US"):
+    """ALIM/SATIM/SİNYAL olaylarını bot_activity_log'a yazar."""
+    try:
+        supabase.table("bot_activity_log").insert({
+            "event_type": event_type,
+            "symbol": symbol,
+            "market": market,
+            "price": price,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "detail": detail,
+            "conviction": conviction,
+            "layer": layer,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ log_activity: {e}")
+
+
+# ============================================================
+# OTOMATİK ÖĞRENME SİSTEMİ (crypto_collector.py V12 ile aynı mantık)
+# ============================================================
+# Akış:
+# 1. Her bot alımında signal_outcomes'a kayıt atılır (record_signal_outcome)
+# 2. Her taramada check_signal_outcomes() 24s/72s/7g dolan kayıtların
+#    gerçek sonucunu ölçer (fiyat şu an ne oldu, kâr/zarar %)
+# 3. update_learning_weights() yeterli örnek (>=30) + istatistiksel
+#    anlamlılık (|z|>=1.96) varsa learning_weights tablosuna katsayı yazar
+# 4. premarket_conviction/process_live_signal bu katsayıyı okuyup
+#    ±LEARNING_MAX_BONUS uygular
+# Hiçbir adım manuel müdahale gerektirmez — sistem kendi kendine evrilir.
+# TR/US, signal_outcomes/learning_weights tablolarını market='BIST'/'US'
+# filtresiyle kripto ile aynı tablodan paylaşır — karışmazlar.
+
+def score_bucket(score):
+    """RSI bucket'ının TR/US karşılığı — entry_score bandı."""
+    if score is None:
+        return "SCORE_YOK"
+    if score < 7:
+        return "SCORE<7"
+    if score < 10:
+        return "SCORE7-10"
+    if score < 14:
+        return "SCORE10-14"
+    return "SCORE14+"
+
+
+def record_signal_outcome(signal_id, symbol, layer, conviction, score, entry_price, market="US"):
+    """Bot alımı yapıldığında çağrılır — 24s/72s/7g sonuç takibi için kayıt at."""
+    try:
+        supabase.table("signal_outcomes").insert({
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "layer": layer,
+            "conviction": conviction,
+            "entry_score": score,
+            "entry_price": entry_price,
+            "market": market,
+            "checked_24h": False,
+            "checked_72h": False,
+            "checked_7d": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ signal_outcomes kayıt: {e}")
+
+
+def _yf_last_price(symbol):
+    """yfinance ile son fiyatı çek — check_signal_outcomes için."""
+    try:
+        t = yf.Ticker(symbol)
+        hist = t.history(period="1d", interval="1m").dropna()
+        if hist.empty:
+            return None
+        return float(hist["Close"].iloc[-1])
+    except Exception:
+        return None
+
+
+def check_signal_outcomes(market="US", price_fetcher=None):
+    """
+    24s/72s/7g eşiklerini dolduran kayıtların gerçek sonucunu ölçer.
+    price_fetcher verilmezse yfinance kullanılır.
+    """
+    if price_fetcher is None:
+        price_fetcher = _yf_last_price
+
+    try:
+        now = datetime.now(timezone.utc)
+        field_map = {24: "24h", 72: "72h", 168: "7d"}
+
+        for hours in OUTCOME_CHECK_HOURS:
+            field = field_map[hours]
+            cutoff = (now - timedelta(hours=hours)).isoformat()
+
+            rows = supabase.table("signal_outcomes") \
+                .select("*") \
+                .eq(f"checked_{field}", False) \
+                .eq("market", market) \
+                .lte("created_at", cutoff) \
+                .limit(20).execute()
+
+            if not rows.data:
+                continue
+
+            for row in rows.data:
+                try:
+                    current = price_fetcher(row["symbol"])
+                    if current is None:
+                        supabase.table("signal_outcomes").update({
+                            f"checked_{field}": True
+                        }).eq("id", row["id"]).execute()
+                        continue
+
+                    entry = float(row["entry_price"])
+                    pct = ((current - entry) / entry) * 100 if entry > 0 else 0
+
+                    if abs(pct) > 95:
+                        print(f"⚠️ {row['symbol']} {field} sonucu şüpheli "
+                              f"(%{pct:.1f}, {entry}→{current}) — atlanıyor")
+                        continue
+
+                    supabase.table("signal_outcomes").update({
+                        f"price_{field}": current,
+                        f"pct_{field}": round(pct, 2),
+                        f"checked_{field}": True,
+                    }).eq("id", row["id"]).execute()
+
+                except Exception:
+                    continue
+                time.sleep(0.2)
+
+    except Exception as e:
+        print(f"❌ check_signal_outcomes ({market}): {e}")
+
+
+def update_learning_weights(market="US"):
+    """
+    layer + score bucket kombinasyonu başına 24s sonuçlarını
+    analiz eder. >=30 örnek VE |z|>=1.96 (yaklaşık p<0.05) ise
+    learning_weights'e küçük bir katsayı yazar.
+    """
+    try:
+        rows = supabase.table("signal_outcomes") \
+            .select("layer, entry_score, pct_24h") \
+            .eq("checked_24h", True) \
+            .eq("market", market) \
+            .not_.is_("pct_24h", "null") \
+            .execute()
+
+        if not rows.data or len(rows.data) < LEARNING_MIN_SAMPLES:
+            return
+
+        groups = defaultdict(list)
+        for r in rows.data:
+            bucket = score_bucket(r.get("entry_score"))
+            key = (r.get("layer") or "?", bucket)
+            groups[key].append(r["pct_24h"])
+
+        updated = 0
+        for (layer, bucket), pcts in groups.items():
+            n = len(pcts)
+            if n < LEARNING_MIN_SAMPLES:
+                continue
+
+            wins = sum(1 for p in pcts if p > 2)
+            win_rate = wins / n
+
+            p0 = LEARNING_BASELINE_WINRATE
+            se = math.sqrt(p0 * (1 - p0) / n)
+            z = (win_rate - p0) / se if se > 0 else 0
+
+            if abs(z) < LEARNING_MIN_ABS_Z:
+                continue
+
+            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS
+            bonus = round(magnitude) if z > 0 else -round(magnitude)
+            bonus = max(-LEARNING_MAX_BONUS, min(LEARNING_MAX_BONUS, bonus))
+
+            if bonus == 0:
+                continue
+
+            key_str = f"{layer}|{bucket}"
+            supabase.table("learning_weights").upsert({
+                "pattern_key": key_str,
+                "layer": layer,
+                "rsi_bucket": bucket,
+                "obv_trend": None,
+                "sample_size": n,
+                "win_rate": round(win_rate * 100, 1),
+                "z_score": round(z, 2),
+                "bonus": bonus,
+                "market": market,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="market,pattern_key").execute()
+
+            updated += 1
+            print(f"  🧠 ÖĞRENME ({market}): {key_str} → bonus:{bonus:+d} "
+                  f"(n={n}, win_rate=%{win_rate*100:.1f}, z={z:.2f})")
+
+            log_activity("OGRENME", detail=f"{key_str} → bonus:{bonus:+d} "
+                          f"(n={n}, win_rate=%{win_rate*100:.1f}, z={z:.2f})",
+                          layer=layer, market=market)
+
+        if updated:
+            print(f"  🧠 {updated} patern güncellendi ({market})")
+
+    except Exception as e:
+        print(f"❌ update_learning_weights ({market}): {e}")
+
+
+_learning_cache_us = {"data": {}, "ts": 0}
+
+
+def get_learning_bonus(layer, score, market="US"):
+    """
+    premarket_conviction/process_live_signal tarafından çağrılır.
+    learning_weights'ten önceden hesaplanmış katsayıyı okur.
+    10 dakika cache'lenir.
+    """
+    global _learning_cache_us
+    now = time.time()
+    if now - _learning_cache_us["ts"] > 600:
+        try:
+            rows = supabase.table("learning_weights").select("*").eq("market", market).execute()
+            _learning_cache_us["data"] = {r["pattern_key"]: r["bonus"] for r in (rows.data or [])}
+            _learning_cache_us["ts"] = now
+        except Exception:
+            pass
+
+    bucket = score_bucket(score)
+    key = f"{layer}|{bucket}"
+    return _learning_cache_us["data"].get(key, 0)
 
 
 def send_push_notification(title, body, market="US", signal_id=None):
@@ -344,11 +589,11 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
     reasons = []
 
     if not trend_data:
-        return "NORMAL", [], 0
+        return "NORMAL", [], 0, None
 
     has_catalyst = bool(catalyst or earnings or analyst or insider)
     if not has_catalyst:
-        return "NORMAL", [], 0
+        return "NORMAL", [], 0, None
 
     if earnings:
         eps_est = earnings.get("eps_estimate")
@@ -393,6 +638,20 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
         score += 1
         reasons.append(f"Dün +{trend_data['prev_change']}% pozitif")
 
+    # Layer ayrımı — sinyalin kaynağına göre
+    if earnings:
+        layer = "EARNINGS"
+    elif catalyst:
+        layer = "HABER"
+    else:
+        layer = "TEKNIK"
+
+    # Öğrenme bonusu — geçmiş 24s sonuçlarına göre ±LEARNING_MAX_BONUS
+    bonus = get_learning_bonus(layer, score, market="US")
+    if bonus != 0:
+        score += bonus
+        reasons.append(f"🧠 Öğrenme katsayısı: {bonus:+d}")
+
     if score >= 10:
         conviction = "CRITICAL"
     elif score >= 7:
@@ -402,7 +661,7 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
     else:
         conviction = "NORMAL"
 
-    return conviction, reasons, score
+    return conviction, reasons, score, layer
 
 
 def get_ai_explanation(symbol, company_name, sector, trend_data, catalyst, earnings, analyst, insider, conviction, reasons, is_premarket_signal=False):
@@ -592,7 +851,7 @@ def us_bot_should_sell(trade, current_price):
     return False, "", peak
 
 
-def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons, trend_data):
+def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons, trend_data, layer=None):
     try:
         open_trades = get_open_us_trades(user_id)
         open_count = len(open_trades)
@@ -649,6 +908,10 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, scor
         }).eq("user_id", user_id).execute()
         tag = " 🌟İSTİSNA" if is_exceptional else ""
         print(f"✅ BOT ALIM{tag}: {user_id} → {symbol} @ ${price:.2f} | Stop:${stop} Hedef:${target}")
+        log_activity("ALIM", symbol=symbol, price=price,
+                      detail=f"${invest:.0f} yatırım | Stop:{stop} | Hedef:{target}" + (" | İSTİSNAİ" if is_exceptional else ""),
+                      conviction=conviction, market="US")
+        record_signal_outcome(signal_id, symbol, layer, conviction, score, price, market="US")
         return True
     except Exception as e:
         print(f"❌ Bot alım hatası: {e}")
@@ -658,6 +921,7 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, scor
 def bot_sell(trade, current_price, exit_reason=""):
     try:
         profit_loss = (current_price - trade["buy_price"]) * trade["quantity"]
+        pct = ((current_price - trade["buy_price"]) / trade["buy_price"]) * 100
         supabase.table("demo_trades").update({
             "sell_price": current_price,
             "sell_date": datetime.now(timezone.utc).isoformat(),
@@ -670,6 +934,10 @@ def bot_sell(trade, current_price, exit_reason=""):
             new_balance = portfolio.data["us_balance"] + (trade["quantity"] * current_price)
             supabase.table("demo_portfolios").update({"us_balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
         print(f"✅ BOT SATIŞ ({exit_reason}): {trade['symbol']} | K/Z: ${profit_loss:.2f}")
+        log_activity("SATIM", symbol=trade["symbol"], price=current_price,
+                      pnl=round(profit_loss, 2), pnl_pct=round(pct, 2),
+                      detail=exit_reason,
+                      conviction=trade.get("entry_conviction"), market="US")
     except Exception as e:
         print(f"❌ Bot satış hatası: {e}")
 
@@ -702,7 +970,7 @@ def bot_check_open_positions():
         print(f"❌ Pozisyon kontrol hatası: {e}")
 
 
-def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id, score=0, reasons=None, trend_data=None):
+def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id, score=0, reasons=None, trend_data=None, layer=None):
     try:
         if not bot_should_buy(price_change, volume_ratio, conviction):
             return
@@ -717,7 +985,7 @@ def bot_process_signal(symbol, price, price_change, volume_ratio, conviction, si
                 continue
             profile = supabase.table("profiles").select("is_pro").eq("id", user_id).limit(1).execute()
             is_pro = profile.data[0].get("is_pro", False) if profile.data else False
-            bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons or [], trend_data)
+            bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons or [], trend_data, layer)
             time.sleep(0.2)
     except Exception as e:
         print(f"❌ Bot sinyal hatası: {e}")
@@ -769,7 +1037,7 @@ def run_premarket_scan():
             analyst = get_analyst_rating(symbol)
             insider = get_insider_recent(symbol)
 
-            conviction, reasons, score = premarket_conviction(trend, catalyst, earnings, analyst, insider)
+            conviction, reasons, score, layer = premarket_conviction(trend, catalyst, earnings, analyst, insider)
 
             if conviction == "NORMAL":
                 continue
@@ -785,7 +1053,8 @@ def run_premarket_scan():
                 "insider": insider,
                 "conviction": conviction,
                 "reasons": reasons,
-                "score": score
+                "score": score,
+                "layer": layer
             })
 
             print(f"  🎯 {symbol} ({company_name}) | {conviction} | Score: {score}")
@@ -843,6 +1112,10 @@ def run_premarket_scan():
             signal_id = result.data[0].get("id") if result.data else None
             premarket_signal_cache[symbol] = time.time()
             print(f"✅ DB'ye kaydedildi: {description}")
+
+            log_activity("SINYAL", symbol=symbol, price=trend["last_close"],
+                          detail=f"Score:{sig['score']} | Dun:{trend['prev_change']:+}% | PRE-MARKET",
+                          conviction=conviction, market="US")
 
         except Exception as e:
             print(f"❌ Sinyal kayıt hatası {sig['symbol']}: {e}")
@@ -947,14 +1220,26 @@ def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
     if insider:
         score += 2
 
-    conviction = "HIGH" if score >= 7 else "MEDIUM" if score >= 4 else "NORMAL"
+    layer = "CANLI"
+    bonus = get_learning_bonus(layer, score, market="US")
+    if bonus != 0:
+        score += bonus
+
+    if score >= 10:
+        conviction = "CRITICAL"
+    elif score >= 7:
+        conviction = "HIGH"
+    elif score >= 4:
+        conviction = "MEDIUM"
+    else:
+        conviction = "NORMAL"
 
     if conviction == "NORMAL" and not has_catalyst:
         return
 
     print(f"📊 CANLI: {symbol} ({company_name}) | {conviction} | {price_change:+.1f}% | {volume_ratio:.1f}x")
 
-    emoji = "🔥" if conviction == "HIGH" else "⚡"
+    emoji = "🔥" if conviction in ("CRITICAL", "HIGH") else "⚡"
     description = f"{emoji} {symbol}"
     if company_name:
         description += f" ({company_name})"
@@ -982,12 +1267,17 @@ def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
         signal_id = result.data[0].get("id") if result.data else None
         print(f"✅ KAYDEDİLDİ: {description}")
 
+        log_activity("SINYAL", symbol=symbol, price=price,
+                      detail=f"{price_change:+.1f}% | Vol:{volume_ratio:.1f}x | {signal_type}",
+                      conviction=conviction, market="US")
+
         trend_for_levels = get_5day_trend(symbol)
         bot_process_signal(
             symbol, price, price_change, volume_ratio, conviction, signal_id,
             score=score,
             reasons=[catalyst["headline"]] if catalyst else [],
-            trend_data=trend_for_levels
+            trend_data=trend_for_levels,
+            layer=layer
         )
 
         push_body = f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x"
@@ -1064,9 +1354,15 @@ def connect_websocket():
 
 
 def position_monitor_loop():
-    """Borsa açıkken 60sn'de bir açık pozisyonları kontrol eder (stop/hedef/reversal)"""
+    """Borsa açıkken 60sn'de bir açık pozisyonları kontrol eder (stop/hedef/reversal)
+    + her ~10 dakikada bir öğrenme sistemini günceller."""
+    cycle = 0
     while is_market_open():
         bot_check_open_positions()
+        cycle += 1
+        if cycle % 10 == 0:
+            check_signal_outcomes(market="US")
+            update_learning_weights(market="US")
         time.sleep(60)
 
 
