@@ -144,8 +144,9 @@ STABLECOIN_BASES = {
 def log_activity(event_type, symbol=None, price=None, pnl=None, pnl_pct=None,
                   detail=None, conviction=None, layer=None, market="CRYPTO"):
     """ALIM/SATIM/SİNYAL/ÖĞRENME/İZLEME olaylarını bot_activity_log'a yazar."""
+    print(f"🪵 log_activity ÇAĞRILDI: {event_type} | {symbol}")
     try:
-        supabase.table("bot_activity_log").insert({
+        res = supabase.table("bot_activity_log").insert({
             "event_type": event_type,
             "symbol": symbol,
             "market": market,
@@ -157,8 +158,9 @@ def log_activity(event_type, symbol=None, price=None, pnl=None, pnl_pct=None,
             "layer": layer,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
+        print(f"🪵 log_activity BAŞARILI: {event_type} | id={res.data[0]['id'] if res.data else '?'}")
     except Exception as e:
-        print(f"⚠️ log_activity: {e}")
+        print(f"⚠️ log_activity HATA: {type(e).__name__}: {e}")
 
 # ============================================================
 # PUSH BİLDİRİM — Sadece AL ve SAT
