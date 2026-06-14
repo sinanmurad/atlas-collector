@@ -96,6 +96,8 @@ TRAIL_ACTIVATE_PCT = 0.03    # %3 kârdan sonra breakeven
 TRAIL_4_PCT = 0.08           # %8-15 kâr arası → zirveden -%4
 TRAIL_6_PCT = 0.15           # %15+ kâr → zirveden -%6
 MIN_HOLD_HOURS = 4            # 4 saat tutmadan doğrulama katmanı çıkışı yok
+ZOMBIE_HOLD_HOURS = 24        # Bu süre geçti + kâr yok + doğrulama yetersizse
+                              # slot temizliği yapılır (kârda olan dokunulmaz)
 CLOSE_SCORE_MIN = 5           # Doğrulama katmanı minimum puan
 MIN_PROFIT_PCT = 0.03         # Doğrulama çıkışı için min %3 kâr
 MAX_OPEN_FREE = 3             # Free kullanıcı max açık pozisyon
@@ -498,14 +500,22 @@ def close_confirmation_score(trade, tech, ob):
     except Exception:
         hold_hours = MIN_HOLD_HOURS  # parse hatasında güvenli taraf: kilitleme
 
-    # VETO: 4 saat dolmadan doğrulama katmanı çıkışı yok (stop hariç)
-    if hold_hours < MIN_HOLD_HOURS:
-        return 0, [f"VETO: {hold_hours:.1f}s/{MIN_HOLD_HOURS}s tutma — sadece stop aktif"], True, trailing_stop
-
     profit_pct = (current - buy_price) / buy_price
+    obv_reversed = (trade.get("entry_obv") == "up" and tech.get("obv_trend") == "down")
+
+    # VETO: 4 saat dolmadan doğrulama katmanı çıkışı yok — TEK İSTİSNA:
+    # zarar >= %5 VE giriş anındaki "birikim" trendi tersine döndüyse
+    # (OBV up→down), bu "gürültü" değil "bozulma" sinyali — erken
+    # doğrulamaya izin ver. İki şart birden gerektiği için rastlantısal
+    # tetiklenme riski düşük.
+    if hold_hours < MIN_HOLD_HOURS:
+        early_exit_ok = profit_pct <= -0.05 and obv_reversed
+        if not early_exit_ok:
+            return 0, [f"VETO: {hold_hours:.1f}s/{MIN_HOLD_HOURS}s tutma — sadece stop aktif"], True, trailing_stop
+        reasons.append(f"⏱️ Erken doğrulama: zarar %{profit_pct*100:.1f} + OBV dönüşü ({hold_hours:.1f}s/{MIN_HOLD_HOURS}s)")
 
     # ── KAYNAK 1: OBV dönüşü ────────────────────────────────
-    if trade.get("entry_obv") == "up" and tech.get("obv_trend") == "down":
+    if obv_reversed:
         score += 3
         reasons.append("OBV down geçti (birikim bitti)")
 
@@ -543,6 +553,15 @@ def close_confirmation_score(trade, tech, ob):
     if profit_pct < MIN_PROFIT_PCT:
         score -= 3
         reasons.append(f"Kâr %{profit_pct*100:.1f} < %{MIN_PROFIT_PCT*100:.0f} (erken çıkış değil)")
+
+    # ── ZOMBİ TEMİZLİĞİ ──────────────────────────────────────
+    # 24+ saat açık, hâlâ KÂRDA DEĞİL (current <= buy_price) ve
+    # doğrulama eşiğine ulaşmamış pozisyonlar slot işgal ediyor.
+    # Kârda olan pozisyonlara DOKUNULMAZ — trailing stop onları
+    # zaten koruyor, "patlama" potansiyeli kesilmez.
+    if hold_hours >= ZOMBIE_HOLD_HOURS and profit_pct <= 0 and score < CLOSE_SCORE_MIN:
+        return 50, [f"⏰ {hold_hours:.1f}s açık, kâr yok (%{profit_pct*100:.1f}) — "
+                     f"slot temizliği"], False, trailing_stop
 
     return score, reasons, False, trailing_stop
 
