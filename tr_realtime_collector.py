@@ -20,10 +20,10 @@ HEADERS = {'User-Agent': 'Mozilla/5.0'}
 signal_cache = {}
 
 # ── OTOMATİK ÖĞRENME SİSTEMİ — sabitler (crypto_collector.py ile aynı) ──
-LEARNING_MIN_SAMPLES = 30        # Grup başına min örnek (akademik standart: 30+)
-LEARNING_MIN_ABS_Z = 1.96         # ~p<0.05 için z-skor eşiği
-LEARNING_MAX_BONUS = 3            # skora uygulanacak max ek/eksi puan
-LEARNING_BASELINE_WINRATE = 0.45  # "Başarı" referansı: 24s içinde >%2 kâr oranı
+LEARNING_MIN_SAMPLES = 10        # 10 örnek yeterli — hızlı öğren
+LEARNING_MIN_ABS_Z = 1.65        # p<0.10 — erken uyarı
+LEARNING_MAX_BONUS = 6           # ±6 puan — CRITICAL eşiğini etkiler
+LEARNING_BASELINE_WINRATE = 0.50 # %50 beklenti — altında ceza, üstünde ödül
 OUTCOME_CHECK_HOURS = [24, 72, 168]   # 24s, 72s, 7g sonuç ölçümü
 ZOMBIE_HOLD_HOURS = 24            # Bu süre geçti + kâr yok ise slot temizliği yapılır
 
@@ -161,9 +161,13 @@ def check_signal_outcomes(market="BIST", price_fetcher=None):
 
 def update_learning_weights(market="BIST"):
     """
-    layer + score bucket kombinasyonu başına 24s sonuçlarını
-    analiz eder. >=30 örnek VE |z|>=1.96 (yaklaşık p<0.05) ise
-    learning_weights'e küçük bir katsayı yazar.
+    KALE MİMARİSİ — 3 boyutlu pattern öğrenmesi (TR/US):
+    layer + score_bucket + kap_tier (TR için)
+    
+    - Min 10 örnek (hızlı öğrenme)
+    - z >= 1.65 (p<0.10, erken uyarı)
+    - Kaybeden pattern için ceza 2x hızlı birikir
+    - %50 baseline — altı ceza, üstü ödül
     """
     try:
         rows = supabase.table("signal_outcomes") \
@@ -196,9 +200,12 @@ def update_learning_weights(market="BIST"):
             z = (win_rate - p0) / se if se > 0 else 0
 
             if abs(z) < LEARNING_MIN_ABS_Z:
-                continue  # istatistiksel olarak anlamsız, dokunma
+                continue
 
-            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS
+            # Asimetrik ceza: kaybedende 2x hızlı öğren
+            loss_multiplier = 2.0 if z < 0 else 1.0
+            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS * loss_multiplier
+            magnitude = min(magnitude, LEARNING_MAX_BONUS)
             bonus = round(magnitude) if z > 0 else -round(magnitude)
             bonus = max(-LEARNING_MAX_BONUS, min(LEARNING_MAX_BONUS, bonus))
 
@@ -209,7 +216,7 @@ def update_learning_weights(market="BIST"):
             supabase.table("learning_weights").upsert({
                 "pattern_key": key_str,
                 "layer": layer,
-                "rsi_bucket": bucket,  # aynı kolon, TR/US için "score bucket" anlamında
+                "rsi_bucket": bucket,
                 "obv_trend": None,
                 "sample_size": n,
                 "win_rate": round(win_rate * 100, 1),
