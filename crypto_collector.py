@@ -728,6 +728,10 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
 
     # Kataliz zorunlu — hiçbir şey yoksa eleme
     if vol_chg < 30 and (rsi is None or rsi > 55) and obv_trend != "up":
+        if ch24h >= 8:
+            print(f"  🐞 ELENDİ(score_coin kataliz yok): {symbol} | "
+                  f"rsi:{rsi} obv:{obv_trend} vol_chg:{vol_chg:.1f} "
+                  f"ch1h:{ch1h:.2f} ch24h:{ch24h:.2f}")
         return None
 
     # ── FİYAT HAREKET (İĞNE DELİĞİ — yukarı kırılma teyidi) ──
@@ -1822,6 +1826,11 @@ def scan_once(scan_count=0):
             if ch7d >= 300:
                 continue
             if vol_chg < 20 and ch1h < 1.5:
+                # DEBUG: 24s'te güçlü yükselişi olan ama bu filtrede elenen coinleri logla
+                if ch24h >= 8:
+                    print(f"  🐞 ELENDİ(ön-filtre vol_chg<20&ch1h<1.5): {symbol} | "
+                          f"ch1h:{ch1h:.2f} ch4h:{ch4h:.2f} ch24h:{ch24h:.2f} "
+                          f"vol_chg:{vol_chg:.1f} price:{price} src:{coin.get('sources')}")
                 continue
 
             tech = get_technical_data(symbol)
