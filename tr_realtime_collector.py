@@ -399,6 +399,243 @@ def get_price_data(symbol):
         return None
 
 
+# ============================================================
+# SÜPER MOTOR — 4 Katmanlı BIST Doğrulama Sistemi
+# 1. Finansal Tablolar (F/K, PD/DD, ROE) — isyatirim.com.tr
+# 2. ATR-14 (Gerçek Volatilite) — Yahoo Finance
+# 3. Endeks Üyeliği (BIST30/100) — isyatirim.com.tr
+# 4. Groq ile KAP İçerik Analizi — pozitif/negatif + güç skoru
+# ============================================================
+
+# Bellek önbelleği — aynı gün içinde tekrar çekme
+_fundamental_cache = {}
+_atr_cache = {}
+_index_cache = {}
+
+ISYATIRIM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'Accept-Language': 'tr-TR,tr;q=0.9',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Referer': 'https://www.isyatirim.com.tr/',
+}
+
+def get_fundamental_data(symbol):
+    """isyatirim.com.tr'den F/K, PD/DD, ROE çeker.
+    Günde bir kez çekip bist_fundamentals'a yazar, önbellekten okur."""
+    global _fundamental_cache
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cache_key = f"{symbol}_{today}"
+    if cache_key in _fundamental_cache:
+        return _fundamental_cache[cache_key]
+
+    # Önce DB'den oku
+    try:
+        r = supabase.table("bist_fundamentals").select("*").eq("symbol", symbol).execute()
+        if r.data:
+            row = r.data[0]
+            updated = row.get("updated_at", "")[:10]
+            if updated == today:
+                data = {
+                    "pe": row.get("pe_ratio"),
+                    "pb": row.get("pb_ratio"),
+                    "roe": row.get("roe"),
+                    "market_cap": row.get("market_cap"),
+                    "index_member": row.get("index_member", ""),
+                    "foreign_ownership": row.get("foreign_ownership"),
+                }
+                _fundamental_cache[cache_key] = data
+                return data
+    except Exception:
+        pass
+
+    # isyatirim.com.tr'den çek
+    try:
+        url = (
+            f"https://www.isyatirim.com.tr/_layouts/15/IsYatirim.Website/Common/"
+            f"Data.aspx/HisseIstatistik?hisse={symbol}"
+        )
+        r = requests.get(url, headers=ISYATIRIM_HEADERS, timeout=10)
+        if r.status_code != 200:
+            _fundamental_cache[cache_key] = None
+            return None
+
+        raw = r.json()
+        value = raw.get("value", [{}])
+        if not value:
+            _fundamental_cache[cache_key] = None
+            return None
+        d = value[0] if isinstance(value, list) else value
+
+        pe  = _safe_float(d.get("HSFIY_FIYAT_KAZANC"))
+        pb  = _safe_float(d.get("HSFIY_PD_DD"))
+        roe = _safe_float(d.get("HSFIY_ROE"))
+        mcap = _safe_int(d.get("HSFIY_PIYASA_DEGERI"))
+        idx  = d.get("ENDEKS_UYELIK", "") or ""
+        foreign = _safe_float(d.get("HSFIY_YABANCI_ORAN"))
+
+        data = {
+            "pe": pe, "pb": pb, "roe": roe,
+            "market_cap": mcap, "index_member": idx,
+            "foreign_ownership": foreign,
+        }
+
+        # DB'ye yaz
+        try:
+            supabase.table("bist_fundamentals").upsert({
+                "symbol": symbol,
+                "pe_ratio": pe, "pb_ratio": pb, "roe": roe,
+                "market_cap": mcap, "index_member": idx,
+                "foreign_ownership": foreign,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception:
+            pass
+
+        _fundamental_cache[cache_key] = data
+        return data
+
+    except Exception as e:
+        _fundamental_cache[cache_key] = None
+        return None
+
+
+def get_atr(symbol, period=14):
+    """Yahoo Finance'den son {period+1} günlük OHLC çekip ATR hesaplar.
+    Borsa kapalıyken bile çalışır — kapanış verileri kullanır."""
+    global _atr_cache
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cache_key = f"{symbol}_{today}"
+    if cache_key in _atr_cache:
+        return _atr_cache[cache_key]
+
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.IS"
+        params = {"interval": "1d", "range": "1mo"}
+        r = requests.get(url, headers=HEADERS, params=params, timeout=8)
+        data = r.json()["chart"]["result"][0]
+        quotes = data["indicators"]["quote"][0]
+        highs  = quotes.get("high", [])
+        lows   = quotes.get("low", [])
+        closes = quotes.get("close", [])
+
+        # Gerçek True Range hesabı
+        tr_list = []
+        for i in range(1, len(closes)):
+            h = highs[i]
+            l = lows[i]
+            pc = closes[i-1]
+            if None in (h, l, pc):
+                continue
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            tr_list.append(tr)
+
+        if len(tr_list) < period:
+            _atr_cache[cache_key] = None
+            return None
+
+        atr = sum(tr_list[-period:]) / period
+        _atr_cache[cache_key] = round(atr, 4)
+        return round(atr, 4)
+
+    except Exception:
+        _atr_cache[cache_key] = None
+        return None
+
+
+def get_index_membership(symbol):
+    """Hissenin BIST30/BIST100/BIST50 üyeliğini döndürür.
+    Önce bist_fundamentals DB'den okur, yoksa isyatirim'den çeker."""
+    global _index_cache
+    if symbol in _index_cache:
+        return _index_cache[symbol]
+
+    try:
+        r = supabase.table("bist_fundamentals").select("index_member").eq("symbol", symbol).execute()
+        if r.data and r.data[0].get("index_member"):
+            idx = r.data[0]["index_member"]
+            _index_cache[symbol] = idx
+            return idx
+    except Exception:
+        pass
+
+    # Temel veri çekerken endeks de gelecek
+    fund = get_fundamental_data(symbol)
+    if fund:
+        idx = fund.get("index_member", "")
+        _index_cache[symbol] = idx
+        return idx
+
+    _index_cache[symbol] = ""
+    return ""
+
+
+def analyze_kap_with_groq(kap_text):
+    """Groq ile KAP başlığını analiz eder.
+    Döner: {"sentiment": "pozitif"|"negatif"|"nötr", "power": 1-10, "reason": str}
+    Keyword matching yerine gerçek NLP — fark bu."""
+    if not kap_text or not GROQ_KEY:
+        return None
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Sen BIST hisse senetleri konusunda uzman bir finansal analistsin. "
+                            "KAP bildirim başlıklarını analiz edip sadece JSON döndürürsün. "
+                            "Başka hiçbir şey yazma."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Bu KAP bildirim başlığını analiz et ve sadece JSON döndür:\n\n"
+                            f"'{kap_text}'\n\n"
+                            f"Format: {{\"sentiment\": \"pozitif\" veya \"negatif\" veya \"nötr\", "
+                            f"\"power\": 1-10 arası tam sayı, "
+                            f"\"reason\": \"tek cümle Türkçe açıklama\"}}\n\n"
+                            f"power: 1=önemsiz, 5=orta, 10=piyasa sarsıcı"
+                        )
+                    }
+                ],
+                "max_tokens": 100,
+                "temperature": 0.1
+            },
+            timeout=8
+        )
+        content = r.json()["choices"][0]["message"]["content"].strip()
+        # JSON temizle
+        if "```" in content:
+            content = content.split("```")[1].replace("json", "").strip()
+        result = json.loads(content)
+        # Doğrulama
+        if result.get("sentiment") not in ("pozitif", "negatif", "nötr"):
+            return None
+        result["power"] = max(1, min(10, int(result.get("power", 5))))
+        return result
+    except Exception:
+        return None
+
+
+def _safe_float(val):
+    try:
+        return float(str(val).replace(",", ".")) if val not in (None, "", "null") else None
+    except Exception:
+        return None
+
+
+def _safe_int(val):
+    try:
+        return int(float(str(val).replace(",", "."))) if val not in (None, "", "null") else None
+    except Exception:
+        return None
+
+
 def get_kap_disclosures(symbol):
     try:
         # publish_date kolonu TEXT formatında "DD.MM.YYYY HH:MM:SS" olarak
@@ -489,24 +726,57 @@ def get_last_signal_time(symbol):
         return 0
 
 
-def calculate_signal_score(price_change, volume_ratio, kap):
+def calculate_signal_score(price_change, volume_ratio, kap, symbol=None):
+    """
+    SÜPER MOTOR — 4 Katmanlı BIST Sinyal Skoru
+    ─────────────────────────────────────────────
+    KATMAN 1 — KAP (Groq NLP ile): max +7 puan
+    KATMAN 2 — Hacim/Fiyat: max +9 puan
+    KATMAN 3 — Temel Analiz (F/K, PD/DD, ROE): max +5 puan
+    KATMAN 4 — Endeks + ATR kalitesi: max +3 puan
+    ─────────────────────────────────────────────
+    CRITICAL = 10+, HIGH = 7+, MEDIUM = 4+
+    """
     score = 0
     reasons = []
 
+    # ── KATMAN 1: KAP ───────────────────────────────────────────
+    # Groq ile içerik analizi (keyword yerine gerçek NLP)
+    kap_ai = None
     if kap:
-        score += kap["score"]
-        tier_label = "🔴 Kritik" if kap["tier"] == 1 else "🟡 Orta" if kap["tier"] == 2 else "🟢 Bilgi"
-        reasons.append(f"KAP [{tier_label}]: {kap['text'][:60]}")
+        kap_ai = analyze_kap_with_groq(kap["text"])
+        if kap_ai:
+            sentiment = kap_ai["sentiment"]
+            power = kap_ai["power"]
+            if sentiment == "pozitif":
+                kap_score = min(7, 2 + round(power * 0.5))  # power 1-10 → skor 2-7
+                score += kap_score
+                reasons.append(f"📰 KAP [{power}/10]: {kap_ai['reason'][:60]}")
+            elif sentiment == "negatif":
+                # Negatif KAP haberi varken fiyat yükseliyorsa manipülasyon riski
+                if price_change > 3:
+                    return "NORMAL", [], 0, None
+                reasons.append(f"⚠️ KAP negatif [{power}/10] — elendi")
+                return "NORMAL", [], 0, None
+            else:  # nötr
+                score += 1
+                reasons.append(f"📋 KAP nötr: {kap['text'][:50]}")
+        else:
+            # Groq başarısız — eski keyword sisteme düş
+            score += kap["score"]
+            tier_label = "🔴 Kritik" if kap["tier"] == 1 else "🟡 Orta" if kap["tier"] == 2 else "🟢 Bilgi"
+            reasons.append(f"KAP [{tier_label}]: {kap['text'][:60]}")
 
+    # ── KATMAN 2: HACİM / FİYAT ─────────────────────────────────
     if volume_ratio >= 10:
         score += 5
-        reasons.append(f"Hacim {volume_ratio:.1f}x — olağandışı kurumsal ilgi")
+        reasons.append(f"🔥 Hacim {volume_ratio:.1f}x — olağandışı kurumsal ilgi")
     elif volume_ratio >= 5:
         score += 4
-        reasons.append(f"Hacim {volume_ratio:.1f}x — güçlü kurumsal ilgi")
+        reasons.append(f"📈 Hacim {volume_ratio:.1f}x — güçlü kurumsal ilgi")
     elif volume_ratio >= 3:
         score += 3
-        reasons.append(f"Hacim {volume_ratio:.1f}x — kurumsal ilgi")
+        reasons.append(f"📊 Hacim {volume_ratio:.1f}x — kurumsal ilgi")
     elif volume_ratio >= 2:
         score += 2
         reasons.append(f"Hacim {volume_ratio:.1f}x artışı")
@@ -527,20 +797,88 @@ def calculate_signal_score(price_change, volume_ratio, kap):
         score += 1
         reasons.append(f"%{price_change:.1f} hafif yükseliş")
     elif price_change < -3:
-        if not kap or kap["tier"] > 2:
+        if not kap or (kap_ai and kap_ai["sentiment"] != "pozitif"):
             return "NORMAL", [], 0, None
-        reasons.append(f"%{price_change:.1f} düşüş — KAP'a rağmen satış")
 
+    # KAP yoksa hacim+fiyat her ikisi de güçlü olmalı
     if not kap:
         if volume_ratio < 3 or price_change < 3:
             return "NORMAL", [], 0, None
 
-    # Layer ayrımı: KAP kaynaklı mı hacim/fiyat kaynaklı mı
-    layer = "KAP" if kap else "HACIM"
+    # ── KATMAN 3: TEMEL ANALİZ ───────────────────────────────────
+    fund = get_fundamental_data(symbol) if symbol else None
+    if fund:
+        pe  = fund.get("pe")
+        pb  = fund.get("pb")
+        roe = fund.get("roe")
+        foreign = fund.get("foreign_ownership")
 
-    # Öğrenme bonusu — geçmiş 24s sonuçlarına göre ±LEARNING_MAX_BONUS.
-    # Bucket sadece (layer, ham_skor) ile belirlenir — conviction henüz
-    # hesaplanmadığı için referans olamaz (dönüşümlü bağımlılık olur).
+        # F/K değerlendirmesi — sektöre göre değişir ama BIST için
+        # <10 ucuz, 10-20 makul, >30 pahalı genel kabul
+        if pe and 0 < pe < 10:
+            score += 3
+            reasons.append(f"💎 F/K {pe:.1f} — çok ucuz (kurumsal hedef)")
+        elif pe and 10 <= pe < 20:
+            score += 2
+            reasons.append(f"✅ F/K {pe:.1f} — makul değerleme")
+        elif pe and pe > 30:
+            score -= 1
+            reasons.append(f"⚠️ F/K {pe:.1f} — pahalı")
+
+        # PD/DD — 1'in altı defter değerinin altında fiyatlanma
+        if pb and 0 < pb < 1:
+            score += 2
+            reasons.append(f"📉 PD/DD {pb:.2f} — defter altı fiyat")
+        elif pb and 1 <= pb < 2:
+            score += 1
+            reasons.append(f"PD/DD {pb:.2f} — makul")
+
+        # ROE — sermaye verimliliği
+        if roe and roe > 20:
+            score += 2
+            reasons.append(f"💪 ROE %{roe:.1f} — yüksek karlılık")
+        elif roe and roe > 10:
+            score += 1
+            reasons.append(f"ROE %{roe:.1f}")
+
+        # Yabancı sahiplik artışı (eğer varsa)
+        if foreign and foreign > 30:
+            score += 1
+            reasons.append(f"🌍 Yabancı sahiplik %{foreign:.1f}")
+
+    # ── KATMAN 4: ENDEKs ÜYELİĞİ + ATR KALİTESİ ────────────────
+    if symbol:
+        idx = get_index_membership(symbol)
+        if idx:
+            if "XU030" in idx or "BIST30" in idx.upper():
+                score += 3
+                reasons.append("🏆 BIST30 — likiditesi garantili, kurumsal takipli")
+            elif "XU100" in idx or "BIST100" in idx.upper():
+                score += 2
+                reasons.append("📌 BIST100 üyesi — kurumsal ilgi")
+            elif "XU050" in idx or "BIST50" in idx.upper():
+                score += 1
+                reasons.append("📌 BIST50 üyesi")
+            else:
+                # Endeks dışı — manipülasyon riski, eşiği yükselt
+                if not kap or score < 8:
+                    if score < 6:
+                        return "NORMAL", [], 0, None
+
+        # ATR — stop/hedef kalitesi için DB'ye yaz (skor etkilemez ama izlenir)
+        atr = get_atr(symbol)
+        if atr:
+            try:
+                supabase.table("bist_fundamentals").upsert({
+                    "symbol": symbol,
+                    "atr_14": atr,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }).execute()
+            except Exception:
+                pass
+
+    # ── LAYER + ÖĞRENME BONUSU ───────────────────────────────────
+    layer = "KAP" if kap else "HACIM"
     bonus = get_learning_bonus(layer, score, market="BIST")
     if bonus != 0:
         score += bonus
@@ -639,12 +977,23 @@ def get_bist_hist_rate(user_id):
     return (wins / len(r.data)) * 100
 
 
-def calc_bist_levels(price, price_change):
+def calc_bist_levels(price, price_change, symbol=None):
     """BIST günlük devre kesici %10 — stop max %7, hedef max %9.
-    Volatilite bazlı hesapla ama BIST limitlerini asla aşma."""
+    Gerçek ATR-14 varsa onu kullan, yoksa volatilite bazlı tahmin."""
+    # Gerçek ATR öncelikli
+    if symbol:
+        atr = get_atr(symbol)
+        if atr and price > 0:
+            atr_pct = (atr / price) * 100
+            stop_pct  = min(atr_pct * 1.5, 7.0)
+            target_pct = min(atr_pct * 3.0, 9.0)
+            stop   = price * (1 - stop_pct / 100)
+            target = price * (1 + target_pct / 100)
+            return round(stop, 2), round(target, 2)
+
     daily_vol = max(abs(price_change), 1.5)
-    stop_pct  = min(daily_vol * 1.5, 7.0)   # max %7 aşağı
-    target_pct = min(daily_vol * 3.0, 9.0)  # max %9 yukarı (devre kesici altı)
+    stop_pct  = min(daily_vol * 1.5, 7.0)
+    target_pct = min(daily_vol * 3.0, 9.0)
     stop   = price * (1 - stop_pct / 100)
     target = price * (1 + target_pct / 100)
     return round(stop, 2), round(target, 2)
@@ -702,7 +1051,7 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction=None,
     try:
         open_trades = get_open_bist_trades(user_id)
         open_count = len(open_trades)
-        stop, target = calc_bist_levels(price, price_change)
+        stop, target = calc_bist_levels(price, price_change, symbol=symbol)
         entry_reason = " | ".join((reasons or [])[:3]) if reasons else (conviction or "")
         is_exceptional = False
 
@@ -919,10 +1268,6 @@ def scan_once(symbols, avg_volumes, send_push=True, is_night=False):
                 continue
 
             if is_night:
-                # GECE MODU: borsa kapalı → price≈open, volume_ratio≈0
-                # olduğundan hacim/fiyat eşiği anlamsız. Adaylık sadece
-                # KAP varlığına bakılarak belirlenir — sıkı skor denetimi
-                # (calculate_signal_score) DEĞİŞMEDEN aşağıda uygulanır.
                 kap = get_kap_disclosures(symbol)
                 if not kap:
                     continue
@@ -953,7 +1298,7 @@ def scan_once(symbols, avg_volumes, send_push=True, is_night=False):
         try:
             symbol = c["symbol"]
             kap = c["kap_prefetched"] if c["kap_prefetched"] is not None else get_kap_disclosures(symbol)
-            conviction, reasons, score, layer = calculate_signal_score(c["price_change"], c["volume_ratio"], kap)
+            conviction, reasons, score, layer = calculate_signal_score(c["price_change"], c["volume_ratio"], kap, symbol=symbol)
 
             if conviction == "NORMAL":
                 continue
