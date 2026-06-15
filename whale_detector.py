@@ -31,10 +31,10 @@ analyst_cache = {}
 premarket_signal_cache = {}
 
 # ── OTOMATİK ÖĞRENME SİSTEMİ — sabitler (crypto_collector.py ile aynı) ──
-LEARNING_MIN_SAMPLES = 30        # Grup başına min örnek (akademik standart: 30+)
-LEARNING_MIN_ABS_Z = 1.96         # ~p<0.05 için z-skor eşiği
-LEARNING_MAX_BONUS = 3            # skora uygulanacak max ek/eksi puan
-LEARNING_BASELINE_WINRATE = 0.45  # "Başarı" referansı: 24s içinde >%2 kâr oranı
+LEARNING_MIN_SAMPLES = 10        # 10 örnek yeterli — hızlı öğren
+LEARNING_MIN_ABS_Z = 1.65        # p<0.10 — erken uyarı
+LEARNING_MAX_BONUS = 6           # ±6 puan — CRITICAL eşiğini etkiler
+LEARNING_BASELINE_WINRATE = 0.50 # %50 beklenti — altında ceza, üstünde ödül
 OUTCOME_CHECK_HOURS = [24, 72, 168]   # 24s, 72s, 7g sonuç ölçümü
 
 try:
@@ -185,9 +185,11 @@ def check_signal_outcomes(market="US", price_fetcher=None):
 
 def update_learning_weights(market="US"):
     """
-    layer + score bucket kombinasyonu başına 24s sonuçlarını
-    analiz eder. >=30 örnek VE |z|>=1.96 (yaklaşık p<0.05) ise
-    learning_weights'e küçük bir katsayı yazar.
+    KALE MİMARİSİ — US learning sistemi
+    layer + score_bucket kombinasyonu
+    - Min 10 örnek, z >= 1.65
+    - Kaybeden pattern 2x hızlı cezalandırılır
+    - %50 baseline
     """
     try:
         rows = supabase.table("signal_outcomes") \
@@ -222,7 +224,10 @@ def update_learning_weights(market="US"):
             if abs(z) < LEARNING_MIN_ABS_Z:
                 continue
 
-            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS
+            # Asimetrik: kaybedende 2x hızlı öğren
+            loss_multiplier = 2.0 if z < 0 else 1.0
+            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS * loss_multiplier
+            magnitude = min(magnitude, LEARNING_MAX_BONUS)
             bonus = round(magnitude) if z > 0 else -round(magnitude)
             bonus = max(-LEARNING_MAX_BONUS, min(LEARNING_MAX_BONUS, bonus))
 
