@@ -812,12 +812,15 @@ def get_us_hist_rate(user_id):
 
 
 def calc_us_levels(price, trend_data):
-    """ATR yerine — 5 günlük değişimden günlük volatilite tahmini.
-    Stop = volatilite x1.5, Hedef = volatilite x8 (kripto V12 oranı)"""
+    """$1-20 küçük cap US hisseleri için stop/hedef.
+    Devre kesici yok — earnings sonrası %20-30 hareketler olağan.
+    Stop: volatilite x1.5 (max %8), Hedef: volatilite x5 (max %20)"""
     daily_vol = abs(trend_data.get("5d_change", 0)) / 5 if trend_data else 2.0
     daily_vol = max(daily_vol, 1.5)
-    stop = price * (1 - daily_vol * 1.5 / 100)
-    target = price * (1 + daily_vol * 8 / 100)
+    stop_pct   = min(daily_vol * 1.5, 8.0)   # max %8 aşağı
+    target_pct = min(daily_vol * 5.0, 20.0)  # max %20 yukarı
+    stop   = price * (1 - stop_pct / 100)
+    target = price * (1 + target_pct / 100)
     return round(stop, 2), round(target, 2)
 
 
@@ -828,25 +831,48 @@ def bot_should_buy(price_change, volume_ratio, conviction):
 
 def us_bot_should_sell(trade, current_price):
     buy_price = trade["buy_price"]
-    stop = trade.get("stop_price") or buy_price * 0.97
-    target = trade.get("target_price") or buy_price * 1.12
     peak = max(trade.get("peak_price") or buy_price, current_price)
     change = ((current_price - buy_price) / buy_price) * 100
+    peak_change = ((peak - buy_price) / buy_price) * 100
 
-    if current_price <= stop:
-        print(f"  🛑 STOP: %{change:.1f}")
-        return True, "stop_loss", peak
+    # ── AŞAMA 1: SABİT STOP (%8) — pozisyon henüz kâra geçmedi ──
+    # Peak henüz buy_price seviyesinde — sabit stop korur
+    if peak_change < 2.0:
+        stop = trade.get("stop_price") or buy_price * 0.92
+        if current_price <= stop:
+            print(f"  🛑 SABİT STOP (%8): %{change:.1f}")
+            return True, "stop_loss", peak
+        return False, "", peak
 
-    if current_price >= target:
-        print(f"  🎯 HEDEF: %{change:.1f}")
-        return True, "target_hit", peak
+    # ── AŞAMA 2: BREAKEVEN — peak %2+ üzerine çıktı ──
+    # Stop artık alış fiyatına çekildi (zarar yok garantisi)
+    if peak_change < 5.0:
+        if current_price <= buy_price:
+            print(f"  ⚖️ BREAKEVEN STOP: tepe %{peak_change:.1f}, şimdi %{change:.1f}")
+            return True, "breakeven", peak
+        return False, "", peak
 
-    # Reversal — kâr varken tepeden geri çekiliş
-    if peak > buy_price:
-        drawdown = (peak - current_price) / peak * 100
-        if change >= 1.5 and drawdown >= 2.0:
-            print(f"  ⚠️ REVERSAL: tepe ${peak:.2f}'den ${current_price:.2f}'ye, kâr hâlâ %{change:.1f}")
-            return True, "reversal", peak
+    # ── AŞAMA 3: TRAİLİNG STOP — peak %5+ üzerine çıktı ──
+    # Tepeden %4 geri çekilince sat — fiyat ne kadar yükselirse
+    # stop da o kadar yukarı çekilir (kripto ile aynı mekanizma)
+    trailing_stop = peak * 0.96  # tepeden %4 aşağı
+    if current_price <= trailing_stop:
+        print(f"  🔄 TRAİLİNG STOP (tepeden %4): tepe ${peak:.2f} → şimdi ${current_price:.2f} (%{change:.1f})")
+        return True, "trailing_stop", peak
+
+    # ── ZOMBİ TEMİZLİĞİ — 48+ saat açık, kâr yok ──
+    try:
+        buy_date = trade.get("buy_date")
+        if buy_date:
+            buy_dt = datetime.fromisoformat(str(buy_date).replace("Z", "+00:00"))
+            if buy_dt.tzinfo is None:
+                buy_dt = buy_dt.replace(tzinfo=timezone.utc)
+            hold_hours = (datetime.now(timezone.utc) - buy_dt).total_seconds() / 3600
+            if hold_hours >= 48 and current_price <= buy_price:
+                print(f"  ⏰ ZOMBİ: {hold_hours:.1f}s açık, kâr yok (%{change:.1f})")
+                return True, "zombie_cleanup", peak
+    except Exception:
+        pass
 
     return False, "", peak
 
