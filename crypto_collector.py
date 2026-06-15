@@ -653,6 +653,22 @@ def get_coin_age_days(symbol, date_added=None):
 def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
                vol_chg, mcap, cmc_rank, tech, fg, orderbook=None,
                suregen_candidate=False):
+    # ============================================================
+    # 📌 TODO (SUREGEN İZLEME — 15 Haz 2026'da eklendi):
+    # "SUREGEN" layer'ı: 24s'te %8+ yürümüş ama anlık duraklamış
+    # coinleri artık eleme yerine score_coin'e gönderiyor (RSI/OBV
+    # kararı veriyor). Amaç: erken-orta vadeli istikrarlı momentum
+    # coinlerini de yakalamak.
+    #
+    # ~2-3 HAFTA SONRA (veya learning_weights'te
+    # "SUREGEN|...|..." satırları n>=30 olduğunda) KONTROL ET:
+    #   SELECT * FROM learning_weights WHERE layer = 'SUREGEN';
+    # - win_rate nasıl? Diğer layer'lardan (BIRIKIM/MOMENTUM) iyi/kötü mü?
+    # - MEDIUM eşiği (score>=9) SUREGEN için çok mu sıkı? (PIEVERSE
+    #   gibi score=8 ile elenenler çoğunluksa, eşiği 8'e düşürmeyi
+    #   düşün — ama önce gerçek win_rate verisine bak.)
+    # - Debug logları (🔬 SUREGEN ADAY/SONUÇ) artık gerekirse kaldırılabilir.
+    # ============================================================
     score = 0
     reasons = []
     layer = "MOMENTUM"
