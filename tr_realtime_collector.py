@@ -640,11 +640,13 @@ def get_bist_hist_rate(user_id):
 
 
 def calc_bist_levels(price, price_change):
-    """Günlük hareketten volatilite tahmini.
-    Stop = volatilite x1.5, Hedef = volatilite x8 (V12 oranı)"""
+    """BIST günlük devre kesici %10 — stop max %7, hedef max %9.
+    Volatilite bazlı hesapla ama BIST limitlerini asla aşma."""
     daily_vol = max(abs(price_change), 1.5)
-    stop = price * (1 - daily_vol * 1.5 / 100)
-    target = price * (1 + daily_vol * 8 / 100)
+    stop_pct  = min(daily_vol * 1.5, 7.0)   # max %7 aşağı
+    target_pct = min(daily_vol * 3.0, 9.0)  # max %9 yukarı (devre kesici altı)
+    stop   = price * (1 - stop_pct / 100)
+    target = price * (1 + target_pct / 100)
     return round(stop, 2), round(target, 2)
 
 
@@ -655,8 +657,8 @@ def bot_should_buy(price_change, volume_ratio, conviction):
 
 def bist_bot_should_sell(trade, current_price):
     buy_price = trade["buy_price"]
-    stop = trade.get("stop_price") or buy_price * 0.925
-    target = trade.get("target_price") or buy_price * 1.12
+    stop = trade.get("stop_price") or buy_price * 0.930
+    target = trade.get("target_price") or buy_price * 1.09
     peak = max(trade.get("peak_price") or buy_price, current_price)
     change = ((current_price - buy_price) / buy_price) * 100
 
@@ -1104,8 +1106,11 @@ def send_morning_signals():
             layer = "KAP" if signal_type == "kap_momentum" else "HACIM"
             price_change_morning = ((morning_price - night_price) / night_price * 100) if night_price else 0
 
-            bot_process_morning_signal(symbol, morning_price, price_change_morning,
-                                        conviction, signal_id, score, reasons, layer)
+            if conviction == "CRITICAL":
+                bot_process_morning_signal(symbol, morning_price, price_change_morning,
+                                            conviction, signal_id, score, reasons, layer)
+            else:
+                print(f"  u23edufe0f {symbol} {conviction} u2014 sadece push, bot alu0131mu0131 yok")
 
             time.sleep(0.5)
 
