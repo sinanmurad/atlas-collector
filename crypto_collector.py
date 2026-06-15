@@ -124,10 +124,10 @@ WATCH_MOVE_VOL_PCT = 200        # Hacim değişimi bu kadar farklılaştıysa ha
 # 90 gün veri toplar, yeterli örnek + istatistiksel anlamlılık
 # varsa score_coin'e küçük bir katsayı olarak otomatik uygulanır.
 # Manuel müdahale gerektirmez.
-LEARNING_MIN_SAMPLES = 30        # Grup başına min örnek (akademik standart: 30+)
-LEARNING_MIN_ABS_Z = 1.96         # ~p<0.05 için z-skor eşiği
-LEARNING_MAX_BONUS = 6            # score_coin'e uygulanacak max ek/eksi puan
-LEARNING_BASELINE_WINRATE = 0.45  # "Başarı" referansı: 24s içinde >%2 kâr oranı
+LEARNING_MIN_SAMPLES = 10        # 10 örnek yeterli — hızlı öğren, yavaş unutma
+LEARNING_MIN_ABS_Z = 1.65        # p<0.10 — daha duyarlı, erken uyarı
+LEARNING_MAX_BONUS = 6           # ±6 puan — CRITICAL eşiğini (13) etkileyecek kadar güçlü
+LEARNING_BASELINE_WINRATE = 0.50 # Beklenti: %50 win rate — altında ceza, üstünde ödül
 OUTCOME_CHECK_HOURS = [24, 72, 168]   # 24s, 72s, 7g sonuç ölçümü
 
 
@@ -859,7 +859,7 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
 
     # ── OTOMATİK ÖĞRENME KATSAYISI ───────────────────────────
     # 90 gün veri biriktikçe otomatik devreye girer, manuel müdahale yok.
-    learning_bonus = get_learning_bonus(layer, rsi, obv_trend)
+    learning_bonus = get_learning_bonus(layer, rsi, obv_trend, score=score)
     if learning_bonus != 0:
         score += learning_bonus
         reasons.append(f"🧠 Öğrenme katsayısı: {learning_bonus:+d}")
@@ -998,13 +998,20 @@ def check_signal_outcomes():
 
 def update_learning_weights():
     """
-    layer + RSI bucket + OBV kombinasyonu başına 24s sonuçlarını analiz eder.
-    >=30 örnek VE |z|>=1.96 (yaklaşık p<0.05) ise learning_weights'e
-    küçük bir katsayı yazar. Aksi halde dokunmaz (veri yetersiz).
+    KALE MİMARİSİ — 4 boyutlu pattern öğrenmesi:
+    layer + RSI bucket + OBV + skor bandı
+    
+    Kurallar:
+    - Min 10 örnek (hızlı öğrenme)
+    - z >= 1.65 (p<0.10, erken uyarı)
+    - Kaybeden pattern için ceza 2x hızlı birikir
+    - Kazanan pattern için ödül 1x (asimetrik — kayıptan kaç)
+    - CRITICAL eşiği artık 13 (eski 10) — learning bunu zorlamaz
+      ama bonus sistemi aracılığıyla etkiler
     """
     try:
         rows = supabase.table("signal_outcomes") \
-            .select("layer, entry_rsi, entry_obv, pct_24h") \
+            .select("layer, entry_rsi, entry_obv, entry_score, pct_24h") \
             .eq("checked_24h", True) \
             .not_.is_("pct_24h", "null") \
             .execute()
@@ -1012,14 +1019,31 @@ def update_learning_weights():
         if not rows.data or len(rows.data) < LEARNING_MIN_SAMPLES:
             return
 
+        def score_band(s):
+            """Skor aralığı — ne kadar güçlü sinyal olduğunu ayırt eder."""
+            try:
+                s = int(float(s)) if s is not None else 0
+            except Exception:
+                s = 0
+            if s >= 16: return "ULTRA"
+            if s >= 13: return "HIGH"
+            if s >= 10: return "MID"
+            return "LOW"
+
         groups = defaultdict(list)
         for r in rows.data:
             bucket = rsi_bucket(r.get("entry_rsi"))
-            key = (r.get("layer") or "?", bucket, r.get("entry_obv") or "?")
+            band = score_band(r.get("entry_score"))
+            key = (
+                r.get("layer") or "?",
+                bucket,
+                r.get("entry_obv") or "?",
+                band,
+            )
             groups[key].append(r["pct_24h"])
 
         updated = 0
-        for (layer, bucket, obv), pcts in groups.items():
+        for (layer, bucket, obv, band), pcts in groups.items():
             n = len(pcts)
             if n < LEARNING_MIN_SAMPLES:
                 continue
@@ -1027,23 +1051,25 @@ def update_learning_weights():
             wins = sum(1 for p in pcts if p > 2)
             win_rate = wins / n
 
-            # z-test: gözlenen oran vs baseline (0.45)
             p0 = LEARNING_BASELINE_WINRATE
             se = math.sqrt(p0 * (1 - p0) / n)
             z = (win_rate - p0) / se if se > 0 else 0
 
             if abs(z) < LEARNING_MIN_ABS_Z:
-                continue  # istatistiksel olarak anlamsız, dokunma
+                continue
 
-            # z=1.96 → bonus=1, z=3+ → bonus=LEARNING_MAX_BONUS, doğrusal ölçek
-            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS
+            # Asimetrik ceza: kaybeden pattern için 2x hızlı öğren
+            # Kazananda 1x, kaybedende 2x — "önce zarar durdur"
+            loss_multiplier = 2.0 if z < 0 else 1.0
+            magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS * loss_multiplier
+            magnitude = min(magnitude, LEARNING_MAX_BONUS)  # cap
             bonus = round(magnitude) if z > 0 else -round(magnitude)
             bonus = max(-LEARNING_MAX_BONUS, min(LEARNING_MAX_BONUS, bonus))
 
             if bonus == 0:
                 continue
 
-            key_str = f"{layer}|{bucket}|{obv}"
+            key_str = f"{layer}|{bucket}|{obv}|{band}"
             supabase.table("learning_weights").upsert({
                 "pattern_key": key_str,
                 "layer": layer,
@@ -1053,16 +1079,13 @@ def update_learning_weights():
                 "win_rate": round(win_rate * 100, 1),
                 "z_score": round(z, 2),
                 "bonus": bonus,
+                "market": "CRYPTO",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }, on_conflict="pattern_key").execute()
 
             updated += 1
             print(f"  🧠 ÖĞRENME: {key_str} → bonus:{bonus:+d} "
                   f"(n={n}, win_rate=%{win_rate*100:.1f}, z={z:.2f})")
-
-            log_activity("OGRENME", detail=f"{key_str} → bonus:{bonus:+d} "
-                          f"(n={n}, win_rate=%{win_rate*100:.1f}, z={z:.2f})",
-                          layer=layer)
 
         if updated:
             print(f"  🧠 {updated} patern güncellendi")
@@ -1074,11 +1097,12 @@ def update_learning_weights():
 _learning_cache = {"data": {}, "ts": 0}
 
 
-def get_learning_bonus(layer, rsi, obv_trend):
+def get_learning_bonus(layer, rsi, obv_trend, score=None):
     """
-    score_coin tarafından çağrılır. learning_weights'ten önceden
-    hesaplanmış katsayıyı okur. 10 dakika cache'lenir — her coin
-    için ayrı sorgu atmaz.
+    4 boyutlu pattern key ile learning_weights'ten bonus okur.
+    Önce tam eşleşme (layer|bucket|obv|band) dener,
+    yoksa 3 boyutlu (layer|bucket|obv) fallback yapar.
+    10 dakika cache'lenir.
     """
     global _learning_cache
     now = time.time()
@@ -1091,8 +1115,28 @@ def get_learning_bonus(layer, rsi, obv_trend):
             pass
 
     bucket = rsi_bucket(rsi)
-    key = f"{layer}|{bucket}|{obv_trend}"
-    return _learning_cache["data"].get(key, 0)
+
+    # Skor bandı
+    def _band(s):
+        try:
+            s = int(float(s)) if s is not None else 0
+        except Exception:
+            s = 0
+        if s >= 16: return "ULTRA"
+        if s >= 13: return "HIGH"
+        if s >= 10: return "MID"
+        return "LOW"
+
+    band = _band(score)
+
+    # Önce 4 boyutlu tam eşleşme
+    key4 = f"{layer}|{bucket}|{obv_trend}|{band}"
+    if key4 in _learning_cache["data"]:
+        return _learning_cache["data"][key4]
+
+    # Fallback: 3 boyutlu (eski format geriye dönük uyumluluk)
+    key3 = f"{layer}|{bucket}|{obv_trend}"
+    return _learning_cache["data"].get(key3, 0)
 
 
 # Kapasite: max 39 (3x13). Doluyken yeni aday, en düşük skorlu
