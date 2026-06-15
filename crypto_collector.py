@@ -678,6 +678,21 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     obv_div = tech.get("obv_divergence") if tech else False
     vol_surge = tech.get("vol_surge_4h", 1) if tech else 1
 
+    # ── DOĞRULAMA MODU: çapraz-kaynak fiyat tutarlılığı ──────────
+    # `price` (CMC/ticker kaynaklı) ile `tech["price"]` (klines'tan
+    # gelen gerçek son kapanış — alımın gerçekleşeceği kaynak) arasında
+    # >%50 fark varsa, bu coin için elimizdeki veri güvenilmez —
+    # muhtemelen sembol çakışması (aynı ticker, farklı proje) veya
+    # stale veri. Sinyal/alım üretme, sessizce ele.
+    tech_price = tech.get("price") if tech else None
+    if tech_price and price > 0:
+        price_ratio = max(price, tech_price) / min(price, tech_price)
+        if price_ratio > 1.5:
+            print(f"  🚫 FİYAT TUTARSIZLIĞI: {symbol} elendi "
+                  f"(ticker:${price} vs klines:${tech_price}, "
+                  f"oran:{price_ratio:.1f}x)")
+            return None
+
     # ── RSI ──────────────────────────────────────────────────
     if rsi is not None:
         if rsi < 25:
@@ -1324,6 +1339,21 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
         if float(t.get("quoteVolume", 0) or 0) < 100_000:
             continue
         if base in merged:
+            # SEMBOL ÇAKIŞMASI KORUMASI: CMC'de bu sembolle eşleşen coin
+            # zaten varsa, MEXC'deki "aynı sembollü" parite GERÇEKTE
+            # tamamen farklı bir proje olabilir (kısa ticker'lar birden
+            # fazla coin tarafından paylaşılır — örn. CMC'deki BTX/BeatSwap
+            # $0.016 iken MEXC'deki BTXUSDT $0.19 olabilir, alakasız
+            # coinler). Fiyatlar arasında ciddi (>%50) sapma varsa bu
+            # coin GÜVENİLMEZ — sources MISMATCH ile işaretlenir ve
+            # score_coin'de sert filtre uygular.
+            cmc_price = merged[base]["price"]
+            if cmc_price > 0:
+                ratio = max(price, cmc_price) / min(price, cmc_price)
+                if ratio > 1.5:
+                    merged[base]["sources"].append("MEXC_MISMATCH")
+                    merged[base]["mismatch_ratio"] = round(ratio, 1)
+                    continue
             merged[base]["sources"].append("MEXC")
         else:
             merged[base] = {
@@ -1347,6 +1377,13 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
         if float(t.get("quote_volume", 0) or 0) < 100_000:
             continue
         if base in merged:
+            cmc_price = merged[base]["price"]
+            if cmc_price > 0:
+                ratio = max(price, cmc_price) / min(price, cmc_price)
+                if ratio > 1.5:
+                    merged[base]["sources"].append("GATEIO_MISMATCH")
+                    merged[base]["mismatch_ratio"] = round(ratio, 1)
+                    continue
             merged[base]["sources"].append("Gate.io")
         else:
             merged[base] = {
@@ -1577,6 +1614,13 @@ def _execute_buy(user_id, symbol, price, signal_id, conviction, layer,
             .eq("status", "open").execute()
         open_list = open_trades.data or []
         open_count = len(open_list)
+
+        # Aynı coin'de zaten açık pozisyon varsa tekrar alım yapma —
+        # aynı sinyalin art arda/çift tetiklenmesiyle aynı coin için
+        # ikinci bir pozisyon açılmasını engeller.
+        if any(t.get("symbol") == symbol for t in open_list):
+            print(f"  ⏭️ {symbol} zaten açık pozisyonda — tekrar alım atlandı")
+            return
 
         # Kapasite kontrolü
         max_normal = MAX_OPEN_PRO if is_pro else MAX_OPEN_FREE
@@ -1856,6 +1900,18 @@ def scan_once(scan_count=0):
                 continue
             if ch7d >= 300:
                 continue
+
+            # SEMBOL ÇAKIŞMASI SIKI MODU: CMC ile MEXC/Gate.io fiyatları
+            # arasında >%50 sapma tespit edilmişse (merge_exchange_data),
+            # bu sembol farklı projelere ait birden fazla coin'i
+            # temsil ediyor olabilir — güvenilmez, tamamen ele.
+            sources = coin.get("sources", [])
+            if any(s.endswith("_MISMATCH") for s in sources):
+                print(f"  🚫 SEMBOL ÇAKIŞMASI: {symbol} elendi "
+                      f"(fiyat oranı {coin.get('mismatch_ratio', '?')}x — "
+                      f"CMC ile borsa fiyatı uyuşmuyor, farklı coin olabilir)")
+                continue
+
             # SÜREGEN MOMENTUM İSTİSNASI:
             # Coin şu an duraklamış (ch1h<1.5) ve hacim patlaması yok (vol_chg<20)
             # ama son 24s'te zaten %8+ yürümüş — bu "tükenmiş" olabilir AMA
