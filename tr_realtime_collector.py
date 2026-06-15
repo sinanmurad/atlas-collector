@@ -867,13 +867,19 @@ def scan_once(symbols, avg_volumes, send_push=True):
     candidates = []
     now = time.time()
 
+    # DEBUG: her eleme nedeninin sayısı
+    dbg = {"cache": 0, "no_data": 0, "no_price": 0, "no_avgvol": 0,
+           "ratio_extreme": 0, "below_threshold": 0, "exception": 0, "ok": 0}
+
     for symbol in symbols:
         try:
             if symbol in signal_cache and now - signal_cache[symbol] < 3600:
+                dbg["cache"] += 1
                 continue
 
             data = get_price_data(symbol)
             if not data:
+                dbg["no_data"] += 1
                 continue
 
             price = data["price"]
@@ -882,21 +888,26 @@ def scan_once(symbols, avg_volumes, send_push=True):
             volume = data["volume"]
 
             if not price or price == 0 or not open_price or open_price == 0:
+                dbg["no_price"] += 1
                 continue
 
             avg_volume = avg_volumes.get(symbol, 0)
             if avg_volume == 0:
+                dbg["no_avgvol"] += 1
                 continue
 
             price_change = ((price - open_price) / open_price) * 100
             volume_ratio = volume / avg_volume
 
             if volume_ratio > 500 or volume_ratio < 0:
+                dbg["ratio_extreme"] += 1
                 continue
 
             if volume_ratio < 1.5 and abs(price_change) < 2:
+                dbg["below_threshold"] += 1
                 continue
 
+            dbg["ok"] += 1
             candidates.append({
                 "symbol": symbol,
                 "price": price,
@@ -908,12 +919,15 @@ def scan_once(symbols, avg_volumes, send_push=True):
                 "day_low": data["day_low"],
             })
 
-        except:
+        except Exception as e:
+            dbg["exception"] += 1
             continue
 
+    print(f"  🔬 DEBUG scan_once: {dbg}")
     print(f"  📋 {len(candidates)} aday — KAP analizi başlıyor...")
 
     scored = []
+    dbg2 = {"normal": 0, "recent_signal": 0, "exception": 0, "scored": 0}
     for c in candidates:
         try:
             symbol = c["symbol"]
@@ -921,18 +935,24 @@ def scan_once(symbols, avg_volumes, send_push=True):
             conviction, reasons, score, layer = calculate_signal_score(c["price_change"], c["volume_ratio"], kap)
 
             if conviction == "NORMAL":
+                dbg2["normal"] += 1
                 continue
 
             last_time = get_last_signal_time(symbol)
             if now - last_time < 3600:
                 signal_cache[symbol] = last_time
+                dbg2["recent_signal"] += 1
                 continue
 
+            dbg2["scored"] += 1
             scored.append({**c, "conviction": conviction, "reasons": reasons, "score": score, "kap": kap, "layer": layer})
 
-        except:
+        except Exception as e:
+            dbg2["exception"] += 1
             continue
 
+    if candidates:
+        print(f"  🔬 DEBUG scored-loop: {dbg2}")
     scored.sort(key=lambda x: x["score"], reverse=True)
     top5 = scored[:5]
 
