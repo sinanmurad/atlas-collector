@@ -651,7 +651,8 @@ def get_coin_age_days(symbol, date_added=None):
 # ============================================================
 
 def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
-               vol_chg, mcap, cmc_rank, tech, fg, orderbook=None):
+               vol_chg, mcap, cmc_rank, tech, fg, orderbook=None,
+               suregen_candidate=False):
     score = 0
     reasons = []
     layer = "MOMENTUM"
@@ -727,12 +728,17 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         score += 1
 
     # Kataliz zorunlu — hiçbir şey yoksa eleme
-    if vol_chg < 30 and (rsi is None or rsi > 55) and obv_trend != "up":
+    # İSTİSNA: "Süregen momentum" — coin son 24s'te zaten %8+ yürümüş.
+    # Bu durumda elemiyoruz, RSI/OBV'nin "devam eder mi tükendi mi"
+    # kararına bırakıyoruz. Layer'ı SUREGEN olarak işaretleyip
+    # öğrenme sisteminin bu pattern'i ayrı takip etmesini sağlıyoruz.
+    no_catalyst = vol_chg < 30 and (rsi is None or rsi > 55) and obv_trend != "up"
+    if no_catalyst:
         if ch24h >= 8:
-            print(f"  🐞 ELENDİ(score_coin kataliz yok): {symbol} | "
-                  f"rsi:{rsi} obv:{obv_trend} vol_chg:{vol_chg:.1f} "
-                  f"ch1h:{ch1h:.2f} ch24h:{ch24h:.2f}")
-        return None
+            layer = "SUREGEN"
+            reasons.append(f"⏩ Süregen momentum — 24s %{ch24h:.1f}, anlık duraklama")
+        else:
+            return None
 
     # ── FİYAT HAREKET (İĞNE DELİĞİ — yukarı kırılma teyidi) ──
     # Amaç: "henüz oynamamış" (ch1h≈0) veya "düşüyor" (ch1h<0) coinleri
@@ -1825,13 +1831,17 @@ def scan_once(scan_count=0):
                 continue
             if ch7d >= 300:
                 continue
+            # SÜREGEN MOMENTUM İSTİSNASI:
+            # Coin şu an duraklamış (ch1h<1.5) ve hacim patlaması yok (vol_chg<20)
+            # ama son 24s'te zaten %8+ yürümüş — bu "tükenmiş" olabilir AMA
+            # "yavaş istikrarlı yükselişin devamı" da olabilir. Eleme — geçsin,
+            # score_coin RSI/OBV ile karar versin, "SUREGEN" olarak etiketlensin.
+            suregen_candidate = False
             if vol_chg < 20 and ch1h < 1.5:
-                # DEBUG: 24s'te güçlü yükselişi olan ama bu filtrede elenen coinleri logla
                 if ch24h >= 8:
-                    print(f"  🐞 ELENDİ(ön-filtre vol_chg<20&ch1h<1.5): {symbol} | "
-                          f"ch1h:{ch1h:.2f} ch4h:{ch4h:.2f} ch24h:{ch24h:.2f} "
-                          f"vol_chg:{vol_chg:.1f} price:{price} src:{coin.get('sources')}")
-                continue
+                    suregen_candidate = True
+                else:
+                    continue
 
             tech = get_technical_data(symbol)
             time.sleep(0.3)
@@ -1850,6 +1860,7 @@ def scan_once(scan_count=0):
                 ch1h, ch4h, ch24h, ch7d,
                 vol_chg, coin.get("mcap", 0), coin.get("cmc_rank", 9999),
                 tech, fg, orderbook,
+                suregen_candidate=suregen_candidate,
             )
 
             if result:
