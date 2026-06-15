@@ -401,18 +401,43 @@ def get_price_data(symbol):
 
 def get_kap_disclosures(symbol):
     try:
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+        # publish_date kolonu TEXT formatında "DD.MM.YYYY HH:MM:SS" olarak
+        # saklanıyor (örn. "15.06.2026 10:14:37"). Bu format ISO ile
+        # string karşılaştırması yapıldığında YANLIŞ sonuç verir —
+        # "2026-06-13" >= "15.06.2026..." string olarak HER ZAMAN
+        # büyük çıkar, yani .gte() filtresi tüm satırları eler ve
+        # bu fonksiyon hep None döner. Bu yüzden tarih filtresi
+        # Supabase sorgusunda DEĞİL, Python tarafında
+        # datetime.strptime ile yapılıyor.
         r = supabase.table("disclosures") \
             .select("title, publish_date, disclosure_index") \
             .ilike("stock_codes", f"%{symbol}%") \
-            .gte("publish_date", yesterday) \
             .order("disclosure_index", ascending=False) \
-            .limit(5) \
+            .limit(20) \
             .execute()
         if not r.data:
             return None
 
-        titles = [row.get("title", "") for row in r.data]
+        cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+        recent_rows = []
+        for row in r.data:
+            pd_str = row.get("publish_date")
+            if not pd_str:
+                continue
+            try:
+                dt = datetime.strptime(pd_str, "%d.%m.%Y %H:%M:%S")
+                dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if dt >= cutoff:
+                recent_rows.append((dt, row))
+
+        if not recent_rows:
+            return None
+
+        # En yeniden en eskiye sırala (gerçek tarihe göre, disclosure_index'e değil)
+        recent_rows.sort(key=lambda x: x[0], reverse=True)
+        titles = [row.get("title", "") for _, row in recent_rows]
         full_text = " ".join(titles).lower()
 
         tier1_keywords = [
