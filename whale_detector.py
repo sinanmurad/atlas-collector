@@ -1106,6 +1106,8 @@ def run_premarket_scan():
                 "pro_explanation": pro,
                 "price": trend["last_close"],
                 "volume_ratio": trend["vol_ratio"],
+                "conviction": conviction,
+                "score": sig["score"],
                 "created_at": datetime.now(timezone.utc).isoformat()
             }).execute()
 
@@ -1124,7 +1126,7 @@ def run_premarket_scan():
 
 
 def send_morning_signals():
-    """Gece hazırlanan US sinyallerini 15:30 TR'de push ile gönder"""
+    """Gece hazırlanan US sinyallerini 15:30 TR'de push ile gönder + bot alımı yap"""
     try:
         since = (datetime.now(timezone.utc) - timedelta(hours=16)).isoformat()
         r = supabase.table("us_signals") \
@@ -1144,11 +1146,19 @@ def send_morning_signals():
         for signal in r.data:
             symbol = signal["symbol"]
             price = signal.get("price", 0)
-            value = signal.get("value", 0)
-            volume_ratio = signal.get("volume_ratio", 0)
+            value = float(signal.get("value", 0))
+            volume_ratio = float(signal.get("volume_ratio", 0) or 0)
             signal_id = signal["id"]
             description = signal.get("description", "")
+            conviction = signal.get("conviction") or (
+                "CRITICAL" if "🔥" in description else "HIGH"
+            )
+            score = signal.get("score") or 0
 
+            # Sadece CRITICAL sinyaller için bot alımı
+            if conviction != "CRITICAL":
+                print(f"  ⏭️ {symbol} {conviction} — bot alımı yok, sadece push")
+            
             company_name = ""
             if "(" in description and ")" in description:
                 try:
@@ -1156,11 +1166,7 @@ def send_morning_signals():
                 except:
                     pass
 
-            emoji = "⚡"
-            if "🔥" in description:
-                emoji = "🔥"
-            elif "👁️" in description:
-                emoji = "👁️"
+            emoji = "🔥" if conviction == "CRITICAL" else "⚡"
 
             push_body = f"${price:.2f} | {value:+.1f}% | Vol: {volume_ratio:.1f}x"
             if company_name:
@@ -1172,6 +1178,20 @@ def send_morning_signals():
                 market="US",
                 signal_id=signal_id
             )
+
+            # CRITICAL ise bot alımı da yap
+            if conviction == "CRITICAL" and price > 0:
+                print(f"  🤖 {symbol} CRITICAL — bot alımı başlatılıyor...")
+                bot_process_signal(
+                    symbol=symbol,
+                    price=price,
+                    price_change=value,
+                    volume_ratio=volume_ratio,
+                    conviction=conviction,
+                    signal_id=signal_id,
+                    score=score,
+                )
+
             time.sleep(0.5)
 
         print("✅ US sabah sinyalleri gönderildi.")
