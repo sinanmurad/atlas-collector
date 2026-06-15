@@ -914,7 +914,7 @@ def rsi_bucket(rsi):
     return "RSI70+"
 
 
-def record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv_trend, entry_price):
+def record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv_trend, entry_price, score=None):
     """Bot alımı yapıldığında çağrılır — 24s/72s/7g sonuç takibi için kayıt at."""
     try:
         supabase.table("signal_outcomes").insert({
@@ -925,6 +925,7 @@ def record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv_trend, 
             "entry_rsi": rsi,
             "entry_obv": obv_trend,
             "entry_price": entry_price,
+            "entry_score": score,
             "checked_24h": False,
             "checked_72h": False,
             "checked_7d": False,
@@ -1694,7 +1695,7 @@ def _execute_buy(user_id, symbol, price, signal_id, conviction, layer,
               f"| Başlangıç stop:{stop_price:.8f} (%{STOP_PCT*100:.0f})")
 
         # Öğrenme sistemi — 24s/72s/7g sonuç takibi için kayıt
-        record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv, price)
+        record_signal_outcome(signal_id, symbol, layer, conviction, rsi, obv, price, score=score)
 
         log_activity("ALIM", symbol=symbol, price=price,
                       detail=f"${invest:.0f} yatırım | Stop:{stop_price:.8f}{' | İSTİSNAİ' if is_exceptional else ''}",
