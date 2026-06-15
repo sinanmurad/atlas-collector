@@ -737,6 +737,8 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         if ch24h >= 8:
             layer = "SUREGEN"
             reasons.append(f"⏩ Süregen momentum — 24s %{ch24h:.1f}, anlık duraklama")
+            print(f"  🔬 SUREGEN score_coin'e girdi: {symbol} | rsi:{rsi} "
+                  f"obv:{obv_trend} ch24h:{ch24h:.2f} (skor hesabı sürüyor...)")
         else:
             return None
 
@@ -820,6 +822,8 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
             score -= 3
 
     if score < 6:
+        if layer == "SUREGEN":
+            print(f"  🔬 SUREGEN SONUÇ: {symbol} → ELENDİ (score={score} < 6)")
         return None
 
     # ── OTOMATİK ÖĞRENME KATSAYISI ───────────────────────────
@@ -836,7 +840,12 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     elif score >= 9:
         conviction = "MEDIUM"
     else:
+        if layer == "SUREGEN":
+            print(f"  🔬 SUREGEN SONUÇ: {symbol} → ELENDİ (score={score} < 9)")
         return None
+
+    if layer == "SUREGEN":
+        print(f"  🔬 SUREGEN SONUÇ: {symbol} → SİNYAL! score={score} conviction={conviction}")
 
     return {
         "symbol": symbol, "name": name, "price": price,
@@ -1840,6 +1849,8 @@ def scan_once(scan_count=0):
             if vol_chg < 20 and ch1h < 1.5:
                 if ch24h >= 8:
                     suregen_candidate = True
+                    print(f"  🔬 SUREGEN ADAY: {symbol} | ch1h:{ch1h:.2f} "
+                          f"ch24h:{ch24h:.2f} vol_chg:{vol_chg:.1f} price:{price}")
                 else:
                     continue
 
