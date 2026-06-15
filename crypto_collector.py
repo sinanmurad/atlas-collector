@@ -126,7 +126,7 @@ WATCH_MOVE_VOL_PCT = 200        # Hacim değişimi bu kadar farklılaştıysa ha
 # Manuel müdahale gerektirmez.
 LEARNING_MIN_SAMPLES = 30        # Grup başına min örnek (akademik standart: 30+)
 LEARNING_MIN_ABS_Z = 1.96         # ~p<0.05 için z-skor eşiği
-LEARNING_MAX_BONUS = 3            # score_coin'e uygulanacak max ek/eksi puan
+LEARNING_MAX_BONUS = 6            # score_coin'e uygulanacak max ek/eksi puan
 LEARNING_BASELINE_WINRATE = 0.45  # "Başarı" referansı: 24s içinde >%2 kâr oranı
 OUTCOME_CHECK_HOURS = [24, 72, 168]   # 24s, 72s, 7g sonuç ölçümü
 
