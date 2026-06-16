@@ -142,7 +142,7 @@ def update_market_status(**kwargs):
         print(f"update_market_status: {e}")
 
 # ============================================================
-# VERİ ÇEKME FONKSİYONLARI
+# VERİ ÇEKME FONKSİYONLARI - DÜZELTİLDİ
 # ============================================================
 
 def get_btc_change():
@@ -167,23 +167,50 @@ def get_btc_change():
     return None, None
 
 def get_spy_change():
-    """S&P500 günlük değişim"""
+    """S&P500 günlük değişim - DÜZELTİLDİ"""
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
             params={"interval": "1d", "range": "2d"},
-            headers=HEADERS,
+            headers={'User-Agent': 'Mozilla/5.0'},
             timeout=10
         )
         if r.status_code == 200:
             data = r.json()
             meta = data["chart"]["result"][0]["meta"]
+            
             price = meta.get("regularMarketPrice", 0)
-            prev = meta.get("previousClose", 0)
+            prev = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
+            
             if price and prev and price > 1000:
-                return ((price - prev) / prev) * 100, price
+                pct = ((price - prev) / prev) * 100
+                return pct, price
     except Exception:
         pass
+    
+    # Alternatif: 5 günlük veriden hesapla
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+            params={"interval": "1d", "range": "5d"},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            result = data["chart"]["result"][0]
+            meta = result.get("meta", {})
+            price = meta.get("regularMarketPrice", 0)
+            
+            closes = result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            if len(closes) >= 2:
+                prev = closes[-2]
+                if price and prev and price > 1000 and prev > 1000:
+                    pct = ((price - prev) / prev) * 100
+                    return pct, price
+    except Exception:
+        pass
+    
     return None, None
 
 def get_vix():
@@ -203,19 +230,24 @@ def get_vix():
     return None
 
 def get_bist100_change():
-    """BIST100 günlük değişim"""
+    """BIST100 günlük değişim - DÜZELTİLDİ"""
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/XU100.IS",
             params={"interval": "1d", "range": "2d"},
-            headers=HEADERS, timeout=8)
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=8
+        )
         if r.status_code == 200:
             data = r.json()
             meta = data["chart"]["result"][0]["meta"]
+            
             price = meta.get("regularMarketPrice", 0)
-            prev = meta.get("previousClose", 0)
+            prev = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
+            
             if price and prev:
-                return ((price - prev) / prev) * 100, price
+                pct = ((price - prev) / prev) * 100
+                return pct, price
     except Exception:
         pass
     return None, None
@@ -288,6 +320,7 @@ def check_all():
     if 13 <= hour < 20:
         spy_pct, spy_price = get_spy_change()
         vix = get_vix()
+        
         if spy_pct is not None:
             print(f"  SPY: ${spy_price:.2f} | Gun: {spy_pct:+.2f}%")
         if vix is not None:
@@ -303,17 +336,27 @@ def check_all():
             emoji = "🔴" if us_new == "RED" else "⚠️" if us_new == "YELLOW" else "🟢"
             t = f"{emoji} US PIYASA {'ALARM' if us_new=='RED' else 'UYARI' if us_new=='YELLOW' else 'NORMALE DONDU'}"
             b = f"S&P500: {spy_pct:+.1f}% | VIX: {vix:.0f}" if spy_pct and vix else ""
+            
             if us_new in ["RED", "YELLOW"]:
                 haberler = get_news_headlines("S&P500 market crash reasons")
                 if haberler:
                     b += format_news_for_push(haberler)
+            
             if should_push(f"us_{us_new.lower()}"):
                 send_push(t, b, f"US_{us_new}")
                 save_event("US", us_new, spy_pct or 0, t, b, us_new)
-            update_market_status(us_status=us_new, spy_change_1d=spy_pct or 0, vix=vix or 0)
+            
+            update_market_status(
+                us_status=us_new,
+                spy_change_1d=spy_pct or 0,
+                vix=vix or 0
+            )
             _last_status["us"] = us_new
         elif spy_pct is not None:
-            update_market_status(spy_change_1d=spy_pct, vix=vix or 0)
+            update_market_status(
+                spy_change_1d=spy_pct,
+                vix=vix or 0
+            )
 
     # ==================== BIST100 ====================
     if 7 <= hour < 15:
@@ -344,7 +387,10 @@ def check_all():
                     send_push(t, b, "BIST_RECOVER")
                     save_event("BIST", "RECOVER", bist_pct, t, b, "GREEN")
 
-            update_market_status(bist_status=bist_new, bist_change_1d=bist_pct)
+            update_market_status(
+                bist_status=bist_new,
+                bist_change_1d=bist_pct
+            )
             _last_status["bist"] = bist_new
 
 # ============================================================
