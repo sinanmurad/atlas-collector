@@ -206,6 +206,121 @@ def send_push(title, body, signal_id=None, market="CRYPTO"):
 # VERİ KAYNAKLARI
 # ============================================================
 
+def get_trusted_exchange_symbols():
+    """
+    Binance + Coinbase + KuCoin + Huobi'deki USDT çiftlerini çeker.
+    Bu borsalarda listelenmiş = minimum kalite standardı geçilmiş demektir.
+    Bir coin bu listede yoksa çöp coin riski yüksek.
+    """
+    trusted = set()
+
+    # Binance
+    try:
+        r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=10)
+        if r.status_code == 200:
+            symbols = r.json().get("symbols", [])
+            for s in symbols:
+                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+                    trusted.add(s["baseAsset"])
+            print(f"  → Binance: {len([s for s in symbols if s.get('quoteAsset')=='USDT' and s.get('status')=='TRADING'])} USDT çifti")
+    except Exception as e:
+        print(f"⚠️ Binance: {e}")
+
+    # KuCoin
+    try:
+        r = requests.get("https://api.kucoin.com/api/v1/symbols", timeout=10)
+        if r.status_code == 200:
+            symbols = r.json().get("data", [])
+            count = 0
+            for s in symbols:
+                if s.get("quoteCurrency") == "USDT" and s.get("enableTrading"):
+                    trusted.add(s["baseCurrency"])
+                    count += 1
+            print(f"  → KuCoin: {count} USDT çifti")
+    except Exception as e:
+        print(f"⚠️ KuCoin: {e}")
+
+    # Huobi (HTX)
+    try:
+        r = requests.get("https://api.huobi.pro/v1/common/symbols", timeout=10)
+        if r.status_code == 200:
+            symbols = r.json().get("data", [])
+            count = 0
+            for s in symbols:
+                if s.get("quote-currency") == "usdt" and s.get("state") == "online":
+                    trusted.add(s["base-currency"].upper())
+                    count += 1
+            print(f"  → Huobi: {count} USDT çifti")
+    except Exception as e:
+        print(f"⚠️ Huobi: {e}")
+
+    # Coinbase
+    try:
+        r = requests.get("https://api.exchange.coinbase.com/products", timeout=10)
+        if r.status_code == 200:
+            products = r.json()
+            count = 0
+            for p in products:
+                if p.get("quote_currency") == "USDT" and p.get("status") == "online":
+                    trusted.add(p["base_currency"])
+                    count += 1
+            print(f"  → Coinbase: {count} USDT çifti")
+    except Exception as e:
+        print(f"⚠️ Coinbase: {e}")
+
+    print(f"  → Güvenilir evren: {len(trusted)} benzersiz coin")
+    return trusted
+
+
+def get_coinbase_tickers():
+    try:
+        r = requests.get("https://api.exchange.coinbase.com/products", timeout=15)
+        if r.status_code == 200:
+            products = r.json()
+            usdt = [p for p in products if p.get("quote_currency") in ("USDT", "USD") and p.get("status") == "online"]
+            print(f"  → Coinbase: {len(usdt)} parite")
+            return usdt
+    except Exception as e:
+        print(f"⚠️ Coinbase: {e}")
+    return []
+
+
+def get_binance_tickers():
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            print(f"  → Binance: {len(data)} parite")
+            return data
+    except Exception as e:
+        print(f"⚠️ Binance ticker: {e}")
+    return []
+
+
+def get_kucoin_tickers():
+    try:
+        r = requests.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=15)
+        if r.status_code == 200:
+            data = r.json().get("data", {}).get("ticker", [])
+            print(f"  → KuCoin: {len(data)} parite")
+            return data
+    except Exception as e:
+        print(f"⚠️ KuCoin ticker: {e}")
+    return []
+
+
+def get_huobi_tickers():
+    try:
+        r = requests.get("https://api.huobi.pro/market/tickers", timeout=15)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            print(f"  → Huobi: {len(data)} parite")
+            return data
+    except Exception as e:
+        print(f"⚠️ Huobi ticker: {e}")
+    return []
+
+
 def get_mexc_tickers():
     try:
         r = requests.get(
@@ -652,7 +767,7 @@ def get_coin_age_days(symbol, date_added=None):
 
 def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
                vol_chg, mcap, cmc_rank, tech, fg, orderbook=None,
-               suregen_candidate=False):
+               suregen_candidate=False, binance_vol=0, on_coinbase=False):
     # ============================================================
     # 📌 TODO (SUREGEN İZLEME — 15 Haz 2026'da eklendi):
     # "SUREGEN" layer'ı: 24s'te %8+ yürümüş ama anlık duraklamış
@@ -826,6 +941,18 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         score += 1
 
     # ── MARKET CAP ───────────────────────────────────────────
+    # LVVA, MAGMA, PLAY, ROUTE, VELVET gibi düşük mcap coinlerde
+    # RSI<30 "alıcı yok, coin ölüyor" anlamına geliyor — sahte dip.
+    # BAY, READY, SWEAT, GAIN gibi $1M+ coinlerde gerçek birikim.
+    # BIRIKIM + RSI<30 kombinasyonu için minimum $500K market cap şartı.
+    if layer == "BIRIKIM" and rsi is not None and rsi < 30:
+        if mcap < 5_000_000:
+            reasons.append(f"🚫 BIRIKIM RSI<30 + mcap ${mcap/1e3:.0f}K — sahte dip (çöp coin), elendi")
+            return None
+        if cmc_rank > 2000:
+            reasons.append(f"🚫 BIRIKIM RSI<30 + CMC rank #{cmc_rank} — bilinmez coin, elendi")
+            return None
+
     if 0 < mcap < 5_000_000:
         score += 4
         reasons.append(f"💎 Micro cap (${mcap/1e6:.1f}M) — yüksek potansiyel")
@@ -838,7 +965,21 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     elif mcap < 500_000_000:
         score += 1
 
-    # ── KORKU & AÇGÖZLÜLÜK ───────────────────────────────────
+    # ── KURUMSAL BORSA BONUSU ────────────────────────────────
+    # Veri kanıtlı: Binance hacim patlaması = büyük para girişi
+    # Coinbase listeli = kurumsal onay (BlackRock, Fidelity vs)
+    if on_coinbase:
+        score += 2
+        reasons.append("🏦 Coinbase listeli — kurumsal onaylı")
+
+    if binance_vol and binance_vol > 5_000_000:  # $5M+ Binance hacmi
+        score += 3
+        reasons.append(f"🏛️ Binance hacmi ${binance_vol/1e6:.1f}M — kurumsal akış")
+    elif binance_vol and binance_vol > 1_000_000:
+        score += 1
+        reasons.append(f"🏛️ Binance hacmi ${binance_vol/1e6:.1f}M")
+
+
     if fg:
         if fg["value"] <= 15:
             score += 3
@@ -869,11 +1010,24 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         return None
 
     # ── OTOMATİK ÖĞRENME KATSAYISI ───────────────────────────
-    # 90 gün veri biriktikçe otomatik devreye girer, manuel müdahale yok.
     learning_bonus = get_learning_bonus(layer, rsi, obv_trend, score=score)
     if learning_bonus != 0:
         score += learning_bonus
         reasons.append(f"🧠 Öğrenme katsayısı: {learning_bonus:+d}")
+
+    # ── VERİ KANITLI CRITICAL GEÇİŞ KURALI ──────────────────
+    # 409 gerçek trade analizi sonucu:
+    # BIRIKIM + RSI<30  → %27 win rate, ort +3.3% (KULLAN)
+    # BIRIKIM + RSI30-50 → %13 win rate, ort +0.1% (HAYIR)
+    # BIRIKIM + RSI50-70 → %8  win rate, ort -3.2% (ASLA)
+    # BIRIKIM + RSI70+   → %5  win rate, ort -10%  (ASLA)
+    # CRITICAL sadece RSI<30 BIRIKIM'de anlamlı.
+    if layer == "BIRIKIM" and (rsi is None or rsi >= 30):
+        # RSI 30+ BIRIKIM sinyali tarihsel olarak zararda —
+        # CRITICAL'a izin verme, max HIGH'da bırak
+        if score >= 22:
+            score = 21  # CRITICAL eşiğinin hemen altı
+            reasons.append("⚠️ BIRIKIM RSI≥30 — CRITICAL engellendi (veri: %8 win rate)")
 
     if score >= 22:
         conviction = "CRITICAL"
@@ -1351,7 +1505,11 @@ def check_watchlist_movement():
 
 
 
-def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
+def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins, binance_tickers=None, kucoin_tickers=None, huobi_tickers=None, coinbase_tickers=None):
+    binance_tickers = binance_tickers or []
+    kucoin_tickers = kucoin_tickers or []
+    huobi_tickers = huobi_tickers or []
+    coinbase_tickers = coinbase_tickers or []
     merged = {}
 
     for c in cmc_coins:
@@ -1449,6 +1607,128 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins):
                 "ch7d": 0, "vol_chg": 0, "mcap": 0, "cmc_rank": 9999,
                 "sources": ["Gate.io"],
             }
+
+    # ── BİNANCE ──────────────────────────────────────────────
+    for t in binance_tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        base = sym[:-4]
+        price = float(t.get("lastPrice", 0) or 0)
+        if price <= 0 or price > 2.0:
+            continue
+        if is_stablecoin(base, price, 0, float(t.get("priceChangePercent", 0) or 0)):
+            continue
+        if float(t.get("quoteVolume", 0) or 0) < 100_000:
+            continue
+        if base in merged:
+            cmc_price = merged[base]["price"]
+            if cmc_price > 0:
+                ratio = max(price, cmc_price) / min(price, cmc_price)
+                if ratio > 1.5:
+                    merged[base]["sources"].append("BINANCE_MISMATCH")
+                    continue
+            merged[base]["sources"].append("Binance")
+            # Binance'den gelen hacim verisi daha güvenilir — güncelle
+            merged[base]["binance_vol"] = float(t.get("quoteVolume", 0) or 0)
+        else:
+            merged[base] = {
+                "symbol": base, "name": base, "price": price,
+                "ch1h": 0, "ch4h": 0,
+                "ch24h": float(t.get("priceChangePercent", 0) or 0),
+                "ch7d": 0, "vol_chg": 0, "mcap": 0, "cmc_rank": 9999,
+                "sources": ["Binance"],
+            }
+
+    # ── KUCOIN ───────────────────────────────────────────────
+    for t in kucoin_tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("-USDT"):
+            continue
+        base = sym[:-5]
+        price = float(t.get("last", 0) or 0)
+        if price <= 0 or price > 2.0:
+            continue
+        if is_stablecoin(base, price, 0, float(t.get("changeRate", 0) or 0)):
+            continue
+        if float(t.get("volValue", 0) or 0) < 100_000:
+            continue
+        if base in merged:
+            cmc_price = merged[base]["price"]
+            if cmc_price > 0:
+                ratio = max(price, cmc_price) / min(price, cmc_price)
+                if ratio > 1.5:
+                    merged[base]["sources"].append("KUCOIN_MISMATCH")
+                    continue
+            merged[base]["sources"].append("KuCoin")
+            merged[base]["kucoin_vol"] = float(t.get("volValue", 0) or 0)
+        else:
+            merged[base] = {
+                "symbol": base, "name": base, "price": price,
+                "ch1h": 0, "ch4h": 0,
+                "ch24h": float(t.get("changeRate", 0) or 0) * 100,
+                "ch7d": 0, "vol_chg": 0, "mcap": 0, "cmc_rank": 9999,
+                "sources": ["KuCoin"],
+            }
+
+    # ── HUOBİ ────────────────────────────────────────────────
+    for t in huobi_tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("usdt"):
+            continue
+        base = sym[:-4].upper()
+        price = float(t.get("close", 0) or 0)
+        if price <= 0 or price > 2.0:
+            continue
+        if is_stablecoin(base, price, 0, 0):
+            continue
+        vol = float(t.get("vol", 0) or 0) * price
+        if vol < 100_000:
+            continue
+        if base in merged:
+            cmc_price = merged[base]["price"]
+            if cmc_price > 0:
+                ratio = max(price, cmc_price) / min(price, cmc_price)
+                if ratio > 1.5:
+                    merged[base]["sources"].append("HUOBI_MISMATCH")
+                    continue
+            merged[base]["sources"].append("Huobi")
+            merged[base]["huobi_vol"] = vol
+        else:
+            merged[base] = {
+                "symbol": base, "name": base, "price": price,
+                "ch1h": 0, "ch4h": 0,
+                "ch24h": float(t.get("open", 0) or 0),
+                "ch7d": 0, "vol_chg": 0, "mcap": 0, "cmc_rank": 9999,
+                "sources": ["Huobi"],
+            }
+
+    # ── COİNBASE ─────────────────────────────────────────────
+    coinbase_symbols = set()
+    for p in coinbase_tickers:
+        base = p.get("base_currency", "")
+        if base:
+            coinbase_symbols.add(base)
+            if base in merged:
+                merged[base]["sources"].append("Coinbase")
+            # Coinbase'de listelenmiş ama diğerlerinde yok — kalite işareti olarak sakla
+
+    # ── TOPLAM HACİM + BORSA SKORU hesapla ───────────────────
+    for sym, coin in merged.items():
+        sources = coin.get("sources", [])
+        # Mismatch olanları çıkar
+        clean_sources = [s for s in sources if "MISMATCH" not in s]
+        coin["exchange_count"] = len(clean_sources)
+        coin["exchanges"] = "+".join(clean_sources)
+        coin["on_coinbase"] = sym in coinbase_symbols
+
+        # Toplam hacim — tüm borsalardan topla
+        total_vol = 0
+        total_vol += coin.get("binance_vol", 0)
+        total_vol += coin.get("kucoin_vol", 0)
+        total_vol += coin.get("huobi_vol", 0)
+        if total_vol > 0:
+            coin["total_vol_usd"] = total_vol
 
     print(f"  → Birleşik evren: {len(merged)} coin")
     return list(merged.values())
@@ -1916,9 +2196,35 @@ def scan_once(scan_count=0):
     time.sleep(1)
     gateio = get_gateio_tickers()
     time.sleep(1)
+    binance = get_binance_tickers()
+    time.sleep(1)
+    kucoin = get_kucoin_tickers()
+    time.sleep(1)
+    huobi = get_huobi_tickers()
+    time.sleep(1)
+    coinbase = get_coinbase_tickers()
+    time.sleep(1)
     cmc = get_cmc_coins()
 
-    coins = merge_exchange_data(mexc, gateio, cmc)
+    # Güvenilir borsa listesi
+    trusted_symbols = set()
+    for t in binance:
+        s = t.get("symbol", "")
+        if s.endswith("USDT"):
+            trusted_symbols.add(s[:-4])
+    for t in kucoin:
+        s = t.get("symbol", "")
+        if s.endswith("-USDT"):
+            trusted_symbols.add(s[:-5])
+    for t in huobi:
+        s = t.get("symbol", "")
+        if s.endswith("usdt"):
+            trusted_symbols.add(s[:-4].upper())
+    for p in coinbase:
+        trusted_symbols.add(p.get("base_currency", ""))
+    print(f"  → Güvenilir evren: {len(trusted_symbols)} coin (Binance+KuCoin+Huobi+Coinbase)")
+
+    coins = merge_exchange_data(mexc, gateio, cmc, binance, kucoin, huobi, coinbase)
     if not coins:
         print("⚠️ Veri alınamadı")
         return 0
@@ -1994,12 +2300,27 @@ def scan_once(scan_count=0):
             orderbook = get_orderbook(symbol)
             time.sleep(0.2)
 
+            # ── GÜVENİLİR BORSA FİLTRESİ ────────────────────────
+            # Binance/KuCoin/Huobi/Coinbase'de listelenmiş coinler
+            # minimum kalite standardını geçmiş demektir.
+            # Bu borsalarda olmayan coinler ekstra sıkı filtreye girer.
+            in_trusted = symbol in trusted_symbols
+            mcap = coin.get("mcap", 0)
+            cmc_rank = coin.get("cmc_rank", 9999)
+
+            if not in_trusted:
+                # Güvenilir borsada yok — çok sıkı filtre
+                if mcap < 10_000_000 or cmc_rank > 1000:
+                    continue  # sessizce ele, log spam olmasın
+
             result = score_coin(
                 symbol, coin["name"], price,
                 ch1h, ch4h, ch24h, ch7d,
-                vol_chg, coin.get("mcap", 0), coin.get("cmc_rank", 9999),
+                vol_chg, mcap, cmc_rank,
                 tech, fg, orderbook,
                 suregen_candidate=suregen_candidate,
+                binance_vol=coin.get("binance_vol", 0),
+                on_coinbase=coin.get("on_coinbase", False),
             )
 
             if result:
@@ -2011,9 +2332,15 @@ def scan_once(scan_count=0):
 
                 if result["conviction"] in ["CRITICAL", "HIGH"] and result["score"] >= 14:
                     scored.append(result)
+                    exchanges = coin.get("exchanges", "?")
+                    ex_count = coin.get("exchange_count", 0)
+                    coinbase_tag = " 🏦CB" if coin.get("on_coinbase") else ""
                     ob_log = f" | OB:{orderbook['bid_ask_ratio']}x" if orderbook else ""
+                    # Çoklu borsa bonusu — 3+ borsada aynı anda = kurumsal
+                    multi_ex_tag = f" 🔥{ex_count}BORSA" if ex_count >= 3 else ""
                     print(f"  🎯 {symbol} | {result['conviction']} | Score:{result['score']} "
-                          f"| {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}{ob_log}")
+                          f"| {result['layer']} | RSI:{result['rsi']} | OBV:{result['obv_trend']}"
+                          f"{ob_log} | [{exchanges}]{coinbase_tag}{multi_ex_tag}")
                 elif result["score"] >= WATCHLIST_MIN_SCORE:
                     # Sinyal eşiğini geçemedi ama izlemeye değer (MEDIUM)
                     watchlist_update(
