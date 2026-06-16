@@ -830,8 +830,8 @@ def calc_us_levels(price, trend_data):
 
 
 def bot_should_buy(price_change, volume_ratio, conviction):
-    # Savaş mimarisi — sadece en yüksek güven
-    return conviction == "CRITICAL" and price_change > 0
+    # CRITICAL sinyal yeterli — premarket'te fiyat değişimi negatif olabilir
+    return conviction == "CRITICAL"
 
 
 def us_bot_should_sell(trade, current_price):
@@ -1477,15 +1477,17 @@ def start():
                 time.sleep(600)
 
             # ============================================================
-            # SABAH SİNYAL GÖNDERME: 12:30-12:59 UTC (15:30-15:59 TR)
-            # Borsa açılmadan 1 saat önce push gönder
+            # SABAH SİNYAL GÖNDERME: 12:30-13:29 UTC (15:30-16:29 TR)
+            # Borsa açılmadan push + bot alımı
+            # Restart durumunda pencere kaçırılmış olabilir — 13:29'a kadar gönder
             # ============================================================
-            elif hour == 12 and minute >= 30 and not morning_signals_sent:
-                print(f"\n🦅 US SABAH SİNYALLERİ — {now_utc.strftime('%H:%M UTC')} (15:30 TR)")
-                send_morning_signals()
-                morning_signals_sent = True
-                night_scan_done = False
-                print("✅ US sabah sinyalleri gönderildi. Borsa açılışı bekleniyor...")
+            elif (hour == 12 and minute >= 30) or (hour == 13 and minute < 30):
+                if not morning_signals_sent:
+                    print(f"\n🦅 US SABAH SİNYALLERİ — {now_utc.strftime('%H:%M UTC')} (15:30 TR)")
+                    send_morning_signals()
+                    morning_signals_sent = True
+                    night_scan_done = False
+                    print("✅ US sabah sinyalleri gönderildi. Borsa açılışı bekleniyor...")
                 time.sleep(120)
 
             # ============================================================
