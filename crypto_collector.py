@@ -1937,6 +1937,16 @@ def bot_buy(s, signal_id):
     conviction = s["conviction"]
     layer = s["layer"]
 
+    # ── MAKRO KONTROL ────────────────────────────────────────
+    try:
+        ms = supabase.table("market_status").select("crypto_status") \
+            .eq("id", 1).maybeSingle().execute()
+        if ms.data and ms.data.get("crypto_status") == "RED":
+            print(f"  🔴 MAKRO RED — BTC düşüşte, {symbol} alımı durduruldu")
+            return
+    except Exception:
+        pass  # Tablo yoksa devam et
+
     try:
         portfolios = supabase.table("demo_portfolios") \
             .select("user_id, crypto_balance").execute()
