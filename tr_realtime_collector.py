@@ -893,9 +893,9 @@ def calculate_signal_score(price_change, volume_ratio, kap, symbol=None):
         score += bonus
         reasons.append(f"🧠 Öğrenme katsayısı: {bonus:+d}")
 
-    if score >= 10:
+    if score >= 9:
         conviction = "CRITICAL"
-    elif score >= 7:
+    elif score >= 6:
         conviction = "HIGH"
     elif score >= 4:
         conviction = "MEDIUM"
