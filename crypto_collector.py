@@ -215,16 +215,18 @@ def get_trusted_exchange_symbols():
     trusted = set()
 
     # Binance
-    try:
-        r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=10)
-        if r.status_code == 200:
-            symbols = r.json().get("symbols", [])
-            for s in symbols:
-                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
-                    trusted.add(s["baseAsset"])
-            print(f"  → Binance: {len([s for s in symbols if s.get('quoteAsset')=='USDT' and s.get('status')=='TRADING'])} USDT çifti")
-    except Exception as e:
-        print(f"⚠️ Binance: {e}")
+    for base_url in ["https://api1.binance.com", "https://api2.binance.com", "https://api.binance.com"]:
+        try:
+            r = requests.get(f"{base_url}/api/v3/exchangeInfo", timeout=10)
+            if r.status_code == 200:
+                symbols = r.json().get("symbols", [])
+                for s in symbols:
+                    if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+                        trusted.add(s["baseAsset"])
+                print(f"  → Binance (trusted): {len(trusted)} coin")
+                break
+        except Exception:
+            continue
 
     # KuCoin
     try:
@@ -286,14 +288,24 @@ def get_coinbase_tickers():
 
 
 def get_binance_tickers():
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            print(f"  → Binance: {len(data)} parite")
-            return data
-    except Exception as e:
-        print(f"⚠️ Binance ticker: {e}")
+    urls = [
+        "https://api1.binance.com/api/v3/ticker/24hr",
+        "https://api2.binance.com/api/v3/ticker/24hr",
+        "https://api3.binance.com/api/v3/ticker/24hr",
+        "https://api4.binance.com/api/v3/ticker/24hr",
+        "https://api.binance.com/api/v3/ticker/24hr",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    print(f"  → Binance: {len(data)} parite ({url.split('/')[2]})")
+                    return data
+        except Exception:
+            continue
+    print("⚠️ Binance: tüm endpointler başarısız")
     return []
 
 
