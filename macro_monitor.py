@@ -105,36 +105,49 @@ def get_btc_change():
 
 
 def get_spy_change():
+    """S&P500 gunluk degisim — Finnhub REST (us_collector ile ayni kaynak)."""
+    finnhub_key = os.environ.get("FINNHUB_KEY", "")
+    if not finnhub_key:
+        return None, None
     try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/SPY",
-                          params={"interval": "1d", "range": "2d"},
-                          headers=HEADERS, timeout=8)
-        meta = r.json()["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice", 0)
-        prev = meta.get("previousClose", 0)
-        if price and prev:
-            return ((price - prev) / prev) * 100, price
+        r = requests.get(
+            f"https://finnhub.io/api/v1/quote?symbol=SPY&token={finnhub_key}",
+            headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            d = r.json()
+            price = d.get("c", 0)
+            prev  = d.get("pc", 0)
+            if price and prev:
+                return ((price - prev) / prev) * 100, price
     except Exception:
         pass
     return None, None
 
 
 def get_vix():
-    try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
-                          params={"interval": "1d", "range": "1d"},
-                          headers=HEADERS, timeout=8)
-        vix = r.json()["chart"]["result"][0]["meta"].get("regularMarketPrice", 0)
-        return float(vix) if vix else None
-    except Exception:
+    """VIX — Finnhub REST."""
+    finnhub_key = os.environ.get("FINNHUB_KEY", "")
+    if not finnhub_key:
         return None
+    try:
+        r = requests.get(
+            f"https://finnhub.io/api/v1/quote?symbol=^VIX&token={finnhub_key}",
+            headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            vix = r.json().get("c", 0)
+            return float(vix) if vix else None
+    except Exception:
+        pass
+    return None
 
 
 def get_bist100_change():
+    """BIST100 — tr_realtime_collector ile ayni Yahoo endpoint."""
     try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XU100.IS",
-                          params={"interval": "1d", "range": "2d"},
-                          headers=HEADERS, timeout=8)
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/XU100.IS",
+            params={"interval": "1d", "range": "2d"},
+            headers=HEADERS, timeout=8)
         meta = r.json()["chart"]["result"][0]["meta"]
         price = meta.get("regularMarketPrice", 0)
         prev = meta.get("previousClose", 0)
