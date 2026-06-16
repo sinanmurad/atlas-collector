@@ -21,7 +21,6 @@ from firebase_admin import credentials, messaging
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-GROQ_KEY = os.environ.get("GROQ_API_KEY")
 FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -51,20 +50,11 @@ except Exception as e:
     print(f"Firebase hatasi: {e}")
 
 # ============================================================
-# GOOGLE NEWS RSS - HABER ÇEK (YENİ)
+# GOOGLE NEWS RSS - HABER ÇEK
 # ============================================================
 
 def get_news_headlines(query, limit=3):
-    """
-    Google News RSS'den gerçek haber başlıkları çek
-    
-    Args:
-        query: Aranacak kelime (örn: "Bitcoin crash")
-        limit: Kaç haber başlığı çekilecek (varsayılan: 3)
-    
-    Returns:
-        list: Haber başlıkları listesi
-    """
+    """Google News RSS'den gerçek haber başlıkları çek"""
     try:
         url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
         response = requests.get(url, timeout=10)
@@ -79,7 +69,6 @@ def get_news_headlines(query, limit=3):
         for item in items[:limit]:
             title = item.find('title')
             if title is not None and title.text:
-                # Başlığı temizle
                 temiz_baslik = title.text.strip()
                 if len(temiz_baslik) > 100:
                     temiz_baslik = temiz_baslik[:97] + "..."
@@ -91,18 +80,8 @@ def get_news_headlines(query, limit=3):
         print(f"Haber hatasi: {e}")
         return []
 
-def format_news_for_push(haberler, market, change_pct):
-    """
-    Haberleri push mesajı formatına çevir
-    
-    Args:
-        haberler: Haber başlıkları listesi
-        market: Piyasa adı
-        change_pct: Değişim yüzdesi
-    
-    Returns:
-        str: Formatlanmış haber metni
-    """
+def format_news_for_push(haberler):
+    """Haberleri push mesajı formatına çevir"""
     if not haberler:
         return ""
     
@@ -167,6 +146,7 @@ def update_market_status(**kwargs):
 # ============================================================
 
 def get_btc_change():
+    """BTC fiyat ve 1 saatlik değişim"""
     for url, params in [
         ("https://api.mexc.com/api/v3/klines",
          {"symbol": "BTCUSDT", "interval": "1h", "limit": 2}),
@@ -177,7 +157,7 @@ def get_btc_change():
             r = requests.get(url, params=params, headers=HEADERS, timeout=8)
             data = r.json()
             if len(data) >= 2:
-                if "symbol" in url or "mexc" in url:
+                if "mexc" in url:
                     prev, curr = float(data[0][4]), float(data[1][4])
                 else:
                     prev, curr = float(data[0][2]), float(data[1][2])
@@ -187,40 +167,27 @@ def get_btc_change():
     return None, None
 
 def get_spy_change():
-    """S&P500 gunluk degisim — Finnhub REST veya MEXC SPX."""
-    finnhub_key = os.environ.get("FINNHUB_KEY", "")
-    if finnhub_key:
-        try:
-            r = requests.get(
-                f"https://finnhub.io/api/v1/quote?symbol=SPY&token={finnhub_key}",
-                headers=HEADERS, timeout=8)
-            if r.status_code == 200:
-                d = r.json()
-                price = d.get("c", 0)
-                prev  = d.get("pc", 0)
-                if price and prev:
-                    return ((price - prev) / prev) * 100, price
-        except Exception:
-            pass
-
+    """S&P500 günlük değişim"""
     try:
         r = requests.get(
-            "https://api.mexc.com/api/v3/ticker/24hr?symbol=SPXUSDT",
-            headers=HEADERS, timeout=8)
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+            params={"interval": "1d", "range": "2d"},
+            headers=HEADERS,
+            timeout=10
+        )
         if r.status_code == 200:
-            d = r.json()
-            price = float(d.get("lastPrice", 0) or 0)
-            prev  = float(d.get("prevClosePrice", 0) or 0)
-            if price and prev:
-                pct = ((price - prev) / prev) * 100
-                return pct, price
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice", 0)
+            prev = meta.get("previousClose", 0)
+            if price and prev and price > 1000:
+                return ((price - prev) / prev) * 100, price
     except Exception:
         pass
-
     return None, None
 
 def get_vix():
-    """VIX — Finnhub REST."""
+    """VIX endeksi"""
     finnhub_key = os.environ.get("FINNHUB_KEY", "")
     if not finnhub_key:
         return None
@@ -236,17 +203,19 @@ def get_vix():
     return None
 
 def get_bist100_change():
-    """BIST100 — Yahoo endpoint."""
+    """BIST100 günlük değişim"""
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/XU100.IS",
             params={"interval": "1d", "range": "2d"},
             headers=HEADERS, timeout=8)
-        meta = r.json()["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice", 0)
-        prev = meta.get("previousClose", 0)
-        if price and prev:
-            return ((price - prev) / prev) * 100, price
+        if r.status_code == 200:
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice", 0)
+            prev = meta.get("previousClose", 0)
+            if price and prev:
+                return ((price - prev) / prev) * 100, price
     except Exception:
         pass
     return None, None
@@ -272,11 +241,9 @@ def should_push(key, minutes=15):
 def check_all():
     now_utc = datetime.now(timezone.utc)
     hour = now_utc.hour
-    print(f"\n Makro kontrol {now_utc.strftime('%H:%M UTC')}")
+    print(f"\n📊 Makro kontrol {now_utc.strftime('%H:%M UTC')}")
 
-    # ==========================================================
-    # BTC
-    # ==========================================================
+    # ==================== BTC ====================
     btc_pct, btc_price = get_btc_change()
     if btc_pct is not None:
         print(f"  BTC: ${btc_price:,.0f} | 1s: {btc_pct:+.2f}%")
@@ -287,24 +254,18 @@ def check_all():
             if _last_status["crypto"] != "RED" and should_push("btc_drop"):
                 t = f"BTC COKUYOR {btc_pct:+.1f}%"
                 b = f"BTC ${btc_price:,.0f} | Kripto alimlar durduruldu"
-                
-                # ⭐ HABER EKLE
-                haberler = get_news_headlines("Bitcoin crash reasons", 3)
+                haberler = get_news_headlines("Bitcoin crash reasons")
                 if haberler:
-                    b += format_news_for_push(haberler, "Bitcoin", btc_pct)
-                
+                    b += format_news_for_push(haberler)
                 send_push(t, b, "BTC_DROP")
                 save_event("CRYPTO", "BTC_DROP", btc_pct, t, b, "RED")
                 
         elif btc_pct >= BTC_ALARM_PUMP and should_push("btc_pump"):
             t = f"BTC POMPALIYOR {btc_pct:+.1f}%"
             b = f"BTC ${btc_price:,.0f} | Firsat yaklasiyor"
-            
-            # ⭐ HABER EKLE
-            haberler = get_news_headlines("Bitcoin rally reasons", 3)
+            haberler = get_news_headlines("Bitcoin rally reasons")
             if haberler:
-                b += format_news_for_push(haberler, "Bitcoin", btc_pct)
-            
+                b += format_news_for_push(haberler)
             send_push(t, b, "BTC_PUMP")
             save_event("CRYPTO", "BTC_PUMP", btc_pct, t, b, "GREEN")
             crypto_new = "GREEN"
@@ -314,21 +275,16 @@ def check_all():
             if should_push("btc_recover"):
                 t = f"BTC TOPARLADI {btc_pct:+.1f}%"
                 b = f"BTC ${btc_price:,.0f} | Kripto alimlar aktif"
-                
-                # ⭐ HABER EKLE
-                haberler = get_news_headlines("Bitcoin recovery news", 3)
+                haberler = get_news_headlines("Bitcoin recovery news")
                 if haberler:
-                    b += format_news_for_push(haberler, "Bitcoin", btc_pct)
-                
+                    b += format_news_for_push(haberler)
                 send_push(t, b, "BTC_RECOVER")
                 save_event("CRYPTO", "BTC_RECOVER", btc_pct, t, b, "GREEN")
 
         update_market_status(crypto_status=crypto_new, btc_change_1h=btc_pct)
         _last_status["crypto"] = crypto_new
 
-    # ==========================================================
-    # S&P500 + VIX (borsa saatlerinde)
-    # ==========================================================
+    # ==================== S&P500 + VIX ====================
     if 13 <= hour < 20:
         spy_pct, spy_price = get_spy_change()
         vix = get_vix()
@@ -347,26 +303,19 @@ def check_all():
             emoji = "🔴" if us_new == "RED" else "⚠️" if us_new == "YELLOW" else "🟢"
             t = f"{emoji} US PIYASA {'ALARM' if us_new=='RED' else 'UYARI' if us_new=='YELLOW' else 'NORMALE DONDU'}"
             b = f"S&P500: {spy_pct:+.1f}% | VIX: {vix:.0f}" if spy_pct and vix else ""
-            
-            # ⭐ HABER EKLE (sadece RED veya YELLOW ise)
             if us_new in ["RED", "YELLOW"]:
-                haberler = get_news_headlines("S&P500 market crash reasons", 3)
+                haberler = get_news_headlines("S&P500 market crash reasons")
                 if haberler:
-                    b += format_news_for_push(haberler, "S&P500", spy_pct or 0)
-            
+                    b += format_news_for_push(haberler)
             if should_push(f"us_{us_new.lower()}"):
                 send_push(t, b, f"US_{us_new}")
                 save_event("US", us_new, spy_pct or 0, t, b, us_new)
-            update_market_status(us_status=us_new,
-                                  spy_change_1d=spy_pct or 0,
-                                  vix=vix or 0)
+            update_market_status(us_status=us_new, spy_change_1d=spy_pct or 0, vix=vix or 0)
             _last_status["us"] = us_new
         elif spy_pct is not None:
             update_market_status(spy_change_1d=spy_pct, vix=vix or 0)
 
-    # ==========================================================
-    # BIST100 (borsa saatlerinde)
-    # ==========================================================
+    # ==================== BIST100 ====================
     if 7 <= hour < 15:
         bist_pct, bist_price = get_bist100_change()
         if bist_pct is not None:
@@ -378,12 +327,9 @@ def check_all():
                 if _last_status["bist"] != "RED" and should_push("bist_drop"):
                     t = f"BIST DUSUYOR {bist_pct:+.1f}%"
                     b = f"BIST100: {bist_price:,.0f} | BIST alimlari durduruldu"
-                    
-                    # ⭐ HABER EKLE
-                    haberler = get_news_headlines("BIST100 Turkey market drop reasons", 3)
+                    haberler = get_news_headlines("BIST100 Turkey market drop")
                     if haberler:
-                        b += format_news_for_push(haberler, "BIST100", bist_pct)
-                    
+                        b += format_news_for_push(haberler)
                     send_push(t, b, "BIST_DROP")
                     save_event("BIST", "DROP", bist_pct, t, b, "RED")
                     
@@ -392,12 +338,9 @@ def check_all():
                 if should_push("bist_recover"):
                     t = f"BIST TOPARLADI {bist_pct:+.1f}%"
                     b = f"BIST100: {bist_price:,.0f} | BIST alimlari aktif"
-                    
-                    # ⭐ HABER EKLE
-                    haberler = get_news_headlines("BIST100 Turkey market recovery", 3)
+                    haberler = get_news_headlines("BIST100 Turkey market recovery")
                     if haberler:
-                        b += format_news_for_push(haberler, "BIST100", bist_pct)
-                    
+                        b += format_news_for_push(haberler)
                     send_push(t, b, "BIST_RECOVER")
                     save_event("BIST", "RECOVER", bist_pct, t, b, "GREEN")
 
@@ -409,11 +352,22 @@ def check_all():
 # ============================================================
 
 def main():
-    print("Atlas Makro Izleme Sistemi baslatildi")
-    print("Google News RSS ile gerçek zamanlı haber entegre edildi")
-    update_market_status(crypto_status="GREEN", us_status="GREEN",
-                          bist_status="GREEN", btc_change_1h=0,
-                          spy_change_1d=0, bist_change_1d=0, vix=20)
+    print("\n" + "="*60)
+    print("🚀 ATLAS MAKRO PİYASA İZLEME SİSTEMİ")
+    print("📊 Google News RSS ile gerçek zamanlı haber")
+    print("💱 BTC | 🇺🇸 S&P500 | 🇹🇷 BIST100")
+    print("="*60 + "\n")
+    
+    update_market_status(
+        crypto_status="GREEN",
+        us_status="GREEN",
+        bist_status="GREEN",
+        btc_change_1h=0,
+        spy_change_1d=0,
+        bist_change_1d=0,
+        vix=20
+    )
+    
     while True:
         try:
             check_all()
