@@ -1321,7 +1321,8 @@ def scan_once(symbols, avg_volumes, send_push=True, is_night=False):
 
             scored.append({**c, "conviction": conviction, "reasons": reasons, "score": score, "kap": kap, "layer": layer})
 
-        except Exception:
+        except Exception as e:
+            print(f"  ⚠️ BIST analiz hatası [{symbol}]: {e}")
             continue
 
     scored.sort(key=lambda x: x["score"], reverse=True)
