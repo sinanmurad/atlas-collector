@@ -717,12 +717,23 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         reasons.append("🐋 OBV bullish diverjans — whale sessizce birikiyor")
     elif obv_trend == "up" and ch1h < 5:
         if rsi and rsi > 70:
-            score += 2
-            reasons.append("📈 OBV yükseliyor ama RSI yüksek — momentum")
-        else:
-            score += 6
+            # RSI aşırı alımda — BIRIKIM değil MOMENTUM, skor düşük tut
+            score += 1
+            reasons.append("📈 OBV yükseliyor ama RSI yüksek — zayıf momentum")
+        elif rsi and rsi < 35:
+            # RSI satım bölgesinde + OBV up = gerçek birikim
+            score += 8
+            layer = "BIRIKIM"
+            reasons.append("🐋 OBV up + RSI düşük — güçlü birikim sinyali")
+        elif rsi and 35 <= rsi <= 55:
+            # Orta bölge — birikim ama teyit gerekli
+            score += 4
             layer = "BIRIKIM"
             reasons.append("🐋 OBV yükseliyor, fiyat sessiz — birikim")
+        else:
+            # RSI 55-70 arası — zayıf, sadece 2 puan
+            score += 2
+            reasons.append("📈 OBV yükseliyor — hafif alım baskısı")
     elif obv_trend == "up":
         score += 3
         reasons.append("📈 OBV yükseliyor — alım baskısı")
@@ -864,7 +875,7 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         score += learning_bonus
         reasons.append(f"🧠 Öğrenme katsayısı: {learning_bonus:+d}")
 
-    if score >= 20:
+    if score >= 22:
         conviction = "CRITICAL"
     elif score >= 14:
         conviction = "HIGH"
