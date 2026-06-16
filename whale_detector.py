@@ -1405,16 +1405,15 @@ def connect_websocket():
 
 
 def position_monitor_loop():
-    """Borsa açıkken 60sn'de bir açık pozisyonları kontrol eder (stop/hedef/reversal)
-    + her ~10 dakikada bir öğrenme sistemini günceller."""
+    """Borsa açıkken 15sn'de bir açık pozisyonları kontrol eder (stop/hedef/reversal)"""
     cycle = 0
     while is_market_open():
         bot_check_open_positions()
         cycle += 1
-        if cycle % 10 == 0:
+        if cycle % 40 == 0:  # ~10 dakikada bir
             check_signal_outcomes(market="US")
             update_learning_weights(market="US")
-        time.sleep(60)
+        time.sleep(15)
 
 
 def start():
@@ -1442,7 +1441,23 @@ def start():
 
     last_watchlist_refresh = time.time()
     night_scan_done = False
-    morning_signals_sent = False
+    morning_push_sent = False
+    morning_buys_done = False
+
+    # Pozisyon izleme thread'i — borsa saatlerinde 15sn'de bir çalışır
+    import threading
+    def _monitor_thread():
+        while True:
+            try:
+                if is_market_open():
+                    bot_check_open_positions()
+            except Exception:
+                pass
+            time.sleep(15)
+
+    monitor = threading.Thread(target=_monitor_thread, daemon=True)
+    monitor.start()
+    print("👁️ Pozisyon izleme başlatıldı (15s aralık)")
 
     while True:
         try:
@@ -1450,20 +1465,17 @@ def start():
             hour = now_utc.hour
             minute = now_utc.minute
 
-            # ============================================================
-            # GECE WATCHLIST YENİLE: 02:00 UTC (05:00 TR)
-            # ============================================================
+            # ── Gece watchlist yenile ────────────────────────────
             if hour == 2 and minute < 5 and time.time() - last_watchlist_refresh > 3600:
-                print("🌙 Gece watchlist yenileniyor...")
                 refresh_watchlist_background()
                 last_watchlist_refresh = time.time()
                 premarket_signal_cache.clear()
                 night_scan_done = False
-                morning_signals_sent = False
+                morning_push_sent = False
+                morning_buys_done = False
 
             # ============================================================
             # GECE MODU: 20:00-12:29 UTC (23:00-15:29 TR)
-            # Borsa kapandıktan sonra analiz yap, push GÖNDERME
             # ============================================================
             if hour >= 20 or hour < 12:
                 if not night_scan_done:
@@ -1471,38 +1483,35 @@ def start():
                     premarket_signal_cache.clear()
                     run_premarket_scan()
                     night_scan_done = True
-                    morning_signals_sent = False
+                    morning_push_sent = False
+                    morning_buys_done = False
                 else:
                     print(f"💤 US gece bekleniyor... {now_utc.strftime('%H:%M UTC')}")
                 time.sleep(600)
 
             # ============================================================
-            # SABAH SİNYAL GÖNDERME: 12:30-13:29 UTC (15:30-16:29 TR)
-            # Borsa açılmadan push + bot alımı
-            # Restart durumunda pencere kaçırılmış olabilir — 13:29'a kadar gönder
+            # SABAH PUSH: 12:30-13:29 UTC (15:30-16:29 TR)
+            # Borsa henüz kapalı — sadece push, alım YOK
             # ============================================================
             elif (hour == 12 and minute >= 30) or (hour == 13 and minute < 30):
-                if not morning_signals_sent:
-                    print(f"\n🦅 US SABAH SİNYALLERİ — {now_utc.strftime('%H:%M UTC')} (15:30 TR)")
-                    send_morning_signals()
-                    morning_signals_sent = True
+                if not morning_push_sent:
+                    print(f"\n📱 US SABAH PUSH — {now_utc.strftime('%H:%M UTC')} (15:30 TR)")
+                    send_morning_signals()  # push + CRITICAL ise alım
+                    morning_push_sent = True
                     night_scan_done = False
-                    print("✅ US sabah sinyalleri gönderildi. Borsa açılışı bekleniyor...")
                 time.sleep(120)
 
             # ============================================================
             # BORSA AÇIK: 13:30-20:00 UTC (16:30-23:00 TR)
-            # WebSocket ile canlı takip + 60sn'de pozisyon izleme
+            # WebSocket ile canlı takip — pozisyon izleme thread'de
             # ============================================================
             elif is_market_open():
-                night_scan_done = False
-                morning_signals_sent = False
+                morning_push_sent = True  # Açıkken push'u tekrar gönderme
                 print(f"📡 US WebSocket bağlanıyor... ({len(active_symbols)} hisse)")
-                threading.Thread(target=position_monitor_loop, daemon=True).start()
                 connect_websocket()
 
             # ============================================================
-            # ARA DÖNEM: 13:00-13:29 UTC (16:00-16:29 TR)
+            # ARA: 13:00-13:29 UTC
             # ============================================================
             else:
                 if hour == 20 and minute < 5:
