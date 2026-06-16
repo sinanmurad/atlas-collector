@@ -1878,6 +1878,10 @@ def save_signal(s, fg, allow_buy=False):
             "acemi_explanation": acemi,
             "usta_explanation": usta,
             "pro_explanation": pro,
+            "exchanges": s.get("exchanges", ""),
+            "exchange_count": s.get("exchange_count", 0),
+            "on_coinbase": s.get("on_coinbase", False),
+            "binance_vol": s.get("binance_vol", 0),
             "market": "CRYPTO",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
@@ -2331,6 +2335,11 @@ def scan_once(scan_count=0):
                     continue
 
                 if result["conviction"] in ["CRITICAL", "HIGH"] and result["score"] >= 14:
+                    # Borsa bilgilerini result'a ekle
+                    result["exchanges"] = coin.get("exchanges", "")
+                    result["exchange_count"] = coin.get("exchange_count", 0)
+                    result["on_coinbase"] = coin.get("on_coinbase", False)
+                    result["binance_vol"] = coin.get("binance_vol", 0)
                     scored.append(result)
                     exchanges = coin.get("exchanges", "?")
                     ex_count = coin.get("exchange_count", 0)
