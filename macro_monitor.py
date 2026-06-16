@@ -3,7 +3,7 @@
 Atlas Makro Piyasa İzleme Sistemi
 BTC, S&P500, BIST100 referanslarini 60sn'de bir kontrol eder.
 Google News RSS ile gerçek zamanlı haber çeker.
-Tüm veriler Supabase'e kaydedilir, Flutter uygulaması buradan okur.
+Tüm veriler Supabase'e kaydedilir.
 """
 
 import os
@@ -290,46 +290,40 @@ def should_push(key, minutes=15):
     return False
 
 # ============================================================
-# PRE-MARKET ANALİZİ (Borsa Kapalıyken)
+# PRE-MARKET ANALİZİ
 # ============================================================
 
 def analyze_premarket_with_real_data():
     """Borsa kapalıyken gerçek verilerle yön tahmini"""
-    
     vix = get_vix()
     btc_pct, _ = get_btc_change()
     futures_pct, _ = get_spy_futures()
     us10y = get_us10y()
     haberler = get_news_headlines("S&P500 pre-market news", 3)
     
-    print("\n  📊 PRE-MARKET ANALİZİ (GERÇEK VERİLER):")
+    print("\n  📊 PRE-MARKET ANALİZİ:")
     print(f"    VIX: {vix:.1f}" if vix else "    VIX: ❌ Veri yok")
     print(f"    BTC: {btc_pct:+.2f}%" if btc_pct else "    BTC: ❌ Veri yok")
-    print(f"    S&P500 Futures: {futures_pct:+.2f}%" if futures_pct else "    S&P500 Futures: ❌ Veri yok")
+    print(f"    Futures: {futures_pct:+.2f}%" if futures_pct else "    Futures: ❌ Veri yok")
     print(f"    ABD 10Y: %{us10y:.2f}" if us10y else "    ABD 10Y: ❌ Veri yok")
-    
     if haberler:
-        print("    📰 SON HABERLER:")
+        print("    📰 HABERLER:")
         for h in haberler:
             print(f"      • {h}")
     
-    # Skor hesapla
     skor = 0
     if vix and vix < 25:
         skor += 1
     elif vix and vix >= 25:
         skor -= 1
-    
     if btc_pct and btc_pct > 0:
         skor += 1
     elif btc_pct and btc_pct < 0:
         skor -= 1
-    
     if futures_pct and futures_pct > 0:
         skor += 1
     elif futures_pct and futures_pct < 0:
         skor -= 1
-    
     if us10y and us10y < 4.2:
         skor += 1
     elif us10y and us10y > 4.5:
@@ -361,40 +355,29 @@ def check_all():
     btc_pct, btc_price = get_btc_change()
     if btc_pct is not None:
         print(f"  BTC: ${btc_price:,.0f} | 1s: {btc_pct:+.2f}%")
-        crypto_new = _last_status["crypto"]
-
         if btc_pct <= BTC_ALARM_DROP:
-            crypto_new = "RED"
-            if _last_status["crypto"] != "RED" and should_push("btc_drop"):
+            if should_push("btc_drop"):
                 t = f"BTC COKUYOR {btc_pct:+.1f}%"
-                b = f"BTC ${btc_price:,.0f} | Kripto alimlar durduruldu"
+                b = f"BTC ${btc_price:,.0f}"
                 haberler = get_news_headlines("Bitcoin crash reasons")
                 if haberler:
                     b += format_news_for_push(haberler)
                 send_push(t, b, "BTC_DROP")
                 save_event("CRYPTO", "BTC_DROP", btc_pct, t, b, "RED")
+                update_market_status(crypto_status="RED", btc_change_1h=btc_pct)
+            else:
+                update_market_status(btc_change_1h=btc_pct)
         elif btc_pct >= BTC_ALARM_PUMP and should_push("btc_pump"):
             t = f"BTC POMPALIYOR {btc_pct:+.1f}%"
-            b = f"BTC ${btc_price:,.0f} | Firsat yaklasiyor"
+            b = f"BTC ${btc_price:,.0f}"
             haberler = get_news_headlines("Bitcoin rally reasons")
             if haberler:
                 b += format_news_for_push(haberler)
             send_push(t, b, "BTC_PUMP")
             save_event("CRYPTO", "BTC_PUMP", btc_pct, t, b, "GREEN")
-            crypto_new = "GREEN"
-        elif _last_status["crypto"] == "RED" and btc_pct >= BTC_RECOVER:
-            crypto_new = "GREEN"
-            if should_push("btc_recover"):
-                t = f"BTC TOPARLADI {btc_pct:+.1f}%"
-                b = f"BTC ${btc_price:,.0f} | Kripto alimlar aktif"
-                haberler = get_news_headlines("Bitcoin recovery news")
-                if haberler:
-                    b += format_news_for_push(haberler)
-                send_push(t, b, "BTC_RECOVER")
-                save_event("CRYPTO", "BTC_RECOVER", btc_pct, t, b, "GREEN")
-
-        update_market_status(crypto_status=crypto_new, btc_change_1h=btc_pct)
-        _last_status["crypto"] = crypto_new
+            update_market_status(crypto_status="GREEN", btc_change_1h=btc_pct)
+        else:
+            update_market_status(btc_change_1h=btc_pct)
 
     # ==================== S&P500 ====================
     spy_pct, spy_price = get_spy_change()
@@ -402,49 +385,22 @@ def check_all():
     
     if spy_pct is not None:
         print(f"  SPY: ${spy_price:.2f} | Gun: {spy_pct:+.2f}%")
-    else:
-        print(f"  SPY: ❌ Veri alınamadı")
-    
     if vix is not None:
         print(f"  VIX: {vix:.1f}")
-    else:
-        print(f"  VIX: ❌ Veri alınamadı")
     
-    # ✅ S&P500 VERİSİNİ KAYDET (her zaman)
-    update_market_status(
-        spy_change_1d=spy_pct if spy_pct is not None else 0,
-        vix=vix if vix is not None else 0
-    )
+    update_market_status(spy_change_1d=spy_pct if spy_pct is not None else 0, vix=vix if vix is not None else 0)
 
-    # Borsa kapalıysa pre-market analizi
     if not (13 <= hour < 20):
         yon, status, skor = analyze_premarket_with_real_data()
-        update_market_status(
-            us_premarket_skor=skor,
-            us_premarket_yon=yon
-        )
+        update_market_status(us_premarket_skor=skor, us_premarket_yon=yon)
     
-    # Borsa açıkken alarm kontrolü
     if 13 <= hour < 20:
-        us_new = _last_status["us"]
+        us_new = "GREEN"
         if (spy_pct and spy_pct <= SP500_CRASH) or (vix and vix >= VIX_EXTREME):
             us_new = "RED"
         elif (spy_pct and spy_pct <= SP500_ALARM_DROP) or (vix and vix >= VIX_HIGH):
             us_new = "YELLOW"
-        else:
-            us_new = "GREEN"
-
         if us_new != _last_status["us"]:
-            emoji = "🔴" if us_new == "RED" else "⚠️" if us_new == "YELLOW" else "🟢"
-            t = f"{emoji} US PIYASA {'ALARM' if us_new=='RED' else 'UYARI' if us_new=='YELLOW' else 'NORMALE DONDU'}"
-            b = f"S&P500: {spy_pct:+.1f}% | VIX: {vix:.0f}" if spy_pct and vix else ""
-            if us_new in ["RED", "YELLOW"]:
-                haberler = get_news_headlines("S&P500 market crash reasons")
-                if haberler:
-                    b += format_news_for_push(haberler)
-            if should_push(f"us_{us_new.lower()}"):
-                send_push(t, b, f"US_{us_new}")
-                save_event("US", us_new, spy_pct or 0, t, b, us_new)
             update_market_status(us_status=us_new)
             _last_status["us"] = us_new
 
@@ -453,40 +409,38 @@ def check_all():
         bist_pct, bist_price = get_bist100_change()
         if bist_pct is not None:
             print(f"  BIST100: {bist_price:,.0f} | Gun: {bist_pct:+.2f}%")
-            bist_new = _last_status["bist"]
-
             if bist_pct <= BIST_ALARM_DROP:
-                bist_new = "RED"
-                if _last_status["bist"] != "RED" and should_push("bist_drop"):
+                if should_push("bist_drop"):
                     t = f"BIST DUSUYOR {bist_pct:+.1f}%"
-                    b = f"BIST100: {bist_price:,.0f} | BIST alimlari durduruldu"
+                    b = f"BIST100: {bist_price:,.0f}"
                     haberler = get_news_headlines("BIST100 Turkey market drop")
                     if haberler:
                         b += format_news_for_push(haberler)
                     send_push(t, b, "BIST_DROP")
                     save_event("BIST", "DROP", bist_pct, t, b, "RED")
+                    update_market_status(bist_status="RED", bist_change_1d=bist_pct)
+                else:
+                    update_market_status(bist_change_1d=bist_pct)
             elif _last_status["bist"] == "RED" and bist_pct >= BIST_RECOVER:
-                bist_new = "GREEN"
                 if should_push("bist_recover"):
                     t = f"BIST TOPARLADI {bist_pct:+.1f}%"
-                    b = f"BIST100: {bist_price:,.0f} | BIST alimlari aktif"
+                    b = f"BIST100: {bist_price:,.0f}"
                     haberler = get_news_headlines("BIST100 Turkey market recovery")
                     if haberler:
                         b += format_news_for_push(haberler)
                     send_push(t, b, "BIST_RECOVER")
                     save_event("BIST", "RECOVER", bist_pct, t, b, "GREEN")
-
-            update_market_status(bist_status=bist_new, bist_change_1d=bist_pct)
-            _last_status["bist"] = bist_new
+                    update_market_status(bist_status="GREEN", bist_change_1d=bist_pct)
+                else:
+                    update_market_status(bist_change_1d=bist_pct)
+            else:
+                update_market_status(bist_change_1d=bist_pct)
     else:
-        # BIST kapalıyken haberleri göster
-        print("  📰 BIST KAPALI - Pre-market haberler:")
+        print("  📰 BIST KAPALI")
         haberler = get_news_headlines("BIST100 Turkey market news", 3)
         if haberler:
             for h in haberler:
                 print(f"    • {h}")
-        # BIST verisini 0 olarak kaydetme (önceki değer kalsın)
-        pass
 
 # ============================================================
 # ANA DÖNGÜ
@@ -506,7 +460,9 @@ def main():
         btc_change_1h=0,
         spy_change_1d=0,
         bist_change_1d=0,
-        vix=20
+        vix=20,
+        us_premarket_skor=0,
+        us_premarket_yon="🟡 NÖTR"
     )
     
     while True:
