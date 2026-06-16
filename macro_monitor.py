@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Atlas Makro Piyasa İzleme Sistemi
-BTC, S&P500, BIST100 referanslarini 60sn'de bir kontrol eder.
-Google News RSS ile gerçek zamanlı haber çeker.
+- Gerçek verilerle borsa öncesi yön tahmini
 """
 
 import os
@@ -22,6 +21,7 @@ from firebase_admin import credentials, messaging
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
@@ -92,6 +92,125 @@ def format_news_for_push(haberler):
     return formatted
 
 # ============================================================
+# GERÇEK VERİ ÇEKME FONKSİYONLARI
+# ============================================================
+
+def get_btc_change():
+    """BTC fiyat ve 1 saatlik değişim - GERÇEK"""
+    for url, params in [
+        ("https://api.mexc.com/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1h", "limit": 2}),
+        ("https://api.gateio.ws/api/v4/spot/candlesticks", {"currency_pair": "BTC_USDT", "interval": "1h", "limit": 2}),
+    ]:
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=8)
+            data = r.json()
+            if len(data) >= 2:
+                if "mexc" in url:
+                    prev, curr = float(data[0][4]), float(data[1][4])
+                else:
+                    prev, curr = float(data[0][2]), float(data[1][2])
+                return ((curr - prev) / prev) * 100, curr
+        except Exception:
+            continue
+    return None, None
+
+def get_spy_change():
+    """S&P500 günlük değişim - GERÇEK"""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+            params={"interval": "1d", "range": "2d"},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice", 0)
+            prev = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
+            if price and prev and price > 1000:
+                return ((price - prev) / prev) * 100, price
+    except Exception:
+        pass
+    return None, None
+
+def get_spy_futures():
+    """S&P500 Futures - GERÇEK (Borsa kapalıyken yön gösterir)"""
+    try:
+        # ES=F (S&P500 Futures) - Yahoo Finance
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/ES%3DF",
+            params={"interval": "5m", "range": "1d"},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice", 0)
+            prev = meta.get("previousClose", 0)
+            if price and prev:
+                pct = ((price - prev) / prev) * 100
+                return pct, price
+    except Exception:
+        pass
+    return None, None
+
+def get_vix():
+    """VIX endeksi - GERÇEK"""
+    if not FINNHUB_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"https://finnhub.io/api/v1/quote?symbol=^VIX&token={FINNHUB_KEY}",
+            headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            vix = r.json().get("c", 0)
+            return float(vix) if vix else None
+    except Exception:
+        pass
+    return None
+
+def get_us10y():
+    """ABD 10 Yıllık Tahvil Faizi - GERÇEK"""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5ETNX",
+            params={"interval": "1d", "range": "2d"},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice", 0)
+            if price:
+                return price
+    except Exception:
+        pass
+    return None
+
+def get_bist100_change():
+    """BIST100 günlük değişim - GERÇEK"""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/XU100.IS",
+            params={"interval": "1d", "range": "2d"},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice", 0)
+            prev = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
+            if price and prev:
+                return ((price - prev) / prev) * 100, price
+    except Exception:
+        pass
+    return None, None
+
+# ============================================================
 # PUSH BİLDİRİM
 # ============================================================
 
@@ -142,117 +261,6 @@ def update_market_status(**kwargs):
         print(f"update_market_status: {e}")
 
 # ============================================================
-# VERİ ÇEKME FONKSİYONLARI - DÜZELTİLDİ
-# ============================================================
-
-def get_btc_change():
-    """BTC fiyat ve 1 saatlik değişim"""
-    for url, params in [
-        ("https://api.mexc.com/api/v3/klines",
-         {"symbol": "BTCUSDT", "interval": "1h", "limit": 2}),
-        ("https://api.gateio.ws/api/v4/spot/candlesticks",
-         {"currency_pair": "BTC_USDT", "interval": "1h", "limit": 2}),
-    ]:
-        try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=8)
-            data = r.json()
-            if len(data) >= 2:
-                if "mexc" in url:
-                    prev, curr = float(data[0][4]), float(data[1][4])
-                else:
-                    prev, curr = float(data[0][2]), float(data[1][2])
-                return ((curr - prev) / prev) * 100, curr
-        except Exception:
-            continue
-    return None, None
-
-def get_spy_change():
-    """S&P500 günlük değişim - DÜZELTİLDİ"""
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
-            params={"interval": "1d", "range": "2d"},
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=10
-        )
-        if r.status_code == 200:
-            data = r.json()
-            meta = data["chart"]["result"][0]["meta"]
-            
-            price = meta.get("regularMarketPrice", 0)
-            prev = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
-            
-            if price and prev and price > 1000:
-                pct = ((price - prev) / prev) * 100
-                return pct, price
-    except Exception:
-        pass
-    
-    # Alternatif: 5 günlük veriden hesapla
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
-            params={"interval": "1d", "range": "5d"},
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=10
-        )
-        if r.status_code == 200:
-            data = r.json()
-            result = data["chart"]["result"][0]
-            meta = result.get("meta", {})
-            price = meta.get("regularMarketPrice", 0)
-            
-            closes = result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-            if len(closes) >= 2:
-                prev = closes[-2]
-                if price and prev and price > 1000 and prev > 1000:
-                    pct = ((price - prev) / prev) * 100
-                    return pct, price
-    except Exception:
-        pass
-    
-    return None, None
-
-def get_vix():
-    """VIX endeksi"""
-    finnhub_key = os.environ.get("FINNHUB_KEY", "")
-    if not finnhub_key:
-        return None
-    try:
-        r = requests.get(
-            f"https://finnhub.io/api/v1/quote?symbol=^VIX&token={finnhub_key}",
-            headers=HEADERS, timeout=8)
-        if r.status_code == 200:
-            vix = r.json().get("c", 0)
-            return float(vix) if vix else None
-    except Exception:
-        pass
-    return None
-
-def get_bist100_change():
-    """BIST100 günlük değişim - DÜZELTİLDİ"""
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/XU100.IS",
-            params={"interval": "1d", "range": "2d"},
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=8
-        )
-        if r.status_code == 200:
-            data = r.json()
-            meta = data["chart"]["result"][0]["meta"]
-            
-            price = meta.get("regularMarketPrice", 0)
-            prev = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
-            
-            if price and prev:
-                pct = ((price - prev) / prev) * 100
-                return pct, price
-    except Exception:
-        pass
-    return None, None
-
-# ============================================================
 # COOLDOWN
 # ============================================================
 
@@ -267,6 +275,96 @@ def should_push(key, minutes=15):
     return False
 
 # ============================================================
+# SENTİMENT ANALİZİ - GERÇEK VERİLERLE
+# ============================================================
+
+def analyze_premarket_with_real_data():
+    """Borsa kapalıyken gerçek verilerle yön tahmini"""
+    
+    # 1. VIX - Korku endeksi
+    vix = get_vix()
+    vix_sinyal = ""
+    if vix:
+        if vix >= 30:
+            vix_sinyal = "🔴 AŞIRI KORKU (DÜŞÜŞ)"
+        elif vix >= 25:
+            vix_sinyal = "🟡 YÜKSEK RİSK (TEDİRGİN)"
+        else:
+            vix_sinyal = "🟢 SAKİN (YÜKSELİŞ)"
+    
+    # 2. BTC - Küresel risk iştahı
+    btc_pct, btc_price = get_btc_change()
+    btc_sinyal = ""
+    if btc_pct:
+        if btc_pct >= 2:
+            btc_sinyal = "🟢 RİSK İŞTAHI YÜKSEK"
+        elif btc_pct <= -2:
+            btc_sinyal = "🔴 RİSK İŞTAHI DÜŞÜK"
+        else:
+            btc_sinyal = "🟡 NÖTR"
+    
+    # 3. S&P500 Futures - Borsa öncesi yön
+    futures_pct, futures_price = get_spy_futures()
+    futures_sinyal = ""
+    if futures_pct:
+        if futures_pct >= 0.5:
+            futures_sinyal = "🟢 YÜKSELİŞ BEKLENİYOR"
+        elif futures_pct <= -0.5:
+            futures_sinyal = "🔴 DÜŞÜŞ BEKLENİYOR"
+        else:
+            futures_sinyal = "🟡 NÖTR"
+    
+    # 4. ABD 10 Yıllık Tahvil
+    us10y = get_us10y()
+    tahvil_sinyal = ""
+    if us10y:
+        if us10y > 4.5:
+            tahvil_sinyal = "🔴 FAİZ YÜKSEK (BASKI)"
+        elif us10y < 4.0:
+            tahvil_sinyal = "🟢 FAİZ DÜŞÜK (DESTEK)"
+        else:
+            tahvil_sinyal = "🟡 NÖTR"
+    
+    # 5. Haberler - Google News
+    haberler = get_news_headlines("S&P500 pre-market news", 3)
+    
+    # Kombine Analiz
+    print("\n  📊 PRE-MARKET ANALİZİ (GERÇEK VERİLER):")
+    print(f"    VIX ({vix:.1f}): {vix_sinyal}" if vix else "    VIX: ❌ Veri yok")
+    print(f"    BTC ({btc_pct:+.2f}%): {btc_sinyal}" if btc_pct else "    BTC: ❌ Veri yok")
+    print(f"    S&P500 Futures ({futures_pct:+.2f}%): {futures_sinyal}" if futures_pct else "    S&P500 Futures: ❌ Veri yok")
+    print(f"    ABD 10Y (%{us10y:.2f}): {tahvil_sinyal}" if us10y else "    ABD 10Y: ❌ Veri yok")
+    
+    if haberler:
+        print("    📰 SON HABERLER:")
+        for h in haberler:
+            print(f"      • {h}")
+    
+    # Toplam Skor
+    skor = 0
+    if vix and vix < 25: skor += 1
+    if vix and vix >= 25: skor -= 1
+    if btc_pct and btc_pct > 0: skor += 1
+    if btc_pct and btc_pct < 0: skor -= 1
+    if futures_pct and futures_pct > 0: skor += 1
+    if futures_pct and futures_pct < 0: skor -= 1
+    if us10y and us10y < 4.2: skor += 1
+    if us10y and us10y > 4.5: skor -= 1
+    
+    if skor >= 2:
+        yon = "🟢 YÜKSELİŞ BEKLENİYOR"
+        status = "GREEN"
+    elif skor <= -2:
+        yon = "🔴 DÜŞÜŞ BEKLENİYOR"
+        status = "RED"
+    else:
+        yon = "🟡 NÖTR"
+        status = "YELLOW"
+    
+    print(f"\n  🎯 SONUÇ: {yon}")
+    return yon, status, skor
+
+# ============================================================
 # ANA KONTROL
 # ============================================================
 
@@ -275,7 +373,7 @@ def check_all():
     hour = now_utc.hour
     print(f"\n📊 Makro kontrol {now_utc.strftime('%H:%M UTC')}")
 
-    # ==================== BTC ====================
+    # ==================== BTC (HER ZAMAN) ====================
     btc_pct, btc_price = get_btc_change()
     if btc_pct is not None:
         print(f"  BTC: ${btc_price:,.0f} | 1s: {btc_pct:+.2f}%")
@@ -316,21 +414,38 @@ def check_all():
         update_market_status(crypto_status=crypto_new, btc_change_1h=btc_pct)
         _last_status["crypto"] = crypto_new
 
-    # ==================== S&P500 + VIX ====================
-    if 13 <= hour < 20:
-        spy_pct, spy_price = get_spy_change()
-        vix = get_vix()
+    # ==================== S&P500 ====================
+    # Borsa açıkken gerçek veri, kapalıyken futures + VIX + haberler
+    spy_pct, spy_price = get_spy_change()
+    vix = get_vix()
+    
+    if spy_pct is not None:
+        print(f"  SPY: ${spy_price:.2f} | Gun: {spy_pct:+.2f}%")
+    
+    if vix is not None:
+        print(f"  VIX: {vix:.1f}")
+    
+    # ⭐ BORSA KAPALIYSA (20:00-13:00 UTC) PRE-MARKET ANALİZİ
+    us_new = _last_status["us"]
+    premarket_yon = ""
+    premarket_status = "GREEN"
+    
+    if not (13 <= hour < 20):
+        yon, status, skor = analyze_premarket_with_real_data()
+        premarket_yon = yon
+        premarket_status = status
         
-        if spy_pct is not None:
-            print(f"  SPY: ${spy_price:.2f} | Gun: {spy_pct:+.2f}%")
-        if vix is not None:
-            print(f"  VIX: {vix:.1f}")
-
-        us_new = "GREEN"
+        # Veritabanına kaydet
+        update_market_status(us_premarket_skor=skor, us_premarket_yon=yon)
+    
+    # Alarm kontrolü (borsa açıkken)
+    if 13 <= hour < 20:
         if (spy_pct and spy_pct <= SP500_CRASH) or (vix and vix >= VIX_EXTREME):
             us_new = "RED"
         elif (spy_pct and spy_pct <= SP500_ALARM_DROP) or (vix and vix >= VIX_HIGH):
             us_new = "YELLOW"
+        else:
+            us_new = "GREEN"
 
         if us_new != _last_status["us"]:
             emoji = "🔴" if us_new == "RED" else "⚠️" if us_new == "YELLOW" else "🟢"
@@ -346,19 +461,12 @@ def check_all():
                 send_push(t, b, f"US_{us_new}")
                 save_event("US", us_new, spy_pct or 0, t, b, us_new)
             
-            update_market_status(
-                us_status=us_new,
-                spy_change_1d=spy_pct or 0,
-                vix=vix or 0
-            )
+            update_market_status(us_status=us_new, spy_change_1d=spy_pct or 0, vix=vix or 0)
             _last_status["us"] = us_new
         elif spy_pct is not None:
-            update_market_status(
-                spy_change_1d=spy_pct,
-                vix=vix or 0
-            )
-
-    # ==================== BIST100 ====================
+            update_market_status(spy_change_1d=spy_pct, vix=vix or 0)
+    
+    # ==================== BIST ====================
     if 7 <= hour < 15:
         bist_pct, bist_price = get_bist100_change()
         if bist_pct is not None:
@@ -387,11 +495,15 @@ def check_all():
                     send_push(t, b, "BIST_RECOVER")
                     save_event("BIST", "RECOVER", bist_pct, t, b, "GREEN")
 
-            update_market_status(
-                bist_status=bist_new,
-                bist_change_1d=bist_pct
-            )
+            update_market_status(bist_status=bist_new, bist_change_1d=bist_pct)
             _last_status["bist"] = bist_new
+    else:
+        # BIST kapalıyken haberleri göster
+        print("  📰 BIST KAPALI - Pre-market haberler:")
+        haberler = get_news_headlines("BIST100 Turkey market news", 3)
+        if haberler:
+            for h in haberler:
+                print(f"    • {h}")
 
 # ============================================================
 # ANA DÖNGÜ
@@ -400,7 +512,7 @@ def check_all():
 def main():
     print("\n" + "="*60)
     print("🚀 ATLAS MAKRO PİYASA İZLEME SİSTEMİ")
-    print("📊 Google News RSS ile gerçek zamanlı haber")
+    print("📊 Google News RSS + Gerçek Veri Analizi")
     print("💱 BTC | 🇺🇸 S&P500 | 🇹🇷 BIST100")
     print("="*60 + "\n")
     
@@ -411,7 +523,9 @@ def main():
         btc_change_1h=0,
         spy_change_1d=0,
         bist_change_1d=0,
-        vix=20
+        vix=20,
+        us_premarket_skor=0,
+        us_premarket_yon="🟡 NÖTR"
     )
     
     while True:
