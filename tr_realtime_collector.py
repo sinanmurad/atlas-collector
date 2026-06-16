@@ -1058,6 +1058,15 @@ def bist_bot_should_sell(trade, current_price):
 def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction=None, score=0,
             reasons=None, price_change=0, layer=None):
     try:
+        # ── MAKRO KONTROL ────────────────────────────────────────
+        try:
+            ms = supabase.table("market_status").select("bist_status") \
+                .eq("id", 1).maybeSingle().execute()
+            if ms.data and ms.data.get("bist_status") == "RED":
+                print(f"  🔴 MAKRO RED — BIST düşüşte, {symbol} alımı durduruldu")
+                return False
+        except Exception:
+            pass
         open_trades = get_open_bist_trades(user_id)
         open_count = len(open_trades)
         stop, target = calc_bist_levels(price, price_change, symbol=symbol)
