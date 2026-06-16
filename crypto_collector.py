@@ -288,24 +288,24 @@ def get_coinbase_tickers():
 
 
 def get_binance_tickers():
+    """Binance ticker - Railway'de engellenmiş olabilir, hızlı dene geç."""
     urls = [
         "https://api1.binance.com/api/v3/ticker/24hr",
         "https://api2.binance.com/api/v3/ticker/24hr",
-        "https://api3.binance.com/api/v3/ticker/24hr",
-        "https://api4.binance.com/api/v3/ticker/24hr",
-        "https://api.binance.com/api/v3/ticker/24hr",
+        "https://data-api.binance.vision/api/v3/ticker/24hr",
     ]
     for url in urls:
         try:
-            r = requests.get(url, timeout=15)
+            r = requests.get(url, headers=HEADERS, timeout=5)
             if r.status_code == 200:
                 data = r.json()
-                if isinstance(data, list):
-                    print(f"  → Binance: {len(data)} parite ({url.split('/')[2]})")
+                if isinstance(data, list) and len(data) > 100:
+                    domain = url.split("/")[2]
+                    print(f"  → Binance: {len(data)} parite ({domain})")
                     return data
         except Exception:
             continue
-    print("⚠️ Binance: tüm endpointler başarısız")
+    # Sessizce geç — KuCoin zaten Binance'i kapsıyor
     return []
 
 
@@ -779,7 +779,8 @@ def get_coin_age_days(symbol, date_added=None):
 
 def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
                vol_chg, mcap, cmc_rank, tech, fg, orderbook=None,
-               suregen_candidate=False, binance_vol=0, on_coinbase=False):
+               suregen_candidate=False, binance_vol=0, on_coinbase=False,
+               in_trusted_db=False):
     # ============================================================
     # 📌 TODO (SUREGEN İZLEME — 15 Haz 2026'da eklendi):
     # "SUREGEN" layer'ı: 24s'te %8+ yürümüş ama anlık duraklamış
@@ -903,7 +904,14 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     # öğrenme sisteminin bu pattern'i ayrı takip etmesini sağlıyoruz.
     no_catalyst = vol_chg < 30 and (rsi is None or rsi > 55) and obv_trend != "up"
     if no_catalyst:
-        if ch24h >= 8:
+        if ch24h >= 30 and ch1h > 0:
+            # BSB yapısı: 24s güçlü yürüyüş + 1s hâlâ pozitif = momentum devam ediyor
+            layer = "SUREGEN"
+            score += 3  # güçlü momentum bonusu
+            reasons.append(f"🚀 Süregen güç — 24s %{ch24h:.1f}, 1s %{ch1h:.1f} devam ediyor")
+            print(f"  🔬 SUREGEN score_coin'e girdi: {symbol} | rsi:{rsi} "
+                  f"obv:{obv_trend} ch24h:{ch24h:.2f} (skor hesabı sürüyor...)")
+        elif ch24h >= 8:
             layer = "SUREGEN"
             reasons.append(f"⏩ Süregen momentum — 24s %{ch24h:.1f}, anlık duraklama")
             print(f"  🔬 SUREGEN score_coin'e girdi: {symbol} | rsi:{rsi} "
@@ -983,6 +991,10 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     if on_coinbase:
         score += 2
         reasons.append("🏦 Coinbase listeli — kurumsal onaylı")
+
+    if in_trusted_db:
+        score += 1
+        reasons.append("⭐ Güvenilir coin listesinde")
 
     if binance_vol and binance_vol > 5_000_000:  # $5M+ Binance hacmi
         score += 3
@@ -2197,10 +2209,22 @@ def scan_once(scan_count=0):
     # ── ÖNCE izleme listesini kontrol et ───────────────────
     check_watchlist_movement()
 
-    # ── Öğrenme sistemi — 3 taramada bir (ağır işlem) ──────
+    # ── Öğrenme sistemi — 3 taramada bir ──────────────────
     if scan_count % 3 == 0:
         check_signal_outcomes()
         update_learning_weights()
+
+    # ── Güvenilir coin listesi — Supabase'den yükle ────────
+    # Her 20 taramada bir güncelle (~saatte 1x)
+    if scan_count % 20 == 0 or not hasattr(scan_once, '_trusted_coins'):
+        try:
+            r = supabase.table("trusted_coins").select("symbol").execute()
+            scan_once._trusted_coins = {row["symbol"] for row in (r.data or [])}
+            print(f"  ✅ Güvenilir coin listesi: {len(scan_once._trusted_coins)} coin")
+        except Exception as e:
+            print(f"⚠️ trusted_coins yüklenemedi: {e}")
+            scan_once._trusted_coins = set()
+    trusted_coins_db = scan_once._trusted_coins
 
     fg = get_fear_greed()
     if fg:
@@ -2212,8 +2236,7 @@ def scan_once(scan_count=0):
     time.sleep(1)
     gateio = get_gateio_tickers()
     time.sleep(1)
-    binance = get_binance_tickers()
-    time.sleep(1)
+    binance = get_binance_tickers()  # Railway'de engellenmiş olabilir, sessiz geç
     kucoin = get_kucoin_tickers()
     time.sleep(1)
     huobi = get_huobi_tickers()
@@ -2222,7 +2245,7 @@ def scan_once(scan_count=0):
     time.sleep(1)
     cmc = get_cmc_coins()
 
-    # Güvenilir borsa listesi
+    # Güvenilir borsa listesi — Binance gelirse ekle, yoksa KuCoin+Huobi+Coinbase yeterli
     trusted_symbols = set()
     for t in binance:
         s = t.get("symbol", "")
@@ -2238,7 +2261,8 @@ def scan_once(scan_count=0):
             trusted_symbols.add(s[:-4].upper())
     for p in coinbase:
         trusted_symbols.add(p.get("base_currency", ""))
-    print(f"  → Güvenilir evren: {len(trusted_symbols)} coin (Binance+KuCoin+Huobi+Coinbase)")
+    sources = "Binance+" if binance else ""
+    print(f"  → Güvenilir evren: {len(trusted_symbols)} coin ({sources}KuCoin+Huobi+Coinbase)")
 
     coins = merge_exchange_data(mexc, gateio, cmc, binance, kucoin, huobi, coinbase)
     if not coins:
@@ -2316,18 +2340,24 @@ def scan_once(scan_count=0):
             orderbook = get_orderbook(symbol)
             time.sleep(0.2)
 
-            # ── GÜVENİLİR BORSA FİLTRESİ ────────────────────────
-            # Binance/KuCoin/Huobi/Coinbase'de listelenmiş coinler
-            # minimum kalite standardını geçmiş demektir.
-            # Bu borsalarda olmayan coinler ekstra sıkı filtreye girer.
-            in_trusted = symbol in trusted_symbols
+            # ── DİNAMİK KALİTE FİLTRESİ ─────────────────────────
+            # Statik liste yok — her taramada CMC + borsa verisinden otomatik
+            # BSB gibi coinler: CMC rank <500 + $10M mcap + güvenilir borsada
             mcap = coin.get("mcap", 0)
             cmc_rank = coin.get("cmc_rank", 9999)
+            in_trusted = symbol in trusted_symbols  # KuCoin/Huobi/Coinbase listeli
+
+            # Temel kalite eşiği
+            if mcap < 5_000_000:
+                continue  # $5M altı mcap — likidite yok
 
             if not in_trusted:
-                # Güvenilir borsada yok — çok sıkı filtre
-                if mcap < 10_000_000 or cmc_rank > 1000:
-                    continue  # sessizce ele, log spam olmasın
+                # Güvenilir borsada listeli değil — çok sıkı
+                if mcap < 50_000_000 or cmc_rank > 300:
+                    continue
+
+            # trusted_coins DB'de varsa ekstra bonus olarak kullan (engel değil)
+            in_trusted_db = symbol in trusted_coins_db if trusted_coins_db else False
 
             result = score_coin(
                 symbol, coin["name"], price,
@@ -2337,6 +2367,7 @@ def scan_once(scan_count=0):
                 suregen_candidate=suregen_candidate,
                 binance_vol=coin.get("binance_vol", 0),
                 on_coinbase=coin.get("on_coinbase", False),
+                in_trusted_db=in_trusted_db,
             )
 
             if result:
