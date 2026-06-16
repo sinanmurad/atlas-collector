@@ -105,22 +105,38 @@ def get_btc_change():
 
 
 def get_spy_change():
-    """S&P500 gunluk degisim — Finnhub REST (us_collector ile ayni kaynak)."""
+    """S&P500 gunluk degisim — Finnhub REST veya MEXC SPX."""
+    # Önce Finnhub dene
     finnhub_key = os.environ.get("FINNHUB_KEY", "")
-    if not finnhub_key:
-        return None, None
+    if finnhub_key:
+        try:
+            r = requests.get(
+                f"https://finnhub.io/api/v1/quote?symbol=SPY&token={finnhub_key}",
+                headers=HEADERS, timeout=8)
+            if r.status_code == 200:
+                d = r.json()
+                price = d.get("c", 0)
+                prev  = d.get("pc", 0)
+                if price and prev:
+                    return ((price - prev) / prev) * 100, price
+        except Exception:
+            pass
+
+    # Fallback: MEXC'te SPX/USDT futures (S&P500 endeks takipçisi)
     try:
         r = requests.get(
-            f"https://finnhub.io/api/v1/quote?symbol=SPY&token={finnhub_key}",
+            "https://api.mexc.com/api/v3/ticker/24hr?symbol=SPXUSDT",
             headers=HEADERS, timeout=8)
         if r.status_code == 200:
             d = r.json()
-            price = d.get("c", 0)
-            prev  = d.get("pc", 0)
+            price = float(d.get("lastPrice", 0) or 0)
+            prev  = float(d.get("prevClosePrice", 0) or 0)
             if price and prev:
-                return ((price - prev) / prev) * 100, price
+                pct = ((price - prev) / prev) * 100
+                return pct, price
     except Exception:
         pass
+
     return None, None
 
 
