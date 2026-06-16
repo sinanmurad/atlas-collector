@@ -551,30 +551,23 @@ def get_atr(symbol, period=14):
 
 
 def get_index_membership(symbol):
-    """Hissenin BIST30/BIST100/BIST50 üyeliğini döndürür.
-    Önce bist_fundamentals DB'den okur, yoksa isyatirim'den çeker."""
+    """Hissenin BIST30/BIST50/BIST100 üyeliğini döndürür.
+    Dış API gerektirmez — bist_index_members tablosundan okur."""
     global _index_cache
     if symbol in _index_cache:
         return _index_cache[symbol]
-
     try:
-        r = supabase.table("bist_fundamentals").select("index_member").eq("symbol", symbol).execute()
-        if r.data and r.data[0].get("index_member"):
-            idx = r.data[0]["index_member"]
-            _index_cache[symbol] = idx
-            return idx
-    except Exception:
-        pass
-
-    # Temel veri çekerken endeks de gelecek
-    fund = get_fundamental_data(symbol)
-    if fund:
-        idx = fund.get("index_member", "")
+        r = supabase.table("bist_index_members") \
+            .select("index_name") \
+            .eq("symbol", symbol) \
+            .maybeSingle() \
+            .execute()
+        idx = r.data["index_name"] if r.data else ""
         _index_cache[symbol] = idx
         return idx
-
-    _index_cache[symbol] = ""
-    return ""
+    except Exception:
+        _index_cache[symbol] = ""
+        return ""
 
 
 def analyze_kap_with_groq(kap_text):
@@ -856,21 +849,19 @@ def calculate_signal_score(price_change, volume_ratio, kap, symbol=None):
     # ── KATMAN 4: ENDEKs ÜYELİĞİ + ATR KALİTESİ ────────────────
     if symbol:
         idx = get_index_membership(symbol)
-        if idx:
-            if "XU030" in idx or "BIST30" in idx.upper():
-                score += 3
-                reasons.append("🏆 BIST30 — likiditesi garantili, kurumsal takipli")
-            elif "XU100" in idx or "BIST100" in idx.upper():
-                score += 2
-                reasons.append("📌 BIST100 üyesi — kurumsal ilgi")
-            elif "XU050" in idx or "BIST50" in idx.upper():
-                score += 1
-                reasons.append("📌 BIST50 üyesi")
-            else:
-                # Endeks dışı — manipülasyon riski, eşiği yükselt
-                if not kap or score < 8:
-                    if score < 6:
-                        return "NORMAL", [], 0, None
+        if idx == "BIST30":
+            score += 3
+            reasons.append("🏆 BIST30 — likiditesi garantili, kurumsal takipli")
+        elif idx == "BIST50":
+            score += 2
+            reasons.append("📌 BIST50 üyesi — kurumsal ilgi")
+        elif idx == "BIST100":
+            score += 1
+            reasons.append("📌 BIST100 üyesi")
+        else:
+            # Endeks dışı — manipülasyon riski, düşük skorda ele
+            if score < 6:
+                return "NORMAL", [], 0, None
 
         # ATR — stop/hedef kalitesi için DB'ye yaz (skor etkilemez ama izlenir)
         atr = get_atr(symbol)
@@ -1311,7 +1302,9 @@ def scan_once(symbols, avg_volumes, send_push=True, is_night=False):
                 continue
 
             last_time = get_last_signal_time(symbol)
-            if now - last_time < 3600:
+            # Gece sinyali vermiş olabilir — canlı taramada 30 dk cooldown yeterli
+            cooldown = 1800 if not is_night else 7200
+            if now - last_time < cooldown:
                 signal_cache[symbol] = last_time
                 continue
 
@@ -1372,6 +1365,8 @@ def scan_once(symbols, avg_volumes, send_push=True, is_night=False):
                 "pro_explanation": pro,
                 "price": price,
                 "volume_ratio": round(volume_ratio, 2),
+                "conviction": conviction,
+                "score": score,
                 "market": "BIST",
                 "created_at": datetime.now(timezone.utc).isoformat()
             }).execute()
@@ -1431,14 +1426,14 @@ def send_morning_signals():
             signal_id = signal["id"]
             signal_type = signal.get("signal_type", "")
 
-            if signal_type == "critical":
-                emoji, conviction = "🔥", "CRITICAL"
-            elif signal_type == "kap_momentum":
-                emoji, conviction = "📰", "HIGH"
-            elif signal_type in ["HIGH", "momentum"]:
-                emoji, conviction = "⚡", "HIGH"
-            else:
-                emoji, conviction = "🚀", "MEDIUM"
+            # Önce DB'deki conviction kolonunu oku (yeni format)
+            # Yoksa signal_type'tan çıkar (eski format geriye dönük uyumluluk)
+            conviction = signal.get("conviction") or (
+                "CRITICAL" if signal_type == "critical" else
+                "HIGH" if signal_type in ["HIGH", "momentum", "kap_momentum"] else
+                "MEDIUM"
+            )
+            emoji = "🔥" if conviction == "CRITICAL" else "⚡" if conviction == "HIGH" else "🚀"
 
             # Sabah anlık fiyatı çek — bot alım ve stop/hedef bu fiyat üzerinden
             morning_data = get_price_data(symbol)
@@ -1451,8 +1446,6 @@ def send_morning_signals():
                 signal_id=signal_id
             )
 
-            # Gece sıkı denetimi geçen sinyal için sabah fiyatıyla
-            # bot alım + stop/hedef + öğrenme kaydı başlat.
             score = signal.get("score") or (10 if conviction == "CRITICAL" else 7 if conviction == "HIGH" else 4)
             reasons = [signal.get("description", "")]
             layer = "KAP" if signal_type == "kap_momentum" else "HACIM"
@@ -1462,7 +1455,7 @@ def send_morning_signals():
                 bot_process_morning_signal(symbol, morning_price, price_change_morning,
                                             conviction, signal_id, score, reasons, layer)
             else:
-                print(f"  u23edufe0f {symbol} {conviction} u2014 sadece push, bot alu0131mu0131 yok")
+                print(f"  ⏭️ {symbol} {conviction} — sadece push, bot alımı yok")
 
             time.sleep(0.5)
 
@@ -1518,11 +1511,11 @@ def main():
                 time.sleep(600)
 
             # ============================================================
-            # SABAH SİNYAL GÖNDERME: 06:00-06:29 UTC (09:00-09:29 TR)
-            # Gece hazırlanan sinyalleri push et + sabah fiyatıyla bot alım
+            # SABAH SİNYAL GÖNDERME: 06:00-06:59 UTC (09:00-09:59 TR)
+            # BIST 09:30'da açılır — 09:59'a kadar erken alım yapılabilir
             # ============================================================
-            elif hour == 6 and minute < 30 and not morning_signals_sent:
-                print(f"\n🦅 SABAH SİNYALLERİ — {now_utc.strftime('%H:%M UTC')} (09:00-09:30 TR)")
+            elif hour == 6 and not morning_signals_sent:
+                print(f"\n🦅 SABAH SİNYALLERİ — {now_utc.strftime('%H:%M UTC')} (09:00-09:59 TR)")
                 send_morning_signals()
                 morning_signals_sent = True
                 night_scan_done = False
