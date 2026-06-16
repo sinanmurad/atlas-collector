@@ -800,10 +800,21 @@ def calculate_signal_score(price_change, volume_ratio, kap, symbol=None):
         if not kap or (kap_ai and kap_ai["sentiment"] != "pozitif"):
             return "NORMAL", [], 0, None
 
-    # KAP yoksa hacim+fiyat her ikisi de güçlü olmalı
+    # KAP yoksa — endeks üyesi hisseler için hacim/fiyat eşiği düşük,
+    # endeks dışı hisseler için her ikisi de güçlü olmalı
     if not kap:
-        if volume_ratio < 3 or price_change < 3:
-            return "NORMAL", [], 0, None
+        idx_check = get_index_membership(symbol) if symbol else ""
+        if idx_check in ("BIST30", "BIST50"):
+            # Büyük hisseler için sadece bir tanesi yeterli
+            if volume_ratio < 2 and price_change < 2:
+                return "NORMAL", [], 0, None
+        elif idx_check == "BIST100":
+            if volume_ratio < 2.5 and price_change < 2.5:
+                return "NORMAL", [], 0, None
+        else:
+            # Endeks dışı — her ikisi de güçlü olmalı
+            if volume_ratio < 3 or price_change < 3:
+                return "NORMAL", [], 0, None
 
     # ── KATMAN 3: TEMEL ANALİZ ───────────────────────────────────
     fund = get_fundamental_data(symbol) if symbol else None
