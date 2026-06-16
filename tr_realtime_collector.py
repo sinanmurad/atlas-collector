@@ -1413,9 +1413,9 @@ def scan_once(symbols, avg_volumes, send_push=True, is_night=False):
     return signals_found
 
 
-def send_morning_signals():
-    """Gece hazırlanan sinyalleri 09:00-09:30 TR'de push ile gönder
-    VE sabah anlık fiyatıyla bot alım/stop/hedef işlemini başlatır."""
+def send_morning_push_only():
+    """09:00-09:29 TR — Sadece push bildirimi gönder, bot alımı YOK.
+    Borsa henüz kapalı, fiyat güvenilmez."""
     try:
         since = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
         r = supabase.table("tr_signals") \
@@ -1429,7 +1429,46 @@ def send_morning_signals():
             print("⚠️ Sabah için sinyal bulunamadı")
             return
 
-        print(f"📱 {len(r.data)} sabah sinyali işleniyor...")
+        print(f"📱 {len(r.data)} sabah sinyali push ediliyor (bot alımı 10:00'da)...")
+        for signal in r.data:
+            symbol = signal["symbol"]
+            night_price = signal.get("price", 0)
+            value = signal.get("value", 0)
+            volume_ratio = signal.get("volume_ratio", 0)
+            signal_id = signal["id"]
+            conviction = signal.get("conviction") or "HIGH"
+            emoji = "🔥" if conviction == "CRITICAL" else "⚡"
+
+            send_push_notification(
+                title=f"{emoji} {symbol} — Sabah Sinyali (Borsa 10:00'da açılıyor)",
+                body=f"{night_price:.2f} TL | %{value:.1f} | Hacim: {volume_ratio:.1f}x | Bot 10:00'da alacak",
+                market="BIST",
+                signal_id=signal_id
+            )
+            time.sleep(0.5)
+
+        print("✅ Sabah push'ları gönderildi.")
+    except Exception as e:
+        print(f"❌ Sabah push hatası: {e}")
+
+
+def send_morning_buys():
+    """10:00-10:14 TR — Borsa açıldı, push edilen sinyalleri GERÇEK fiyattan al.
+    Push ile %100 aynı sinyaller — sadece fiyat şimdi gerçek."""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=13)).isoformat()
+        r = supabase.table("tr_signals") \
+            .select("*") \
+            .gte("created_at", since) \
+            .order("created_at", ascending=False) \
+            .limit(5) \
+            .execute()
+
+        if not r.data:
+            print("⚠️ Bot alımı için sinyal bulunamadı")
+            return
+
+        print(f"🤖 {len(r.data)} sinyal için borsa açılış alımı yapılıyor...")
         for signal in r.data:
             symbol = signal["symbol"]
             night_price = signal.get("price", 0)
@@ -1437,43 +1476,37 @@ def send_morning_signals():
             volume_ratio = signal.get("volume_ratio", 0)
             signal_id = signal["id"]
             signal_type = signal.get("signal_type", "")
-
-            # Önce DB'deki conviction kolonunu oku (yeni format)
-            # Yoksa signal_type'tan çıkar (eski format geriye dönük uyumluluk)
             conviction = signal.get("conviction") or (
-                "CRITICAL" if signal_type == "critical" else
-                "HIGH" if signal_type in ["HIGH", "momentum", "kap_momentum"] else
-                "MEDIUM"
+                "CRITICAL" if signal_type == "critical" else "HIGH"
             )
-            emoji = "🔥" if conviction == "CRITICAL" else "⚡" if conviction == "HIGH" else "🚀"
-
-            # Sabah anlık fiyatı çek — bot alım ve stop/hedef bu fiyat üzerinden
-            morning_data = get_price_data(symbol)
-            morning_price = morning_data["price"] if morning_data and morning_data.get("price") else night_price
-
-            send_push_notification(
-                title=f"{emoji} {symbol} — Sabah Sinyali",
-                body=f"{morning_price:.2f} TL | %{value:.1f} | Hacim: {volume_ratio:.1f}x",
-                market="BIST",
-                signal_id=signal_id
-            )
-
-            score = signal.get("score") or (10 if conviction == "CRITICAL" else 7 if conviction == "HIGH" else 4)
+            score = signal.get("score") or (10 if conviction == "CRITICAL" else 7)
             reasons = [signal.get("description", "")]
             layer = "KAP" if signal_type == "kap_momentum" else "HACIM"
-            price_change_morning = ((morning_price - night_price) / night_price * 100) if night_price else 0
 
-            if conviction == "CRITICAL":
-                bot_process_morning_signal(symbol, morning_price, price_change_morning,
-                                            conviction, signal_id, score, reasons, layer)
-            else:
-                print(f"  ⏭️ {symbol} {conviction} — sadece push, bot alımı yok")
+            if conviction != "CRITICAL":
+                print(f"  ⏭️ {symbol} {conviction} — bot alımı yok (sadece CRITICAL)")
+                continue
 
+            # Borsa açıldı — gerçek anlık fiyatı çek
+            open_data = get_price_data(symbol)
+            open_price = open_data["price"] if open_data and open_data.get("price") else night_price
+
+            if open_price <= 0:
+                print(f"  ⚠️ {symbol} fiyat alınamadı — alım atlandı")
+                continue
+
+            price_change = ((open_price - night_price) / night_price * 100) if night_price else value
+            print(f"  🏦 {symbol}: Gece {night_price:.2f} TL → Açılış {open_price:.2f} TL ({price_change:+.2f}%)")
+
+            bot_process_morning_signal(
+                symbol, open_price, price_change,
+                conviction, signal_id, score, reasons, layer
+            )
             time.sleep(0.5)
 
-        print("✅ Sabah sinyalleri işlendi (push + bot alım).")
+        print("✅ Açılış alımları tamamlandı.")
     except Exception as e:
-        print(f"❌ Sabah sinyal gönderme hatası: {e}")
+        print(f"❌ Açılış alım hatası: {e}")
 
 
 def main():
@@ -1496,6 +1529,28 @@ def main():
     scan_count = 0
     night_scan_done = False
     morning_signals_sent = False
+    morning_buys_done = False
+
+    # ── AÇIK POZİSYON TAKİP THREAD'İ ──────────────────────────────
+    # Borsa açıkken 15 saniyede bir açık pozisyonları kontrol eder.
+    # Sinyal gelir gelmez stop/hedef/reversal anında tetiklenir.
+    import threading
+    _position_monitor_active = False
+
+    def _position_monitor_loop():
+        while True:
+            try:
+                now_h = datetime.now(timezone.utc).hour
+                # Sadece borsa saatlerinde çalış: 07:00-15:00 UTC (10:00-18:00 TR)
+                if 7 <= now_h < 15:
+                    bot_check_open_positions()
+            except Exception:
+                pass
+            time.sleep(15)  # 15 saniyede bir kontrol
+
+    monitor_thread = threading.Thread(target=_position_monitor_loop, daemon=True)
+    monitor_thread.start()
+    print("👁️ Pozisyon izleme başlatıldı (15s aralık)")
 
     while True:
         try:
@@ -1504,45 +1559,58 @@ def main():
             minute = now_utc.minute
 
             # ============================================================
-            # GECE MODU: 14:00-05:59 UTC (17:00-08:59 TR)
-            # Borsa kapandıktan sonra KAP-bazlı analiz yap
+            # GECE MODU: 15:00-06:59 UTC (18:00-09:59 TR)
+            # Borsa 18:00 TR'de kapanır, 10:00 TR'de açılır
             # ============================================================
-            if hour >= 14 or hour < 6:
+            if hour >= 15 or hour < 6:
                 if not night_scan_done:
                     print(f"\n🌙 GECE MOTORU başlıyor... {now_utc.strftime('%H:%M UTC')}")
-                    signal_cache.clear()  # Eski cache temizle
+                    signal_cache.clear()
                     found = scan_once(symbols, avg_volumes, send_push=False, is_night=True)
                     check_signal_outcomes(market="BIST", price_fetcher=lambda s: (get_price_data(s) or {}).get("price"))
                     update_learning_weights(market="BIST")
                     log_nightly_learning_summary(market="BIST")
                     night_scan_done = True
                     morning_signals_sent = False
-                    print(f"✅ Gece taraması bitti. {found} sinyal hazırlandı. Sabah 09:00-09:30 TR'de gönderilecek.")
+                    morning_buys_done = False
+                    print(f"✅ Gece taraması bitti. {found} sinyal hazırlandı.")
                 else:
                     print(f"💤 Gece bekleniyor... {now_utc.strftime('%H:%M UTC')}")
                 time.sleep(600)
 
             # ============================================================
-            # SABAH SİNYAL GÖNDERME: 06:00-06:59 UTC (09:00-09:59 TR)
-            # BIST 09:30'da açılır — 09:59'a kadar erken alım yapılabilir
+            # SABAH PUSH: 06:00-06:29 UTC (09:00-09:29 TR)
+            # Borsa henüz kapalı — sadece push bildirimi gönder
+            # Bot alımı YAPMA, fiyat gerçek değil
             # ============================================================
-            elif hour == 6 and not morning_signals_sent:
-                print(f"\n🦅 SABAH SİNYALLERİ — {now_utc.strftime('%H:%M UTC')} (09:00-09:59 TR)")
-                send_morning_signals()
+            elif hour == 6 and minute < 30 and not morning_signals_sent:
+                print(f"\n📱 SABAH PUSH — {now_utc.strftime('%H:%M UTC')} (09:00-09:29 TR)")
+                send_morning_push_only()
                 morning_signals_sent = True
                 night_scan_done = False
                 time.sleep(120)
 
             # ============================================================
-            # CANLI TARAMA: 06:30-13:59 UTC (09:30-16:59 TR)
-            # Borsa açık — 2 dk'da bir tarama
+            # BOT ALIM: 07:00-07:01 UTC (10:00-10:01 TR)
+            # Borsa tam açılışta — ilk 1 dakikada gerçek fiyattan al
+            # 5 dk sonra fiyat %3 kayabilir, en dipten almak için
+            # açılış anını yakala
             # ============================================================
-            elif (hour == 6 and minute >= 30) or (7 <= hour < 14):
+            elif hour == 7 and minute < 2 and not morning_buys_done:
+                print(f"\n🤖 BOT ALIM ZAMANI — {now_utc.strftime('%H:%M UTC')} (10:00-10:14 TR)")
+                send_morning_buys()
+                morning_buys_done = True
+                time.sleep(120)
+
+            # ============================================================
+            # CANLI TARAMA: 07:00-14:59 UTC (10:00-17:59 TR)
+            # BIST 10:00 TR'de açılır (07:00 UTC) — sürekli işlem 18:00'e kadar
+            # Açık pozisyonlar ayrı thread'de 15s'de bir takip ediliyor
+            # ============================================================
+            elif 7 <= hour < 15:
                 print(f"\n📡 Canlı tarama... {now_utc.strftime('%H:%M:%S')} UTC")
                 found = scan_once(symbols, avg_volumes)
                 scan_count += 1
-                if scan_count % 6 == 0:
-                    bot_check_open_positions()
                 if scan_count % 12 == 0:
                     check_signal_results()
                 if scan_count % 3 == 0:
