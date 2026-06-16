@@ -884,6 +884,15 @@ def us_bot_should_sell(trade, current_price):
 
 def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons, trend_data, layer=None):
     try:
+        # ── MAKRO KONTROL ────────────────────────────────────────
+        try:
+            ms = supabase.table("market_status").select("us_status") \
+                .eq("id", 1).maybeSingle().execute()
+            if ms.data and ms.data.get("us_status") == "RED":
+                print(f"  🔴 MAKRO RED — S&P500 düşüşte, {symbol} alımı durduruldu")
+                return False
+        except Exception:
+            pass
         open_trades = get_open_us_trades(user_id)
         open_count = len(open_trades)
         stop, target = calc_us_levels(price, trend_data)
