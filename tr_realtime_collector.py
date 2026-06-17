@@ -1074,6 +1074,12 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction=None,
             pass
         open_trades = get_open_bist_trades(user_id)
         open_count = len(open_trades)
+
+        # Aynı sembolde açık pozisyon varsa tekrar alma
+        open_symbols = [t.get("symbol") for t in open_trades]
+        if symbol in open_symbols:
+            print(f"  ⏭️ {symbol} zaten açık pozisyonda — tekrar alım yapılmıyor")
+            return False
         stop, target = calc_bist_levels(price, price_change, symbol=symbol)
         entry_reason = " | ".join((reasons or [])[:3]) if reasons else (conviction or "")
         is_exceptional = False
@@ -1107,8 +1113,8 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction=None,
                     return False
                 is_exceptional = True
 
-        invest = min(balance * 0.10, 100)
-        if invest < 10:
+        invest = min(balance * 0.10, 1000)  # Max ₺1.000 per trade (TL bazlı)
+        if invest < 100:  # Min ₺100
             return False
         quantity = invest / price
         supabase.table("demo_trades").insert({
@@ -1127,7 +1133,7 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction=None,
         tag = " 🌟İSTİSNA" if is_exceptional else ""
         print(f"✅ BOT ALIM{tag}: {user_id} → {symbol} @ {price:.2f} TL | Stop:{stop} Hedef:{target}")
         log_activity("ALIM", symbol=symbol, price=price,
-                      detail=f"${invest:.0f} yatırım | Stop:{stop} | Hedef:{target}" + (" | İSTİSNAİ" if is_exceptional else ""),
+                      detail=f"₺{invest:.0f} yatırım | Stop:{stop} | Hedef:{target}" + (" | İSTİSNAİ" if is_exceptional else ""),
                       conviction=conviction, market="BIST")
         record_signal_outcome(signal_id, symbol, layer, conviction, score, price, market="BIST")
         return True
@@ -1151,7 +1157,7 @@ def bot_sell(trade, current_price, exit_reason=""):
         if portfolio.data:
             new_balance = portfolio.data["bist_balance"] + (trade["quantity"] * current_price)
             supabase.table("demo_portfolios").update({"bist_balance": round(new_balance, 2)}).eq("user_id", trade["user_id"]).execute()
-        print(f"✅ BOT SATIŞ ({exit_reason}): {trade['symbol']} | K/Z: {profit_loss:.2f} TL")
+        print(f"✅ BOT SATIŞ ({exit_reason}): {trade['symbol']} | K/Z: ₺{profit_loss:.2f}")
         log_activity("SATIM", symbol=trade["symbol"], price=current_price,
                       pnl=round(profit_loss, 2), pnl_pct=round(pct, 2),
                       detail=exit_reason,
