@@ -1411,6 +1411,11 @@ def scan_once(symbols, avg_volumes, send_push=True, is_night=False):
                           detail=f"Score:{score} | %{price_change:.1f} | Hacim:{volume_ratio:.1f}x",
                           conviction=conviction, market="BIST")
 
+            # HIGH sinyalleri de signal_outcomes'a kaydet — bot almasa bile takip et
+            if conviction == "HIGH" and signal_id:
+                record_signal_outcome(signal_id, symbol, layer, conviction, score, price, market="BIST")
+                print(f"  📊 {symbol} HIGH — signal_outcomes takibe alındı (bot almıyor)")
+
             if send_push:
                 bot_process_signal(symbol, price, price_change, volume_ratio, conviction, signal_id, score, reasons, layer)
 
