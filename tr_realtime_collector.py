@@ -1588,32 +1588,24 @@ def main():
                 time.sleep(600)
 
             # ============================================================
-            # SABAH PUSH: 06:00-06:29 UTC (09:00-09:29 TR)
-            # Borsa henüz kapalı — sadece push bildirimi gönder
-            # Bot alımı YAPMA, fiyat gerçek değil
+            # SABAH PUSH + SON TARAMA: 06:00-06:45 UTC (09:00-09:45 TR)
+            # Gece sinyallerini push et + son tarama yap
+            # 09:45 TR'ye kadar tüm sinyaller push edilmiş olacak
+            # Bot alımı YAPMA — 07:00 UTC'de gerçek fiyattan al
             # ============================================================
-            elif hour == 6 and minute < 30 and not morning_signals_sent:
-                print(f"\n📱 SABAH PUSH — {now_utc.strftime('%H:%M UTC')} (09:00-09:29 TR)")
+            elif hour == 6 and minute < 46 and not morning_signals_sent:
+                print(f"\n📱 SABAH PUSH + SON TARAMA — {now_utc.strftime('%H:%M UTC')} (09:00-09:45 TR)")
+                # 1. Gece sinyallerini push et
                 send_morning_push_only()
-                morning_signals_sent = True
-                night_scan_done = False
-                time.sleep(120)
-
-            # ============================================================
-            # AÇILIŞ ÖNCESİ SON TARAMA: 06:45-06:59 UTC (09:45-09:59 TR)
-            # Sabah erken hareket eden hisseleri yakala
-            # OYYAT gibi gece değil sabah hareket eden hisseler için
-            # Push gönder — bot 07:00'de gerçek fiyattan alım yapacak
-            # ============================================================
-            elif hour == 6 and minute >= 45 and not morning_buys_done:
-                print(f"\n🔍 AÇILIŞ ÖNCESİ SON TARAMA — {now_utc.strftime('%H:%M UTC')} (09:45-09:59 TR)")
+                # 2. Son tarama — sabah erken hareket edenleri yakala
                 found = scan_once(symbols, avg_volumes)
                 if found:
-                    print(f"  ✅ {len(found)} sinyal bulundu — 07:00'de alım yapılacak")
-                    # Push gönder ama alım yapma — borsa henüz kapalı
                     for sig in found:
                         if sig.get("conviction") == "CRITICAL":
                             send_signal_notification(sig)
+                morning_signals_sent = True
+                night_scan_done = False
+                print(f"  ✅ Tüm sinyaller push edildi. Bot 07:00 UTC'de alım yapacak.")
                 time.sleep(120)
 
             # ============================================================
@@ -1634,6 +1626,34 @@ def main():
             # Açık pozisyonlar ayrı thread'de 15s'de bir takip ediliyor
             # ============================================================
             elif 7 <= hour < 15:
+                # ── KAP TETİKLEMELİ ANLIK TARAMA ────────────────────
+                # Her 60 saniyede yeni KAP bildirimi var mı kontrol et
+                # Yeni bildirim varsa o hisseyi hemen tara — 15 dk bekleme
+                try:
+                    since_kap = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%d.%m.%Y %H:%M:%S")
+                    kap_r = supabase.table("disclosures") \
+                        .select("stock_codes, title, publish_date") \
+                        .gt("collected_at", (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()) \
+                        .neq("stock_codes", "") \
+                        .execute()
+
+                    if kap_r.data:
+                        for kap_row in kap_r.data:
+                            codes = kap_row.get("stock_codes", "")
+                            title = kap_row.get("title", "")
+                            # stock_codes: "ENTRA" veya "ISMEN, IYM" formatında
+                            for code in [c.strip() for c in codes.split(",")]:
+                                if not code or len(code) < 2:
+                                    continue
+                                print(f"\n⚡ KAP TETİKLEME: {code} — {title[:60]}")
+                                # Sadece bu hisseyi anında tara
+                                kap_found = scan_once([code], avg_volumes)
+                                if kap_found:
+                                    print(f"  🎯 KAP tetiklemeli sinyal: {code}")
+                except Exception as kap_err:
+                    print(f"⚠️ KAP tetikleme hatası: {kap_err}")
+
+                # ── NORMAL 15 DAKİKALIK TARAMA ───────────────────────
                 print(f"\n📡 Canlı tarama... {now_utc.strftime('%H:%M:%S')} UTC")
                 found = scan_once(symbols, avg_volumes)
                 scan_count += 1
