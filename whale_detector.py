@@ -1071,7 +1071,7 @@ def run_premarket_scan():
             if not trend:
                 continue
 
-            if not earnings and not (1.0 <= trend["last_close"] <= 20.0):
+            if not earnings and not catalyst:
                 continue
 
             analyst = get_analyst_rating(symbol)
@@ -1219,9 +1219,15 @@ def send_morning_signals():
                 signal_id=signal_id
             )
 
+            # HIGH sinyalleri signal_outcomes'a kaydet — sonuç takibi için
+            if conviction == "HIGH":
+                record_signal_outcome(signal_id, symbol, "PREMARKET", conviction, score, price, market="US")
+                print(f"  📊 {symbol} HIGH — signal_outcomes'a kaydedildi (bot almıyor)")
+
             # CRITICAL ise bot alımı da yap
             if conviction == "CRITICAL" and price > 0:
                 print(f"  🤖 {symbol} CRITICAL — bot alımı başlatılıyor...")
+                record_signal_outcome(signal_id, symbol, "PREMARKET", conviction, score, price, market="US")
                 bot_process_signal(
                     symbol=symbol,
                     price=price,
@@ -1334,13 +1340,21 @@ def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
                       conviction=conviction, market="US")
 
         trend_for_levels = get_5day_trend(symbol)
-        bot_process_signal(
-            symbol, price, price_change, volume_ratio, conviction, signal_id,
-            score=score,
-            reasons=[catalyst["headline"]] if catalyst else [],
-            trend_data=trend_for_levels,
-            layer=layer
-        )
+
+        # HIGH sinyalleri de signal_outcomes'a kaydet — bot almasa bile takip et
+        if conviction == "HIGH" and signal_id:
+            record_signal_outcome(signal_id, symbol, layer, conviction, score, price, market="US")
+            print(f"  📊 HIGH sinyal takibe alındı (bot almıyor, sonuç izleniyor)")
+
+        # Sadece CRITICAL sinyallerde bot alımı yap
+        if conviction == "CRITICAL":
+            bot_process_signal(
+                symbol, price, price_change, volume_ratio, conviction, signal_id,
+                score=score,
+                reasons=[catalyst["headline"]] if catalyst else [],
+                trend_data=trend_for_levels,
+                layer=layer
+            )
 
         push_body = f"${price:.2f} | {price_change:+.1f}% | Vol: {volume_ratio:.1f}x"
         if company_name:
