@@ -1397,9 +1397,9 @@ def on_error(ws, error):
 
 
 def on_close(ws, close_status_code, close_msg):
-    print("🔌 Bağlantı kapandı, 10sn sonra yeniden...")
+    print("🔌 Bağlantı kapandı, 10sn sonra yeniden bağlanacak...")
     time.sleep(10)
-    connect_websocket()
+    # Ana döngü yeniden bağlanacak — burada çağırma
 
 
 def connect_websocket():
@@ -1460,8 +1460,8 @@ def start():
             try:
                 if is_market_open():
                     bot_check_open_positions()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ Pozisyon izleme hatası: {e}")
             time.sleep(15)
 
     monitor = threading.Thread(target=_monitor_thread, daemon=True)
@@ -1474,6 +1474,8 @@ def start():
             hour = now_utc.hour
             minute = now_utc.minute
 
+            print(f"⏰ US döngü: {now_utc.strftime('%H:%M UTC')} | market_open={is_market_open()} | weekday={now_utc.weekday()}")
+
             # ── Gece watchlist yenile ────────────────────────────
             if hour == 2 and minute < 5 and time.time() - last_watchlist_refresh > 3600:
                 refresh_watchlist_background()
@@ -1484,13 +1486,16 @@ def start():
                 morning_buys_done = False
 
             # ============================================================
-            # GECE MODU: 20:00-12:29 UTC (23:00-15:29 TR)
+            # GECE MODU: 20:00-12:29 UTC
             # ============================================================
             if hour >= 20 or hour < 12:
                 if not night_scan_done:
                     print(f"\n🌙 US GECE MOTORU başlıyor... {now_utc.strftime('%H:%M UTC')}")
-                    premarket_signal_cache.clear()
-                    run_premarket_scan()
+                    try:
+                        premarket_signal_cache.clear()
+                        run_premarket_scan()
+                    except Exception as e:
+                        print(f"⚠️ Gece tarama hatası: {e}")
                     night_scan_done = True
                     morning_push_sent = False
                     morning_buys_done = False
@@ -1499,37 +1504,47 @@ def start():
                 time.sleep(600)
 
             # ============================================================
-            # SABAH PUSH: 12:30-13:29 UTC (15:30-16:29 TR)
-            # Borsa henüz kapalı — sadece push, alım YOK
+            # SABAH PUSH: 12:30-13:29 UTC
             # ============================================================
             elif (hour == 12 and minute >= 30) or (hour == 13 and minute < 30):
                 if not morning_push_sent:
-                    print(f"\n📱 US SABAH PUSH — {now_utc.strftime('%H:%M UTC')} (15:30 TR)")
-                    send_morning_signals()  # push + CRITICAL ise alım
+                    print(f"\n📱 US SABAH PUSH — {now_utc.strftime('%H:%M UTC')}")
+                    try:
+                        send_morning_signals()
+                    except Exception as e:
+                        print(f"⚠️ Sabah push hatası: {e}")
                     morning_push_sent = True
                     night_scan_done = False
                 time.sleep(120)
 
             # ============================================================
-            # BORSA AÇIK: 13:30-20:00 UTC (16:30-23:00 TR)
-            # WebSocket ile canlı takip — pozisyon izleme thread'de
+            # BORSA AÇIK: 13:30-20:00 UTC
             # ============================================================
             elif is_market_open():
-                morning_push_sent = True  # Açıkken push'u tekrar gönderme
+                morning_push_sent = True
                 print(f"📡 US WebSocket bağlanıyor... ({len(active_symbols)} hisse)")
-                connect_websocket()
+                try:
+                    connect_websocket()
+                except Exception as e:
+                    print(f"⚠️ WebSocket hatası: {e}")
+                    time.sleep(30)
 
             # ============================================================
-            # ARA: 13:00-13:29 UTC
+            # ARA DÖNEM
             # ============================================================
             else:
                 if hour == 20 and minute < 5:
-                    bot_check_open_positions()
+                    try:
+                        bot_check_open_positions()
+                    except Exception as e:
+                        print(f"⚠️ Kapanış kontrol hatası: {e}")
                 print(f"💤 US bekleniyor. {now_utc.strftime('%H:%M UTC')}")
-                time.sleep(300)
+                time.sleep(60)
 
         except Exception as e:
             print(f"❌ Ana döngü hatası: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(60)
 
 
