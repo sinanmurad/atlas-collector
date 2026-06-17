@@ -1064,6 +1064,15 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
             print(f"  🔬 SUREGEN SONUÇ: {symbol} → ELENDİ (score={score} < 9)")
         return None
 
+    # SUREGEN ve MOMENTUM için daha düşük CRITICAL eşiği
+    # BIRIKIM RSI<30 zaten sıkı filtreden geçiyor
+    if layer in ("SUREGEN", "MOMENTUM") and score >= 16:
+        conviction = "CRITICAL"
+        if layer == "SUREGEN":
+            reasons.append("🚀 SUREGEN CRITICAL — momentum gücü doğrulandı")
+        else:
+            reasons.append("⚡ MOMENTUM CRITICAL — güçlü trend yakalandı")
+
     if layer == "SUREGEN":
         print(f"  🔬 SUREGEN SONUÇ: {symbol} → SİNYAL! score={score} conviction={conviction}")
 
