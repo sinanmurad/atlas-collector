@@ -893,7 +893,7 @@ def calculate_signal_score(price_change, volume_ratio, kap, symbol=None):
         score += bonus
         reasons.append(f"🧠 Öğrenme katsayısı: {bonus:+d}")
 
-    if score >= 9:
+    if score >= 8:
         conviction = "CRITICAL"
     elif score >= 6:
         conviction = "HIGH"
@@ -1597,6 +1597,23 @@ def main():
                 send_morning_push_only()
                 morning_signals_sent = True
                 night_scan_done = False
+                time.sleep(120)
+
+            # ============================================================
+            # AÇILIŞ ÖNCESİ SON TARAMA: 06:45-06:59 UTC (09:45-09:59 TR)
+            # Sabah erken hareket eden hisseleri yakala
+            # OYYAT gibi gece değil sabah hareket eden hisseler için
+            # Push gönder — bot 07:00'de gerçek fiyattan alım yapacak
+            # ============================================================
+            elif hour == 6 and minute >= 45 and not morning_buys_done:
+                print(f"\n🔍 AÇILIŞ ÖNCESİ SON TARAMA — {now_utc.strftime('%H:%M UTC')} (09:45-09:59 TR)")
+                found = scan_once(symbols, avg_volumes)
+                if found:
+                    print(f"  ✅ {len(found)} sinyal bulundu — 07:00'de alım yapılacak")
+                    # Push gönder ama alım yapma — borsa henüz kapalı
+                    for sig in found:
+                        if sig.get("conviction") == "CRITICAL":
+                            send_signal_notification(sig)
                 time.sleep(120)
 
             # ============================================================
