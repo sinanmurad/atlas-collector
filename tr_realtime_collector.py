@@ -1060,11 +1060,16 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction=None,
     try:
         # ── MAKRO KONTROL ────────────────────────────────────────
         try:
-            ms = supabase.table("market_status").select("bist_status") \
+            ms = supabase.table("market_status").select("bist_status, vix") \
                 .eq("id", 1).maybeSingle().execute()
-            if ms.data and ms.data.get("bist_status") == "RED":
-                print(f"  🔴 MAKRO RED — BIST düşüşte, {symbol} alımı durduruldu")
-                return False
+            if ms.data:
+                if ms.data.get("bist_status") == "RED":
+                    print(f"  🔴 MAKRO RED — BIST düşüşte, {symbol} alımı durduruldu")
+                    return False
+                vix = float(ms.data.get("vix") or 0)
+                if vix >= 30:
+                    print(f"  🔴 VIX {vix:.1f} — küresel kriz, {symbol} BIST alımı durduruldu")
+                    return False
         except Exception:
             pass
         open_trades = get_open_bist_trades(user_id)
