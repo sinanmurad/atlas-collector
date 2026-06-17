@@ -1268,6 +1268,8 @@ def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
     elif abs(price_change) >= 5:
         score += 2
     elif abs(price_change) >= 3:
+        score += 2
+    elif abs(price_change) >= 1.5:
         score += 1
     if volume_ratio >= 10:
         score += 3
@@ -1372,7 +1374,7 @@ def on_message(ws, message):
                 continue
             volume_ratio = tracker.get_volume_ratio(symbol, avg_vol)
             price_change = tracker.get_price_change(symbol, price)
-            if volume_ratio >= 2 and price_change >= 3:
+            if volume_ratio >= 2 and price_change >= 1.5:
                 process_live_signal(symbol, "momentum", price, price_change, volume_ratio)
             elif volume_ratio >= 5 and price_change > 0:
                 process_live_signal(symbol, "volume_spike", price, price_change, volume_ratio)
