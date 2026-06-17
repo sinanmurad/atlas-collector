@@ -657,9 +657,9 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
         score += bonus
         reasons.append(f"🧠 Öğrenme katsayısı: {bonus:+d}")
 
-    if score >= 10:
+    if score >= 8:
         conviction = "CRITICAL"
-    elif score >= 7:
+    elif score >= 6:
         conviction = "HIGH"
     elif score >= 4:
         conviction = "MEDIUM"
@@ -1287,9 +1287,9 @@ def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
     if bonus != 0:
         score += bonus
 
-    if score >= 10:
+    if score >= 8:
         conviction = "CRITICAL"
-    elif score >= 7:
+    elif score >= 6:
         conviction = "HIGH"
     elif score >= 4:
         conviction = "MEDIUM"
