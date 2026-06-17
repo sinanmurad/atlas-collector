@@ -2303,6 +2303,10 @@ def scan_once(scan_count=0):
     for coin in coins:
         symbol = coin["symbol"]
         try:
+            # Leveraged token filtresi — 3S, 5S, 3L, 5L, 2L, 2S suffix'li coinler
+            LEVERAGED_SUFFIXES = ("3S", "5S", "3L", "5L", "2S", "2L", "10S", "10L")
+            if any(symbol.endswith(s) for s in LEVERAGED_SUFFIXES):
+                continue
             # Cache — aynı coin için 4 saat arayla sinyal
             if symbol in signal_cache and now - signal_cache[symbol] < SIGNAL_COOLDOWN_H * 3600:
                 continue
@@ -2349,6 +2353,9 @@ def scan_once(scan_count=0):
             suregen_candidate = False
             if vol_chg < 20 and ch1h < 1.5:
                 if ch24h >= 8:
+                    # ch1h ve vol_chg sıfırsa veri yok — leveraged token veya likit değil
+                    if ch1h == 0.0 and vol_chg == 0.0:
+                        continue
                     suregen_candidate = True
                     print(f"  🔬 SUREGEN ADAY: {symbol} | ch1h:{ch1h:.2f} "
                           f"ch24h:{ch24h:.2f} vol_chg:{vol_chg:.1f} price:{price}")
