@@ -1939,11 +1939,19 @@ def bot_buy(s, signal_id):
 
     # ── MAKRO KONTROL ────────────────────────────────────────
     try:
-        ms = supabase.table("market_status").select("crypto_status") \
+        ms = supabase.table("market_status").select("crypto_status, vix") \
             .eq("id", 1).maybeSingle().execute()
-        if ms.data and ms.data.get("crypto_status") == "RED":
-            print(f"  🔴 MAKRO RED — BTC düşüşte, {symbol} alımı durduruldu")
-            return
+        if ms.data:
+            if ms.data.get("crypto_status") == "RED":
+                print(f"  🔴 MAKRO RED — BTC düşüşte, {symbol} alımı durduruldu")
+                return
+            vix = float(ms.data.get("vix") or 0)
+            if vix >= 30:
+                print(f"  🔴 VIX {vix:.1f} — küresel kriz, {symbol} alımı durduruldu")
+                return
+            if vix >= 25:
+                print(f"  ⚠️ VIX {vix:.1f} — yüksek korku, {symbol} alımı durduruldu")
+                return
     except Exception:
         pass  # Tablo yoksa devam et
 
