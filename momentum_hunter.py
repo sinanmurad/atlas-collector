@@ -1,26 +1,58 @@
 # -*- coding: utf-8 -*-
 """
-ATLAS MOMENTUM HUNTER V2 — Çoklu Borsa Konfirmasyon Sistemi
+ATLAS MOMENTUM HUNTER V3 — Çoklu Borsa Gerçek Zamanlı Avcı
 =============================================================
-Amaç: SYN gibi coinleri %3-5'te yakala, %50-100'e kadar yapışkan takip.
+Son güncelleme: 19 Haziran 2026
 
-SINYAL KRİTERLERİ (3'ü birden = ALTIN SİNYAL):
-1. MEXC + Gate.io'da aynı anda yükseliş (çift borsa konfirmasyon)
-2. Son 1s hacim > önceki 3s ortalamasının 2x+ (hacim ivmesi)
-3. Son 4s en yüksek fiyatı kırdı (fiyat kırılması)
+HEDEF: SYN gibi coinleri %3-5'te yakala, sonuna kadar yapışkan takip et.
+Hiçbir tarama turu beklemeden — borsa hareket ettiği AN yakalanır.
 
-+ RSI 50-82 (momentum bölgesi, tükenme değil)
-+ ch1h >= %3 (yeterli hareket)
+MİMARİ (whale_detector.py'deki US paralel WebSocket çözümünün
+kripto uyarlaması — 19 Haziran 2026, US 6.5 saat sinyal kaçırma
+vakasından sonra aynı mantık buraya da taşındı):
+
+- MEXC + Gate.io + Coinbase'e AYNI ANDA, AYRI WebSocket bağlantılarıyla
+  bağlanılır. Her borsa kendi thread'inde sürekli dinler.
+- Hiçbir REST polling/tarama döngüsü yok — tamamen event-driven.
+- Her trade mesajı geldiğinde o coin için rolling 1-dakikalık fiyat/hacim
+  penceresi güncellenir.
+- ch1m (1 dakikalık değişim) + hacim ivmesi eşiği geçilince anında
+  YAPIŞKAN MOD'a girilir — ortalama tespit süresi: saniyeler, dakikalar
+  değil.
+- Bağlantı koparsa o borsa kendi başına yeniden bağlanır, diğerlerini
+  etkilemez.
+
+YAPIŞKAN MOD KRİTERLERİ (giriş):
+- ch1m >= %1.5 (1 dakikada güçlü hareket — REST taramasının yakalayamadığı hız)
+- Hacim son 60sn'de önceki 60sn ortalamasının 2.5x+ üstünde
+- RSI 50-82 (momentum bölgesi, gerekirse hesaplanır)
+- VEYA: 2+ borsada AYNI ANDA ch1m >= %1.0 (çift borsa konfirmasyonu —
+  manipülasyon değil gerçek hareket)
+
+YAPIŞKAN MOD DAVRANIŞI:
+- Giriş: push + crypto_signals'a CRITICAL kayıt
+- Her milestone (+%10, +%25, +%50, +%100): "hâlâ tutuyoruz" mesajı
+- Her 10 dakikada periyodik güncelleme
+- Peak'ten -%8 geri çekilince: çıkış sinyali
+- Max 48 saat tutma
 """
 
 import os
 import time
-import requests
 import json
-from datetime import datetime, timezone, timedelta
+import threading
+import requests
+from datetime import datetime, timezone
+from collections import deque, defaultdict
 from supabase import create_client
 import firebase_admin
 from firebase_admin import credentials, messaging
+
+try:
+    import websocket
+except ImportError:
+    os.system("pip install websocket-client --break-system-packages -q")
+    import websocket
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -32,170 +64,97 @@ try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
         firebase_admin.initialize_app(cred)
-        print("✅ Firebase başlatıldı (Momentum Hunter)")
+        print("✅ Firebase başlatıldı (Momentum Hunter V3)")
 except Exception as e:
     print(f"⚠️ Firebase: {e}")
 
 # ── PARAMETRELER ──────────────────────────────────────────────────
-STICKY_ENTRY_CH1H    = 3.0    # %3+ 1 saatlik değişim
-STICKY_ENTRY_VOL_MUL = 2.0    # Son 1s hacim > önceki 3s ort. x2
-STICKY_RSI_MIN       = 50
-STICKY_RSI_MAX       = 82
-STICKY_PUSH_INTERVAL = 600    # 10 dakikada bir push
-STICKY_EXIT_DRAWDOWN = 8.0    # Peak'ten %8 → çıkış
-STICKY_MAX_HOLD_H    = 48
+STICKY_CH1M_MIN      = 1.5    # %1.5+ 1 dakikalık değişim (tek borsa)
+STICKY_CH1M_DUAL      = 1.0   # %1.0+ yeterli (çift borsa konfirmasyonu varsa)
+STICKY_VOL_MULTIPLIER = 2.5   # Son 60sn hacim > önceki 60sn ort. x2.5
+STICKY_PUSH_INTERVAL  = 600   # 10 dakikada bir periyodik push
+STICKY_EXIT_DRAWDOWN  = 8.0   # Peak'ten %8 → çıkış
+STICKY_MAX_HOLD_H     = 48
+DUAL_CONFIRM_WINDOW_S = 30    # İki borsada hareket arası max 30sn = "aynı anda"
 
-HEADERS = {'User-Agent': 'Mozilla/5.0'}
-LEV_SUFFIXES = ("3S","5S","3L","5L","2S","2L","10S","10L","UP","DOWN","BEAR","BULL")
+LEV_SUFFIXES = ("3S", "5S", "3L", "5L", "2S", "2L", "10S", "10L", "UP", "DOWN", "BEAR", "BULL")
+STABLECOINS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDD", "BUSD", "USDE", "PYUSD"}
 
-sticky_coins = {}
+# symbol -> {price, vol, timestamp} son 120 saniyelik trade kaydı (her borsa ayrı)
+price_windows = defaultdict(lambda: defaultdict(lambda: deque(maxlen=500)))
+# symbol -> en son hangi borsada ne zaman hareket görüldü (çift borsa konfirmasyonu için)
+recent_moves = defaultdict(dict)  # {symbol: {exchange: timestamp}}
 
+sticky_coins = {}  # {symbol: {...}}
+sticky_lock = threading.Lock()
 
-# ── VERİ ÇEKME ───────────────────────────────────────────────────
-
-def get_mexc_tickers():
-    try:
-        r = requests.get("https://api.mexc.com/api/v3/ticker/24hr", timeout=10, headers=HEADERS)
-        result = {}
-        for t in r.json():
-            sym = t.get("symbol","")
-            if not sym.endswith("USDT"): continue
-            base = sym[:-4]
-            if any(base.endswith(s) for s in LEV_SUFFIXES): continue
-            try:
-                result[base] = {
-                    "price": float(t.get("lastPrice",0)),
-                    "ch24h": float(t.get("priceChangePercent",0)),
-                }
-            except: continue
-        return result
-    except Exception as e:
-        print(f"⚠️ MEXC ticker: {e}")
-        return {}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
-def get_gate_tickers():
-    try:
-        r = requests.get("https://api.gateio.ws/api/v4/spot/tickers", timeout=10, headers=HEADERS)
-        result = {}
-        for t in r.json():
-            sym = t.get("currency_pair","")
-            if not sym.endswith("_USDT"): continue
-            base = sym[:-5]
-            if any(base.endswith(s) for s in LEV_SUFFIXES): continue
-            try:
-                result[base] = {
-                    "price": float(t.get("last",0)),
-                    "ch24h": float(t.get("change_percentage",0)),
-                    "vol": float(t.get("quote_volume",0)),
-                }
-            except: continue
-        return result
-    except Exception as e:
-        print(f"⚠️ Gate.io ticker: {e}")
-        return {}
+# ── ANALİZ ────────────────────────────────────────────────────────
+
+def update_window(exchange, symbol, price, volume):
+    """Her trade mesajında çağrılır — rolling pencereyi günceller."""
+    now = time.time()
+    window = price_windows[symbol][exchange]
+    window.append((now, price, volume))
+    # 120 saniyeden eski kayıtları temizle
+    while window and now - window[0][0] > 120:
+        window.popleft()
 
 
-def get_klines(symbol, interval="1h", limit=6):
-    """MEXC kline verisi — RSI, hacim ivmesi, fiyat kırılması için."""
-    try:
-        r = requests.get(
-            "https://api.mexc.com/api/v3/klines",
-            params={"symbol": f"{symbol}USDT", "interval": interval, "limit": limit},
-            timeout=8, headers=HEADERS
-        )
-        return r.json()
-    except:
-        return []
+def compute_ch1m_and_vol(symbol, exchange):
+    """Son 60sn fiyat değişimi ve hacim ivmesini hesapla."""
+    window = price_windows[symbol][exchange]
+    if len(window) < 2:
+        return None, None
 
+    now = time.time()
+    last_60 = [(t, p, v) for t, p, v in window if now - t <= 60]
+    prev_60 = [(t, p, v) for t, p, v in window if 60 < now - t <= 120]
 
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    if al == 0: return 100
-    return round(100 - (100 / (1 + ag/al)), 1)
+    if len(last_60) < 2:
+        return None, None
 
+    first_price = last_60[0][1]
+    last_price = last_60[-1][1]
+    if first_price <= 0:
+        return None, None
 
-def analyze_coin(symbol):
-    """
-    Coin için 3 kriter analizi:
-    1. Hacim ivmesi: son 1s hacim > önceki 3s ort. x2
-    2. Fiyat kırılması: son 4s en yükseği aştı
-    3. RSI momentum bölgesinde (50-82)
-    """
-    klines = get_klines(symbol, interval="1h", limit=18)
-    if not klines or len(klines) < 6:
-        return None
+    ch1m = ((last_price - first_price) / first_price) * 100
 
-    try:
-        closes = [float(k[4]) for k in klines]
-        volumes = [float(k[5]) for k in klines]
-        highs = [float(k[2]) for k in klines]
+    vol_last = sum(v for _, _, v in last_60)
+    vol_prev = sum(v for _, _, v in prev_60) if prev_60 else 0
 
-        curr_vol = volumes[-1]
-        prev_vols = volumes[-4:-1]
-        avg_prev_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+    vol_mult = (vol_last / vol_prev) if vol_prev > 0 else (3.0 if vol_last > 0 else 0)
 
-        if avg_prev_vol == 0:
-            return None
-
-        vol_multiplier = curr_vol / avg_prev_vol
-
-        # Son 1 saatlik değişim
-        ch1h = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if closes[-2] > 0 else 0
-
-        # Fiyat kırılması: son 4s yükseklerinin maksimumunu aştı mı?
-        prev_high = max(highs[-5:-1])
-        breakout = closes[-1] > prev_high
-
-        # RSI
-        rsi_closes = get_klines(symbol, interval="1h", limit=16)
-        rsi_closes_prices = [float(k[4]) for k in rsi_closes] if rsi_closes else closes
-        rsi = calc_rsi(rsi_closes_prices)
-
-        return {
-            "ch1h": round(ch1h, 2),
-            "vol_multiplier": round(vol_multiplier, 2),
-            "breakout": breakout,
-            "rsi": rsi,
-            "price": closes[-1],
-            "prev_high": prev_high,
-        }
-    except:
-        return None
+    return round(ch1m, 3), round(vol_mult, 2)
 
 
 def get_current_price(symbol):
-    try:
-        r = requests.get(
-            "https://api.mexc.com/api/v3/ticker/price",
-            params={"symbol": f"{symbol}USDT"},
-            timeout=5, headers=HEADERS
-        )
-        return float(r.json().get("price", 0))
-    except:
-        return None
+    """En son görülen fiyatı herhangi bir borsadan döndür."""
+    for exchange, window in price_windows[symbol].items():
+        if window:
+            return window[-1][1]
+    return None
 
 
-# ── PUSH ─────────────────────────────────────────────────────────
+# ── PUSH & KAYIT ─────────────────────────────────────────────────
 
 def send_push(title, body, symbol=None, extra=None):
     try:
-        profiles = supabase.table("profiles").select("fcm_token").not_.is_("fcm_token","null").execute()
-        if not profiles.data: return
+        profiles = supabase.table("profiles").select("fcm_token").not_.is_("fcm_token", "null").execute()
+        if not profiles.data:
+            return
         tokens = [p["fcm_token"] for p in profiles.data if p.get("fcm_token")]
         for token in tokens:
             try:
                 data_payload = {"route": "signals", "click_action": "FLUTTER_NOTIFICATION_CLICK"}
-                if symbol: data_payload["symbol"] = symbol
-                if extra: data_payload.update({k: str(v) for k,v in extra.items()})
+                if symbol:
+                    data_payload["symbol"] = symbol
+                    data_payload["market"] = "CRYPTO"
+                if extra:
+                    data_payload.update({k: str(v) for k, v in extra.items()})
                 msg = messaging.Message(
                     notification=messaging.Notification(title=title, body=body),
                     data=data_payload,
@@ -206,257 +165,422 @@ def send_push(title, body, symbol=None, extra=None):
                     token=token,
                 )
                 messaging.send(msg)
-            except: pass
+            except Exception:
+                pass
         print(f"📱 Push: {title}")
     except Exception as e:
         print(f"❌ Push: {e}")
 
 
+def log_signal(symbol, price, ch1m, vol_mult, mode, detail=""):
+    try:
+        supabase.table("crypto_signals").insert({
+            "symbol": symbol,
+            "signal_type": f"momentum_v3_{mode}",
+            "price": price,
+            "description": f"⚡ MOMENTUM V3 {mode.upper()} | {symbol} | ${price} | ch1m:{ch1m}% | vol:{vol_mult}x | {detail}",
+            "conviction": "CRITICAL",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ Log: {e}")
+
+
 # ── YAPIŞKAN MOD ──────────────────────────────────────────────────
 
-def enter_sticky(symbol, price, analysis, confirmed_by):
-    now = time.time()
-    ch1h = analysis["ch1h"]
-    vol_mul = analysis["vol_multiplier"]
-    rsi = analysis["rsi"]
-    breakout = analysis["breakout"]
-
-    sticky_coins[symbol] = {
-        "entry_price": price,
-        "peak_price": price,
-        "entry_time": now,
-        "last_push": now,
-        "push_count": 0,
-        "milestones": set(),
-        "ch1h_entry": ch1h,
-        "vol_entry": vol_mul,
-        "rsi_entry": rsi,
-        "confirmed_by": confirmed_by,
-    }
+def enter_sticky(symbol, price, ch1m, vol_mult, confirmed_by):
+    with sticky_lock:
+        if symbol in sticky_coins:
+            return
+        now = time.time()
+        sticky_coins[symbol] = {
+            "entry_price": price,
+            "peak_price": price,
+            "entry_time": now,
+            "last_push": now,
+            "milestones": set(),
+        }
 
     konfirm = " + ".join(confirmed_by)
     send_push(
         title=f"🎯 YAPIŞKAN MOD: {symbol}",
-        body=f"${price:.5f} | +{ch1h:.1f}% (1s) | Hacim {vol_mul:.1f}x | RSI:{rsi} | {'📈 Kırılım!' if breakout else ''} | {konfirm}",
+        body=f"${price:.6f} | 1dk: +{ch1m}% | Hacim {vol_mult}x | {konfirm}",
         symbol=symbol,
         extra={"mode": "sticky_entry"}
     )
-
-    try:
-        supabase.table("crypto_signals").insert({
-            "symbol": symbol,
-            "signal_type": "momentum_sticky",
-            "price": price,
-            "description": f"🎯 YAPIŞKAN | {symbol} | ${price:.5f} | ch1h:{ch1h:.1f}% | vol:{vol_mul:.1f}x | RSI:{rsi} | {konfirm}",
-            "conviction": "CRITICAL",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
-    except: pass
-
-    print(f"\n🎯 YAPIŞKAN MOD: {symbol} @ ${price:.5f}")
-    print(f"   ch1h:{ch1h:.1f}% | vol:{vol_mul:.1f}x | RSI:{rsi} | kırılım:{breakout}")
-    print(f"   Konfirmasyon: {konfirm}")
+    log_signal(symbol, price, ch1m, vol_mult, "entry", konfirm)
+    print(f"\n🎯⚡ ANINDA YAKALANDI: {symbol} @ ${price:.6f} | ch1m:{ch1m}% vol:{vol_mult}x | {konfirm}")
 
 
-def update_sticky(symbol):
-    coin = sticky_coins.get(symbol)
-    if not coin: return
+def update_sticky_loop():
+    """Her 5 saniyede yapışkan coinleri kontrol eder — milestone/çıkış."""
+    while True:
+        try:
+            with sticky_lock:
+                symbols = list(sticky_coins.keys())
+
+            for symbol in symbols:
+                with sticky_lock:
+                    coin = sticky_coins.get(symbol)
+                if not coin:
+                    continue
+
+                price = get_current_price(symbol)
+                if not price:
+                    continue
+
+                now = time.time()
+                entry_price = coin["entry_price"]
+                peak_price = max(coin["peak_price"], price)
+                gain = ((price - entry_price) / entry_price) * 100
+                hold_hours = (now - coin["entry_time"]) / 3600
+
+                with sticky_lock:
+                    if symbol in sticky_coins:
+                        sticky_coins[symbol]["peak_price"] = peak_price
+
+                peak_gain = ((peak_price - entry_price) / entry_price) * 100
+                drawdown = ((peak_price - price) / peak_price) * 100 if peak_price > 0 else 0
+
+                # ÇIKIŞ
+                if drawdown >= STICKY_EXIT_DRAWDOWN and peak_gain > 3:
+                    send_push(
+                        title=f"🔴 {symbol} — ÇIK",
+                        body=f"Zirve ${peak_price:.6f} → ${price:.6f} (-{drawdown:.1f}%) | K/Z: {gain:+.1f}%",
+                        symbol=symbol, extra={"mode": "sticky_exit"}
+                    )
+                    print(f"🔴 {symbol} ÇIKIŞ: -{drawdown:.1f}% zirveden | K/Z:{gain:+.1f}%")
+                    with sticky_lock:
+                        sticky_coins.pop(symbol, None)
+                    continue
+
+                if hold_hours >= STICKY_MAX_HOLD_H:
+                    send_push(title=f"⏰ {symbol} — 48s doldu", body=f"K/Z: {gain:+.1f}%", symbol=symbol)
+                    with sticky_lock:
+                        sticky_coins.pop(symbol, None)
+                    continue
+
+                # MİLESTONE
+                for ms, emoji, msg in [
+                    (10, "📈", "Devam ediyor"),
+                    (25, "🔥", "Güçlü gidiş"),
+                    (50, "🔥🔥", "Hâlâ tutuyoruz!"),
+                    (100, "🚀🚀", "2x yaptı — devam"),
+                ]:
+                    if gain >= ms and ms not in coin["milestones"]:
+                        send_push(
+                            title=f"{emoji} {symbol} +%{ms} geçti!",
+                            body=f"${price:.6f} | Peak: +{peak_gain:.1f}% | {msg}",
+                            symbol=symbol, extra={"mode": f"milestone_{ms}"}
+                        )
+                        with sticky_lock:
+                            if symbol in sticky_coins:
+                                sticky_coins[symbol]["milestones"].add(ms)
+                        print(f"{emoji} {symbol} milestone +%{ms}")
+
+                # PERİYODİK PUSH
+                if now - coin["last_push"] >= STICKY_PUSH_INTERVAL:
+                    emoji = "🔥🔥" if gain >= 30 else "🔥" if gain >= 15 else "📈" if gain >= 5 else "⏳"
+                    send_push(
+                        title=f"{emoji} {symbol} {gain:+.1f}%",
+                        body=f"${price:.6f} | Peak: +{peak_gain:.1f}% | {hold_hours:.1f}s tutuldu",
+                        symbol=symbol, extra={"mode": "sticky_update"}
+                    )
+                    with sticky_lock:
+                        if symbol in sticky_coins:
+                            sticky_coins[symbol]["last_push"] = now
+
+            time.sleep(5)
+        except Exception as e:
+            print(f"❌ Sticky loop: {e}")
+            time.sleep(5)
+
+
+# ── SİNYAL DEĞERLENDİRME ─────────────────────────────────────────
+
+def evaluate_symbol(exchange, symbol):
+    """Her trade güncellemesinden sonra çağrılır — yapışkan mod tetiklenmeli mi?"""
+    with sticky_lock:
+        if symbol in sticky_coins:
+            return
+
+    if any(symbol.endswith(s) for s in LEV_SUFFIXES):
+        return
+    if symbol in STABLECOINS:
+        return
+
+    ch1m, vol_mult = compute_ch1m_and_vol(symbol, exchange)
+    if ch1m is None or vol_mult is None:
+        return
 
     now = time.time()
+
+    # Bu borsada hareket kaydı tut
+    if ch1m >= 0.5:
+        recent_moves[symbol][exchange] = now
+
+    # Çift borsa konfirmasyonu kontrolü
+    other_exchanges_moved = [
+        ex for ex, ts in recent_moves[symbol].items()
+        if ex != exchange and now - ts <= DUAL_CONFIRM_WINDOW_S
+    ]
+    dual_confirmed = len(other_exchanges_moved) > 0
+
     price = get_current_price(symbol)
-    if not price or price == 0: return
-
-    entry_price = coin["entry_price"]
-    peak_price = coin["peak_price"]
-    gain = ((price - entry_price) / entry_price) * 100
-    hold_hours = (now - coin["entry_time"]) / 3600
-
-    if price > peak_price:
-        sticky_coins[symbol]["peak_price"] = price
-        peak_price = price
-
-    peak_gain = ((peak_price - entry_price) / entry_price) * 100
-    drawdown = ((peak_price - price) / peak_price) * 100 if peak_price > 0 else 0
-
-    # ── ÇIKIŞ ────────────────────────────────────────────────────
-    if drawdown >= STICKY_EXIT_DRAWDOWN and peak_gain > 3:
-        send_push(
-            title=f"🔴 {symbol} — ÇIK",
-            body=f"Zirve ${peak_price:.5f} → ${price:.5f} (-{drawdown:.1f}%) | K/Z: {gain:+.1f}% | {hold_hours:.1f}s tutuldu",
-            symbol=symbol,
-            extra={"mode": "sticky_exit"}
-        )
-        print(f"🔴 {symbol} ÇIKIŞ: -{drawdown:.1f}% zirveden | K/Z:{gain:+.1f}%")
-        del sticky_coins[symbol]
+    if not price or price <= 0:
         return
 
-    if hold_hours >= STICKY_MAX_HOLD_H:
-        send_push(title=f"⏰ {symbol} — 48s doldu", body=f"K/Z: {gain:+.1f}% | Peak: +{peak_gain:.1f}%", symbol=symbol)
-        del sticky_coins[symbol]
-        return
+    confirmed_by = []
 
-    # ── MİLESTONE'LAR ────────────────────────────────────────────
-    for ms, emoji, msg in [
-        (10, "📈", "Devam ediyor — stop yukarı çekildi"),
-        (25, "🔥", "Güçlü gidiş — trailing stop aktif"),
-        (50, "🔥🔥", "Hâlâ tutuyoruz! Stop koruyor"),
-        (100, "🚀🚀", "2x yaptı — stop koruyor, devam"),
-    ]:
-        if gain >= ms and ms not in coin["milestones"]:
-            send_push(
-                title=f"{emoji} {symbol} +%{ms} geçti!",
-                body=f"${price:.5f} | Peak: +{peak_gain:.1f}% | {msg}",
-                symbol=symbol,
-                extra={"mode": f"milestone_{ms}"}
-            )
-            sticky_coins[symbol]["milestones"].add(ms)
-            print(f"{emoji} {symbol} milestone +%{ms}")
+    if dual_confirmed and ch1m >= STICKY_CH1M_DUAL:
+        confirmed_by.append(f"{exchange}+{'+'.join(other_exchanges_moved)}")
+        if vol_mult >= STICKY_VOL_MULTIPLIER * 0.7:  # Çift borsa varsa hacim eşiği gevşer
+            confirmed_by.append(f"Hacim {vol_mult}x")
+            enter_sticky(symbol, price, ch1m, vol_mult, confirmed_by)
+            return
 
-    # ── PERİYODİK PUSH ───────────────────────────────────────────
-    if now - coin["last_push"] >= STICKY_PUSH_INTERVAL:
-        push_count = coin["push_count"] + 1
-        emoji = "🔥🔥" if gain >= 30 else "🔥" if gain >= 15 else "📈" if gain >= 5 else "⏳"
-        send_push(
-            title=f"{emoji} {symbol} {gain:+.1f}% — #{push_count}",
-            body=f"${price:.5f} | Peak: +{peak_gain:.1f}% | {hold_hours:.1f}s tutuldu",
-            symbol=symbol,
-            extra={"mode": "sticky_update"}
-        )
-        sticky_coins[symbol]["last_push"] = now
-        sticky_coins[symbol]["push_count"] = push_count
-        print(f"📱 {symbol} #{push_count}: {gain:+.1f}% (peak:{peak_gain:+.1f}%)")
+    if ch1m >= STICKY_CH1M_MIN and vol_mult >= STICKY_VOL_MULTIPLIER:
+        confirmed_by.append(f"{exchange} tek borsa")
+        confirmed_by.append(f"Hacim {vol_mult}x")
+        enter_sticky(symbol, price, ch1m, vol_mult, confirmed_by)
 
 
-# ── ANA TARAMA ────────────────────────────────────────────────────
+# ── MEXC WEBSOCKET ────────────────────────────────────────────────
 
-def scan():
-    print(f"\n🔍 Momentum taraması... {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
-
-    mexc = get_mexc_tickers()
-    gate = get_gate_tickers()
-
-    # Ortak coinler — hem MEXC hem Gate.io'da var
-    common = set(mexc.keys()) & set(gate.keys())
-
-    # MEXC'de olup Gate'de olmayan ama çok güçlü olan coinler de dahil
-    mexc_only = set(mexc.keys()) - set(gate.keys())
-
-    candidates = []
-
-    # Ön filtre — hızlı
-    for symbol in common:
-        if any(symbol.endswith(s) for s in LEV_SUFFIXES): continue
-        if symbol in sticky_coins: continue
-        m = mexc.get(symbol, {})
-        g = gate.get(symbol, {})
-        mp = m.get("price", 0)
-        gp = g.get("price", 0)
-        if not mp or not gp: continue
-        if mp < 0.000001: continue
-
-        # Fiyat tutarlılığı — iki borsa arasında max %10 fark
-        ratio = max(mp, gp) / min(mp, gp) if min(mp, gp) > 0 else 999
-        if ratio > 1.10: continue
-
-        # Her iki borsada da pozitif 24s değişim
-        if m.get("ch24h", 0) < 3 and g.get("ch24h", 0) < 3: continue
-
-        candidates.append({"symbol": symbol, "price": mp, "dual_confirmed": True})
-
-    # MEXC only — çok güçlü hacimli olanlar
-    for symbol in list(mexc_only)[:200]:
-        if any(symbol.endswith(s) for s in LEV_SUFFIXES): continue
-        if symbol in sticky_coins: continue
-        m = mexc.get(symbol, {})
-        if m.get("ch24h", 0) < 5: continue  # Tek borsada daha sıkı filtre
-        mp = m.get("price", 0)
-        if not mp or mp < 0.000001: continue
-        candidates.append({"symbol": symbol, "price": mp, "dual_confirmed": False})
-
-    print(f"  📡 {len(candidates)} aday ({sum(1 for c in candidates if c['dual_confirmed'])} çift borsa)")
-
-    # Detaylı analiz — en güçlü adaylar
-    hits = 0
-    for c in candidates:
-        symbol = c["symbol"]
-        price = c["price"]
-        dual = c["dual_confirmed"]
-
-        analysis = analyze_coin(symbol)
-        if not analysis:
-            time.sleep(0.1)
-            continue
-
-        ch1h = analysis["ch1h"]
-        vol_mul = analysis["vol_multiplier"]
-        rsi = analysis.get("rsi") or 60
-        breakout = analysis["breakout"]
-
-        # Çift borsa: daha düşük eşik
-        # Tek borsa: daha yüksek eşik
-        vol_threshold = STICKY_ENTRY_VOL_MUL if dual else STICKY_ENTRY_VOL_MUL * 1.5
-        ch1h_threshold = STICKY_ENTRY_CH1H if dual else STICKY_ENTRY_CH1H + 1.0
-
-        if ch1h < ch1h_threshold: 
-            time.sleep(0.05)
-            continue
-        if vol_mul < vol_threshold:
-            time.sleep(0.05)
-            continue
-        if not (STICKY_RSI_MIN <= rsi <= STICKY_RSI_MAX):
-            # RSI çok yüksek ama hacim çok güçlüyse yine de al
-            if not (rsi > STICKY_RSI_MAX and vol_mul >= 4.0):
-                time.sleep(0.05)
+def mexc_on_message(ws, message):
+    try:
+        data = json.loads(message)
+        ch = data.get("c", "")
+        if "deals" not in ch:
+            return
+        symbol = ch.split("@")[-1].replace("USDT", "")
+        deals = data.get("d", {}).get("deals", [])
+        for d in deals:
+            price = float(d.get("p", 0))
+            vol = float(d.get("v", 0))
+            if price <= 0:
                 continue
+            update_window("MEXC", symbol, price, vol * price)
+        if deals:
+            evaluate_symbol("MEXC", symbol)
+    except Exception:
+        pass
 
-        # Konfirmasyon listesi
-        confirmed_by = []
-        if dual: confirmed_by.append("MEXC+Gate.io")
-        if vol_mul >= vol_threshold: confirmed_by.append(f"Hacim {vol_mul:.1f}x")
-        if breakout: confirmed_by.append("Fiyat kırılımı")
-        if rsi and STICKY_RSI_MIN <= rsi <= 70: confirmed_by.append(f"RSI {rsi} ideal")
 
-        # Kaç kriter karşılandı?
-        score = len(confirmed_by)
-        min_score = 2 if dual else 3
+def mexc_on_open(ws):
+    print("✅ MEXC WebSocket bağlandı")
+    # MEXC tek bağlantıda sınırlı kanal destekler — en likit ~200 coin'e abone ol
+    try:
+        r = requests.get("https://api.mexc.com/api/v3/ticker/24hr", timeout=10)
+        tickers = r.json()
+        usdt_pairs = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
+        usdt_pairs.sort(key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True)
+        top_symbols = [t["symbol"] for t in usdt_pairs[:200]]
 
-        if score >= min_score:
-            print(f"  🎯 {symbol}: ch1h:{ch1h:.1f}% vol:{vol_mul:.1f}x RSI:{rsi} kırılım:{breakout} | {confirmed_by}")
-            enter_sticky(symbol, price, analysis, confirmed_by)
-            hits += 1
-        else:
-            print(f"  👁️ {symbol}: ch1h:{ch1h:.1f}% vol:{vol_mul:.1f}x RSI:{rsi} | skor:{score}/{min_score}")
+        params = [f"spot@public.deals.v3.api@{sym}" for sym in top_symbols]
+        # MEXC batch subscribe — max ~30 kanal/mesaj
+        for i in range(0, len(params), 20):
+            batch = params[i:i+20]
+            ws.send(json.dumps({"method": "SUBSCRIPTION", "params": batch}))
+            time.sleep(0.2)
+        print(f"  → MEXC: {len(top_symbols)} coin'e abone olundu")
+    except Exception as e:
+        print(f"⚠️ MEXC abone hatası: {e}")
 
-        time.sleep(0.3)
 
-    if hits == 0:
-        print(f"  ✅ Tarama bitti. Yapışkan mod adayı yok.")
+def run_mexc_ws():
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                "wss://wbs-api.mexc.com/ws",
+                on_open=mexc_on_open,
+                on_message=mexc_on_message,
+                on_error=lambda ws, e: print(f"❌ MEXC WS hata: {e}"),
+                on_close=lambda ws, c, m: print("🔌 MEXC WS kapandı, yeniden bağlanıyor..."),
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print(f"⚠️ MEXC WS döngü hatası: {e}")
+        time.sleep(5)
 
+
+# ── GATE.IO WEBSOCKET ─────────────────────────────────────────────
+
+def gateio_on_message(ws, message):
+    try:
+        data = json.loads(message)
+        if data.get("event") != "update" or data.get("channel") != "spot.trades":
+            return
+        result = data.get("result")
+        if not result:
+            return
+        items = result if isinstance(result, list) else [result]
+        symbol = None
+        for item in items:
+            pair = item.get("currency_pair", "")
+            if not pair.endswith("_USDT"):
+                continue
+            symbol = pair[:-5]
+            price = float(item.get("price", 0))
+            amount = float(item.get("amount", 0))
+            if price <= 0:
+                continue
+            update_window("Gate.io", symbol, price, amount * price)
+        if symbol:
+            evaluate_symbol("Gate.io", symbol)
+    except Exception:
+        pass
+
+
+def gateio_on_open(ws):
+    print("✅ Gate.io WebSocket bağlandı")
+    try:
+        r = requests.get("https://api.gateio.ws/api/v4/spot/tickers", timeout=10)
+        tickers = r.json()
+        usdt_pairs = [t for t in tickers if t.get("currency_pair", "").endswith("_USDT")]
+        usdt_pairs.sort(key=lambda t: float(t.get("quote_volume", 0) or 0), reverse=True)
+        top_pairs = [t["currency_pair"] for t in usdt_pairs[:200]]
+
+        for i in range(0, len(top_pairs), 50):
+            batch = top_pairs[i:i+50]
+            ws.send(json.dumps({
+                "time": int(time.time()),
+                "channel": "spot.trades",
+                "event": "subscribe",
+                "payload": batch
+            }))
+            time.sleep(0.2)
+        print(f"  → Gate.io: {len(top_pairs)} coin'e abone olundu")
+    except Exception as e:
+        print(f"⚠️ Gate.io abone hatası: {e}")
+
+
+def run_gateio_ws():
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                "wss://api.gateio.ws/ws/v4/",
+                on_open=gateio_on_open,
+                on_message=gateio_on_message,
+                on_error=lambda ws, e: print(f"❌ Gate.io WS hata: {e}"),
+                on_close=lambda ws, c, m: print("🔌 Gate.io WS kapandı, yeniden bağlanıyor..."),
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print(f"⚠️ Gate.io WS döngü hatası: {e}")
+        time.sleep(5)
+
+
+# ── COINBASE WEBSOCKET ────────────────────────────────────────────
+
+def coinbase_on_message(ws, message):
+    try:
+        data = json.loads(message)
+        if data.get("type") != "ticker":
+            return
+        product = data.get("product_id", "")
+        if not product.endswith("-USD") and not product.endswith("-USDT"):
+            return
+        symbol = product.split("-")[0]
+        price = float(data.get("price", 0) or 0)
+        vol = float(data.get("last_size", 0) or 0)
+        if price <= 0:
+            return
+        update_window("Coinbase", symbol, price, vol * price)
+        evaluate_symbol("Coinbase", symbol)
+    except Exception:
+        pass
+
+
+def coinbase_on_open(ws):
+    print("✅ Coinbase WebSocket bağlandı")
+    try:
+        r = requests.get("https://api.exchange.coinbase.com/products", timeout=10)
+        products = r.json()
+        usd_pairs = [p["id"] for p in products if p.get("quote_currency") == "USD" and p.get("status") == "online"]
+        top_pairs = usd_pairs[:150]  # Coinbase tüm coinleri kapsamıyor zaten, hepsini al
+
+        ws.send(json.dumps({
+            "type": "subscribe",
+            "product_ids": top_pairs,
+            "channels": ["ticker"]
+        }))
+        print(f"  → Coinbase: {len(top_pairs)} coin'e abone olundu")
+    except Exception as e:
+        print(f"⚠️ Coinbase abone hatası: {e}")
+
+
+def run_coinbase_ws():
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                "wss://ws-feed.exchange.coinbase.com",
+                on_open=coinbase_on_open,
+                on_message=coinbase_on_message,
+                on_error=lambda ws, e: print(f"❌ Coinbase WS hata: {e}"),
+                on_close=lambda ws, c, m: print("🔌 Coinbase WS kapandı, yeniden bağlanıyor..."),
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print(f"⚠️ Coinbase WS döngü hatası: {e}")
+        time.sleep(5)
+
+
+# ── TEMİZLİK (eski pencere verisi birikmesin) ────────────────────
+
+def cleanup_loop():
+    """Eski sembollerin pencere verisini periyodik temizle — bellek şişmesin."""
+    while True:
+        time.sleep(300)
+        try:
+            now = time.time()
+            removed = 0
+            for symbol in list(price_windows.keys()):
+                all_old = True
+                for exchange, window in price_windows[symbol].items():
+                    if window and now - window[-1][0] < 600:
+                        all_old = False
+                        break
+                if all_old:
+                    del price_windows[symbol]
+                    recent_moves.pop(symbol, None)
+                    removed += 1
+            if removed:
+                print(f"🧹 Temizlik: {removed} eski sembol pencereden silindi")
+        except Exception as e:
+            print(f"⚠️ Cleanup: {e}")
+
+
+# ── ANA ──────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("🎯 ATLAS MOMENTUM HUNTER V2")
-    print("Çoklu Borsa Konfirmasyon + Hacim İvmesi + Fiyat Kırılması")
-    print(f"ch1h>={STICKY_ENTRY_CH1H}% | Hacim>{STICKY_ENTRY_VOL_MUL}x | RSI {STICKY_RSI_MIN}-{STICKY_RSI_MAX}")
+    print("🎯⚡ ATLAS MOMENTUM HUNTER V3 — Çoklu Borsa Gerçek Zamanlı")
+    print("MEXC + Gate.io + Coinbase paralel WebSocket — REST tarama YOK")
+    print(f"Eşik: ch1m>={STICKY_CH1M_MIN}% (dual:{STICKY_CH1M_DUAL}%) | Hacim>{STICKY_VOL_MULTIPLIER}x")
+    print(f"Çıkış: peak'ten -%{STICKY_EXIT_DRAWDOWN} | Push: her {STICKY_PUSH_INTERVAL//60}dk")
     print("=" * 60)
 
+    threads = [
+        threading.Thread(target=run_mexc_ws, daemon=True, name="MEXC-WS"),
+        threading.Thread(target=run_gateio_ws, daemon=True, name="GateIO-WS"),
+        threading.Thread(target=run_coinbase_ws, daemon=True, name="Coinbase-WS"),
+        threading.Thread(target=update_sticky_loop, daemon=True, name="Sticky-Monitor"),
+        threading.Thread(target=cleanup_loop, daemon=True, name="Cleanup"),
+    ]
+    for t in threads:
+        t.start()
+        time.sleep(0.5)
+
+    print("✅ Tüm borsalar paralel dinleniyor. Sistem aktif.\n")
+
+    # Ana thread canlı tut + periyodik durum raporu
     while True:
-        try:
-            # Yapışkan coinleri güncelle
-            if sticky_coins:
-                print(f"\n📌 Yapışkan: {list(sticky_coins.keys())}")
-                for symbol in list(sticky_coins.keys()):
-                    update_sticky(symbol)
-                    time.sleep(0.5)
-
-            scan()
-            time.sleep(60)
-
-        except Exception as e:
-            print(f"❌ Hata: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(30)
+        time.sleep(60)
+        with sticky_lock:
+            active = list(sticky_coins.keys())
+        tracked = len(price_windows)
+        print(f"📊 Durum: {tracked} coin izleniyor | {len(active)} yapışkan mod: {active}")
 
 
 if __name__ == "__main__":
