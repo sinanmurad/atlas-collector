@@ -743,7 +743,7 @@ def parse_ai_levels(ai_text):
 
 def get_last_signal_time(symbol):
     try:
-        r = supabase.table("us_signals").select("created_at").eq("symbol", symbol).order("created_at", ascending=False).limit(1).execute()
+        r = supabase.table("us_signals").select("created_at").eq("symbol", symbol).order("created_at", desc=True).limit(1).execute()
         if r.data:
             dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
             return dt.timestamp()
@@ -1173,7 +1173,7 @@ def send_morning_signals():
             .select("*") \
             .gte("created_at", since) \
             .eq("signal_type", "premarket") \
-            .order("created_at", ascending=False) \
+            .order("created_at", desc=True) \
             .limit(5) \
             .execute()
 
