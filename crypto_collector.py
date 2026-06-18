@@ -2,7 +2,7 @@
 """
 ATLAS KRİPTO KARTAL GÖZÜ — V13 MOMENTUM MİMARİSİ
 ==================================================
-Son güncelleme: 18 Haziran 2026
+Son güncelleme: 19 Haziran 2026
 
 HEDEF: SYN gibi güçlü momentum coinleri erken yakala, yapışkan takip et.
 
@@ -24,8 +24,8 @@ BOT KURALLARI:
 TRAILING STOP:
 - kâr <%2      → stop = giriş - %8 (sabit)
 - kâr %2-%5    → stop = giriş (breakeven)
-- kâr %5-%8    → stop = zirveden -%4
-- kâr >=%8     → stop = zirveden -%6
+- kâr %5-%8    → stop = zirveden -%8
+- kâr >=%8     → stop = zirveden -%12 (18 Haz: %6→%12, SYN erken çıkış sonrası)
 - Min tutma: 4 saat
 
 VERİ KAYNAKLARI:
@@ -39,6 +39,20 @@ MİMARİ NOTLAR:
 - MOMENTUM Hunter (momentum_hunter.py) ayrı servis olarak çalışıyor
 - signal_outcomes tablosu: 24s/72s/7g sonuç takibi
 - learning_weights: min 10 örnek + z>=1.65 ile aktifleşir
+
+DEĞİŞİKLİK GÜNLÜĞÜ (19 Haziran 2026):
+- trusted_coins/trusted_symbols filtresi tamamen kaldırıldı (sadece mcap+rank kontrolü kaldı)
+- Fiyat üst limiti ($2.0) kaldırıldı — VELVET ($0.55), IMU gibi coinler artık taranıyor
+- mcap alt limiti $5M → $1M düşürüldü
+- ch1h ön eleme aralığı genişletildi: -3/+6 → -5/+15
+- ch24h ön eleme: 200% → 500%
+- SUREGEN eşiği: ch24h>=8 → ch24h>=5 (daha erken yakalama)
+- Top-5 sinyal limiti kaldırıldı — tüm CRITICAL/HIGH sinyaller kaydediliyor
+- Bot artık TÜM CRITICAL sinyalleri alıyor (önceden sadece en yüksek skorlu 1 tanesi)
+- İstisnai pozisyon eşiği: score>=24 → score>=16, max 2→3 istisna
+- Trailing stop genişletildi: %4/%6 → %8/%12 (SYN erken çıkış vakası sonrası)
+- "ascending=" parametresi → "desc=" (Supabase kütüphane güncellemesi uyumu)
+- V12 → V13 tüm referanslar güncellendi
 """
 
 import os
@@ -568,8 +582,11 @@ def compute_trailing_stop(buy_price, current, peak):
 
     - Kâr < %3        → stop = giriş - %8 (sabit stop)
     - Kâr %3 - %8     → stop = giriş (breakeven koruması)
-    - Kâr %8 - %15    → stop = zirveden %4 geri çekilme
-    - Kâr >= %15      → stop = zirveden %6 geri çekilme (büyük harekete nefes alanı)
+    - Kâr %8 - %20    → stop = zirveden %8 geri çekilme
+    - Kâr >= %20      → stop = zirveden %12 geri çekilme (SYN gibi güçlü
+                         trendlerde erken çıkışı önler — büyük harekete
+                         nefes alanı tanır, 18 Haz 2026 SYN örneğinden
+                         sonra %6'dan %12'ye genişletildi)
 
     Döner: (stop_price, etiket)
     """
@@ -580,9 +597,9 @@ def compute_trailing_stop(buy_price, current, peak):
     elif profit_pct < TRAIL_4_PCT:
         return buy_price, "breakeven"
     elif profit_pct < TRAIL_6_PCT:
-        return peak * (1 - 0.04), "trail_4pct"
+        return peak * (1 - 0.08), "trail_8pct"
     else:
-        return peak * (1 - 0.06), "trail_6pct"
+        return peak * (1 - 0.12), "trail_12pct"
 
 
 def close_confirmation_score(trade, tech, ob):
@@ -614,8 +631,8 @@ def close_confirmation_score(trade, tech, ob):
         label_map = {
             "sabit_stop": "Sabit stop (%8) vuruldu",
             "breakeven": "Breakeven stop vuruldu (kâr korunuyor)",
-            "trail_4pct": "Trailing stop (zirveden %4) vuruldu",
-            "trail_6pct": "Trailing stop (zirveden %6) vuruldu",
+            "trail_8pct": "Trailing stop (zirveden %8) vuruldu",
+            "trail_12pct": "Trailing stop (zirveden %12) vuruldu",
         }
         return 99, [label_map.get(trail_label, "Stop vuruldu")], False, trailing_stop
 
@@ -2424,7 +2441,7 @@ def scan_once(scan_count=0):
 
 def main():
     print("🚀 Atlas Kripto Kartal Gözü — V13 Momentum Mimarisi")
-    print("📌 Trailing Stop: %8→breakeven→%4→%6 | Min tutma:4s | Max pozisyon:5+3 | BIRIKIM:YOK")
+    print("📌 Trailing Stop: %8→breakeven→%8→%12 | Min tutma:4s | Max pozisyon:5+3 | BIRIKIM:YOK")
     print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
     if not CMC_API_KEY:
