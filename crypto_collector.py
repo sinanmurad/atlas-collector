@@ -2400,27 +2400,19 @@ def scan_once(scan_count=0):
             continue
 
     # ── SEÇİM: CRITICAL sinyaller — tüm layerlar ──────────
-    # BIRIKIM, MOMENTUM, SUREGEN hepsi değerlendirilir
     buy_candidates = [
         s for s in scored
         if s["conviction"] == "CRITICAL"
     ]
 
-    best_buy = None
-    if buy_candidates:
-        best_buy = max(buy_candidates, key=lambda x: x["score"])
-        if len(buy_candidates) > 1:
-            print(f"  ⚖️ {len(buy_candidates)} CRITICAL aday — "
-                  f"sadece {best_buy['symbol']} (score:{best_buy['score']}) alım yapıyor")
+    # Tüm CRITICAL ve HIGH sinyalleri kaydet — top 5 limiti kaldırıldı
+    top = sorted(scored, key=lambda x: -x["score"])
 
-    # Sinyal kayıt — scored zaten CRITICAL/HIGH + score>=14 olarak filtrelendi
-    top = sorted(scored, key=lambda x: -x["score"])[:5]
-
-    print(f"\n📋 {len(scored)} aday → {len(top)} sinyal kaydedilecek")
+    print(f"\n📋 {len(scored)} aday → {len(top)} sinyal kaydedilecek ({len(buy_candidates)} CRITICAL)")
 
     signals_found = 0
     for s in top:
-        allow = (best_buy is not None and s["symbol"] == best_buy["symbol"])
+        allow = s["conviction"] == "CRITICAL"  # Tüm CRITICAL'lar alınır
         if save_signal(s, fg, allow_buy=allow):
             signals_found += 1
         time.sleep(0.5)
