@@ -833,8 +833,11 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
             score += 2
             reasons.append(f"📊 RSI {rsi} — Toparlanıyor")
         elif rsi > 75:
-            score -= 3
-            reasons.append(f"⚠️ RSI {rsi} — Aşırı alım")
+            # BIRIKIM için aşırı alım cezası — MOMENTUM için değil
+            # SYN gibi coinler RSI 75+ iken %100+ yapabiliyor
+            if not suregen_candidate:
+                score -= 1  # Eski -3 yerine -1, çok sert cezalandırma
+            reasons.append(f"⚠️ RSI {rsi} — Yüksek, dikkat")
         elif rsi > 60:
             score += 1
 
@@ -1861,7 +1864,7 @@ def parse_ai(text):
 def get_last_signal_time(symbol):
     try:
         r = supabase.table("crypto_signals").select("created_at") \
-            .eq("symbol", symbol).order("created_at", ascending=False) \
+            .eq("symbol", symbol).order("created_at", desc=True) \
             .limit(1).execute()
         if r.data:
             dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
@@ -2438,11 +2441,11 @@ def scan_once(scan_count=0):
         except Exception:
             continue
 
-    # ── SEÇİM: SADECE CRITICAL + BİRİKİM adayları ──────────
-    # Diğerleri de kaydedilir ama bot alım yapmaz
+    # ── SEÇİM: CRITICAL sinyaller — tüm layerlar ──────────
+    # BIRIKIM, MOMENTUM, SUREGEN hepsi değerlendirilir
     buy_candidates = [
         s for s in scored
-        if s["conviction"] == "CRITICAL" and s["layer"] == "BIRIKIM"
+        if s["conviction"] == "CRITICAL"
     ]
 
     best_buy = None
