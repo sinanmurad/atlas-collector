@@ -1009,8 +1009,13 @@ def calc_bist_levels(price, price_change, symbol=None):
 
 
 def bot_should_buy(price_change, volume_ratio, conviction):
-    # Savaş mimarisi — sadece en yüksek güven + pozitif hareket
-    return conviction == "CRITICAL" and price_change > 0
+    # CRITICAL — her zaman al
+    if conviction == "CRITICAL" and price_change > 0:
+        return True
+    # HIGH — hacim 2x+ ise al (kalite filtresi)
+    if conviction == "HIGH" and price_change > 0 and volume_ratio >= 2.0:
+        return True
+    return False
 
 
 def bist_bot_should_sell(trade, current_price):
@@ -1113,7 +1118,11 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction=None,
                     return False
                 is_exceptional = True
 
-        invest = min(balance * 0.10, 1000)  # Max ₺1.000 per trade (TL bazlı)
+        # HIGH sinyaller için daha küçük pozisyon
+        if conviction == "HIGH":
+            invest = min(balance * 0.05, 500)  # Max ₺500 (HIGH)
+        else:
+            invest = min(balance * 0.10, 1000)  # Max ₺1.000 (CRITICAL)
         if invest < 100:  # Min ₺100
             return False
         quantity = invest / price
