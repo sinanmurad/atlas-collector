@@ -101,8 +101,8 @@ ZOMBIE_HOLD_HOURS = 24        # Bu süre geçti + kâr yok + doğrulama yetersiz
 CLOSE_SCORE_MIN = 5           # Doğrulama katmanı minimum puan
 MIN_PROFIT_PCT = 0.03         # Doğrulama çıkışı için min %3 kâr
 MAX_OPEN_FREE = 3             # Free kullanıcı max açık pozisyon
-MAX_OPEN_PRO = 3              # Pro max normal pozisyon
-MAX_OPEN_PRO_EXCEPTIONAL = 5  # Pro istisna ile max
+MAX_OPEN_PRO = 5              # Pro max normal pozisyon
+MAX_OPEN_PRO_EXCEPTIONAL = 8  # Pro istisna ile max
 INVEST_PCT_CRITICAL = 0.20    # CRITICAL sinyalde bakiyenin %20'si
 INVEST_PCT_HIGH = 0.15        # HIGH sinyalde %15
 MAX_INVEST_USD = 50           # Pozisyon başı max $50
@@ -1864,7 +1864,7 @@ def parse_ai(text):
 def get_last_signal_time(symbol):
     try:
         r = supabase.table("crypto_signals").select("created_at") \
-            .eq("symbol", symbol).order("created_at", desc=True) \
+            .eq("symbol", symbol).order("created_at", ascending=False) \
             .limit(1).execute()
         if r.data:
             dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
