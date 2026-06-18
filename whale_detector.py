@@ -13,16 +13,18 @@ DEĞİŞİKLİK GÜNLÜĞÜ:
 - Duplicate koruma: aynı sembolde açık pozisyon varsa tekrar alım yok
 
 [19 Haziran 2026]
-- KRİTİK FIX: on_open() artık DÖNEN PENCERE kullanıyor. Eskiden her
-  WebSocket (yeniden)bağlantısında SADECE active_symbols[:50] —yani
-  watchlist'in ilk 50 hissesi— izleniyordu. WebSocket sık sık kopup
-  yeniden bağlandığı için (rate limit, ağ hatası) bot SAATLERCE aynı
-  50 hisseyi görüyor, geri kalan 950+ hisseyi HİÇ görmüyordu. Bu yüzden
-  borsa 6.5 saat açıkken (18 Haziran 13:30-20:00 UTC) sıfır canlı
-  sinyal üretildi. Çözüm: her (yeniden)bağlantıda farklı 50'lik blok
-  abone olunuyor, tüm watchlist ~20 dakikada bir tam tur atıyor.
+- KRİTİK FIX #1: on_open() dönen pencere kullanmaya başladı (sonra
+  aşağıdaki #2 ile komple değiştirildi).
+- KRİTİK FIX #2 (asıl çözüm): Tek WebSocket + dönen pencere yerine
+  PARALEL ÇOK BAĞLANTI mimarisine geçildi. Watchlist N hisseyse,
+  N/50 adet WebSocket bağlantısı AYNI ANDA açılıyor — her biri kendi
+  50'lik dilimini sürekli dinliyor, koparsa kendi başına yeniden
+  bağlanıyor. Artık "tam tur ~20 dakika" gecikmesi yok — TÜM watchlist
+  her an gerçek zamanlı izleniyor. (18 Haziran'da eski mimariyle 6.5
+  saat boyunca sıfır canlı sinyal üretilmişti — kök neden buydu.)
 - Watchlist filtresi gevşetildi: $1-20 + 500K hacim → $0.50+ + 100K hacim
   (POWW gibi düşük hacimli ama hareketli hisseler artık watchlist'e giriyor)
+- "ascending=" parametresi → "desc=" (Supabase kütüphane uyumu)
 """
 import os
 import json
@@ -1383,36 +1385,12 @@ def on_message(ws, message):
         print(f"WS mesaj hatası: {e}")
 
 
-def on_open(ws):
-    """
-    19 Haz 2026: DÖNEN PENCERE — her (yeniden)bağlantıda farklı 50'lik
-    blok abone olunuyor. Eskiden hep active_symbols[:50] kullanılıyordu;
-    WebSocket sık koptuğu için bot saatlerce aynı 50 hisseyi görüyor,
-    geri kalan watchlist'i hiç göremiyordu (18 Haziran'da 6.5 saat
-    boyunca sıfır canlı sinyal — bu yüzden).
-    """
-    global _ws_window_index
-    total = len(active_symbols)
-    if total == 0:
-        print("⚠️ active_symbols boş — abone olunamadı")
-        return
-
-    start = (_ws_window_index["i"] * WS_WINDOW_SIZE) % max(total, 1)
-    end = start + WS_WINDOW_SIZE
-
-    if end <= total:
-        symbols_to_sub = active_symbols[start:end]
-    else:
-        # Listenin sonuna geldi — başa sar
-        symbols_to_sub = active_symbols[start:] + active_symbols[:end - total]
-
-    _ws_window_index["i"] += 1
-    total_windows = (total // WS_WINDOW_SIZE) + 1
-
-    print(f"✅ WebSocket bağlandı. {len(symbols_to_sub)} hisse izleniyor... "
-          f"(pencere {_ws_window_index['i']}/{total_windows}, toplam {total} hisse)")
-    for symbol in symbols_to_sub:
-        ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
+def _make_on_open(symbols_chunk, conn_index, total_conns):
+    def on_open(ws):
+        print(f"✅ WS bağlantı {conn_index}/{total_conns} açıldı — {len(symbols_chunk)} hisse")
+        for symbol in symbols_chunk:
+            ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
+    return on_open
 
 
 def on_error(ws, error):
@@ -1424,20 +1402,67 @@ def on_error(ws, error):
         print(f"❌ WebSocket hatası: {error}")
 
 
-def on_close(ws, close_status_code, close_msg):
-    print("🔌 Bağlantı kapandı, 10sn sonra yeniden bağlanacak...")
-    time.sleep(10)
+def _make_on_close(conn_index):
+    def on_close(ws, close_status_code, close_msg):
+        print(f"🔌 WS bağlantı {conn_index} kapandı, 10sn sonra yeniden bağlanacak...")
+    return on_close
+
+
+def _run_single_connection(symbols_chunk, conn_index, total_conns):
+    """Tek bir WebSocket bağlantısını sürekli ayakta tutar — kopunca yeniden bağlanır."""
+    while is_market_open():
+        try:
+            ws = websocket.WebSocketApp(
+                f"wss://ws.finnhub.io?token={FINNHUB_KEY}",
+                on_open=_make_on_open(symbols_chunk, conn_index, total_conns),
+                on_message=on_message,
+                on_error=on_error,
+                on_close=_make_on_close(conn_index)
+            )
+            ws.run_forever()
+        except Exception as e:
+            print(f"⚠️ WS bağlantı {conn_index} hatası: {e}")
+        if is_market_open():
+            time.sleep(10)
 
 
 def connect_websocket():
-    ws = websocket.WebSocketApp(
-        f"wss://ws.finnhub.io?token={FINNHUB_KEY}",
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    ws.run_forever()
+    """
+    19 Haz 2026: PARALEL ÇOK BAĞLANTILI WEBSOCKET — eskiden tek bağlantı
+    ve dönen pencere vardı (her (yeniden)bağlantıda farklı 50 hisse,
+    tam tur ~20 dakika sürüyordu — bu çok yavaş, hareketler kaçıyordu).
+    Şimdi watchlist'in TAMAMI paralel WebSocket bağlantılarıyla AYNI ANDA
+    izleniyor (Finnhub bağlantı başına 50 sembol limiti var ama bağlantı
+    SAYISINI sınırlamıyor). 1000 hisse → 20 paralel bağlantı → hepsi
+    gerçek zamanlı, kaçırma sıfıra iner.
+    """
+    total = len(active_symbols)
+    if total == 0:
+        print("⚠️ active_symbols boş — WebSocket başlatılamadı")
+        time.sleep(30)
+        return
+
+    chunks = [active_symbols[i:i + WS_WINDOW_SIZE] for i in range(0, total, WS_WINDOW_SIZE)]
+    total_conns = len(chunks)
+    print(f"📡 {total} hisse → {total_conns} paralel WebSocket bağlantısı açılıyor...")
+
+    threads = []
+    for idx, chunk in enumerate(chunks, start=1):
+        t = threading.Thread(
+            target=_run_single_connection,
+            args=(chunk, idx, total_conns),
+            daemon=True
+        )
+        t.start()
+        threads.append(t)
+        time.sleep(0.3)  # Finnhub'ı aynı anda boğmamak için kademeli aç
+
+    print(f"✅ {total_conns} WebSocket bağlantısı aktif — {total} hisse gerçek zamanlı izleniyor")
+
+    # Ana thread borsa açık olduğu sürece bekler
+    while is_market_open():
+        time.sleep(30)
+    print("🔔 Borsa kapandı — WebSocket bağlantıları sonlanıyor")
 
 
 def position_monitor_loop():
