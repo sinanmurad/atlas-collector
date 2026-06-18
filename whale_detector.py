@@ -909,8 +909,8 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, scor
                 print(f"⚠️ {user_id} 3 açık pozisyon dolu (Free)")
                 return False
         else:
-            BASE_CAP = 3
-            EXCEPTIONAL_CAP = 2
+            BASE_CAP = 5
+            EXCEPTIONAL_CAP = 3
             MAX_TOTAL = BASE_CAP + EXCEPTIONAL_CAP
 
             if open_count >= MAX_TOTAL:
