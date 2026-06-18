@@ -1986,7 +1986,7 @@ def _execute_buy(user_id, symbol, price, signal_id, conviction, layer,
         is_exceptional = False
 
         if open_count >= max_normal:
-            if is_pro and score >= 24 and exceptional_count < 2 and open_count < MAX_OPEN_PRO_EXCEPTIONAL:
+            if is_pro and score >= 16 and exceptional_count < 3 and open_count < MAX_OPEN_PRO_EXCEPTIONAL:
                 is_exceptional = True
                 print(f"  🌟 İSTİSNAİ: {symbol} (score={score}) — slot {open_count+1}")
             else:
