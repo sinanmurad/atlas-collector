@@ -4,6 +4,23 @@ ATLAS MOMENTUM HUNTER V3 — Çoklu Borsa Gerçek Zamanlı Avcı
 =============================================================
 Son güncelleme: 19 Haziran 2026
 
+DEĞİŞİKLİK GÜNLÜĞÜ:
+[19 Haziran 2026 — ilk canlı test]
+- crypto_signals insert hatası düzeltildi: "coin" kolonu NOT NULL idi,
+  sadece "symbol" gönderiliyordu → coin=symbol eklendi.
+- İlk canlı testte 3 borsa da bağlandı (MEXC 200, Gate.io 200,
+  Coinbase 150 coin) ve DEXT anında yakalandı (ch1m:4.08%, vol:3.0x) —
+  mimari çalışıyor, REST tarama beklemesi olmadan saniyeler içinde tespit.
+- KRİTİK EKSİK GİDERİLDİ: V3 sadece push+sinyal kaydı yapıyordu, demo_trades'e
+  hiç dokunmuyordu — gerçek bot alımı YOKTU. bot_buy_sticky() ve
+  sell_sticky_positions() eklendi: artık yapışkan moda giriş gerçek
+  pozisyon açıyor, çıkışta gerçek satış yapıp bakiyeyi güncelliyor.
+- DİNAMİK YATIRIM: Sabit %20/$50 yerine sinyal gücüne göre $50-$200
+  arası ölçekli yatırım. Güç = ch1m büyüklüğü (%40) + hacim çarpanı
+  (%40) + çift borsa konfirmasyon bonusu (%20). Zayıf sinyal $50 taban
+  alır, çok güçlü sinyal (yüksek ch1m + yüksek hacim + dual confirm)
+  $200'e kadar çıkar. Bakiyenin %30'unu asla geçmez.
+
 HEDEF: SYN gibi coinleri %3-5'te yakala, sonuna kadar yapışkan takip et.
 Hiçbir tarama turu beklemeden — borsa hareket ettiği AN yakalanır.
 
@@ -76,6 +93,34 @@ STICKY_PUSH_INTERVAL  = 600   # 10 dakikada bir periyodik push
 STICKY_EXIT_DRAWDOWN  = 8.0   # Peak'ten %8 → çıkış
 STICKY_MAX_HOLD_H     = 48
 DUAL_CONFIRM_WINDOW_S = 30    # İki borsada hareket arası max 30sn = "aynı anda"
+
+# Bot alımı parametreleri
+MAX_OPEN_PRO = 5
+MAX_OPEN_PRO_EXCEPTIONAL = 8
+MIN_INVEST_USD = 50    # Taban — en zayıf sinyal bile en az bunu alır
+MAX_INVEST_USD = 200   # Tavan — en güçlü sinyal bunu geçemez
+STOP_PCT = 0.08
+balance_lock = threading.Lock()
+
+
+def calc_dynamic_investment(balance, ch1m, vol_mult, dual_confirmed):
+    """
+    Sinyal gücüne göre dinamik yatırım tutarı.
+    Güç skoru: ch1m büyüklüğü + hacim çarpanı + çift borsa bonusu.
+    $50 taban, $200 tavan — bakiyenin de üstüne çıkmaz.
+    """
+    # Güç skoru 0-1 arası normalize
+    ch1m_score = min(ch1m / 6.0, 1.0)          # %6+ ch1m = tam puan
+    vol_score = min(vol_mult / 8.0, 1.0)        # 8x+ hacim = tam puan
+    dual_bonus = 0.25 if dual_confirmed else 0
+
+    strength = (ch1m_score * 0.4) + (vol_score * 0.4) + dual_bonus
+    strength = min(strength, 1.0)
+
+    # $50 (zayıf) → $200 (çok güçlü) arası lineer ölçek
+    invest = MIN_INVEST_USD + (MAX_INVEST_USD - MIN_INVEST_USD) * strength
+    invest = min(invest, balance * 0.30)  # Bakiyenin %30'unu asla geçme
+    return round(invest, 2), round(strength, 2)
 
 LEV_SUFFIXES = ("3S", "5S", "3L", "5L", "2S", "2L", "10S", "10L", "UP", "DOWN", "BEAR", "BULL")
 STABLECOINS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDD", "BUSD", "USDE", "PYUSD"}
@@ -174,16 +219,113 @@ def send_push(title, body, symbol=None, extra=None):
 
 def log_signal(symbol, price, ch1m, vol_mult, mode, detail=""):
     try:
-        supabase.table("crypto_signals").insert({
+        result = supabase.table("crypto_signals").insert({
             "symbol": symbol,
+            "coin": symbol,
             "signal_type": f"momentum_v3_{mode}",
             "price": price,
             "description": f"⚡ MOMENTUM V3 {mode.upper()} | {symbol} | ${price} | ch1m:{ch1m}% | vol:{vol_mult}x | {detail}",
             "conviction": "CRITICAL",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
+        return result.data[0].get("id") if result.data else None
     except Exception as e:
         print(f"⚠️ Log: {e}")
+        return None
+
+
+def bot_buy_sticky(symbol, price, signal_id, ch1m, vol_mult, confirmed_by):
+    """Yapışkan mod girişinde gerçek bot alımı yapar — yatırım sinyal gücüne göre dinamik."""
+    try:
+        try:
+            ms = supabase.table("market_status").select("crypto_status, vix") \
+                .eq("id", 1).maybeSingle().execute()
+            if ms.data:
+                if ms.data.get("crypto_status") == "RED":
+                    print(f"  🔴 MAKRO RED — {symbol} alımı durduruldu")
+                    return
+                vix = float(ms.data.get("vix") or 0)
+                if vix >= 25:
+                    print(f"  ⚠️ VIX {vix:.1f} — {symbol} alımı durduruldu")
+                    return
+        except Exception:
+            pass
+
+        dual_confirmed = len(confirmed_by) > 0 and any("+" in c for c in confirmed_by)
+
+        portfolios = supabase.table("demo_portfolios").select("user_id, crypto_balance").execute()
+        if not portfolios.data:
+            return
+
+        for p in portfolios.data:
+            user_id = p["user_id"]
+            try:
+                profile = supabase.table("profiles").select("is_pro").eq("id", user_id).limit(1).execute()
+                is_pro = profile.data[0].get("is_pro", False) if profile.data else False
+                if not is_pro:
+                    continue
+
+                open_trades = supabase.table("demo_trades").select("*") \
+                    .eq("user_id", user_id).eq("market", "CRYPTO").eq("status", "open").execute()
+                open_list = open_trades.data or []
+                open_count = len(open_list)
+
+                if any(t.get("symbol") == symbol for t in open_list):
+                    print(f"  ⏭️ {symbol} zaten açık — {user_id[:8]} atlandı")
+                    continue
+
+                exceptional_count = sum(1 for t in open_list if t.get("is_exceptional"))
+                is_exceptional = False
+
+                if open_count >= MAX_OPEN_PRO:
+                    if exceptional_count < 3 and open_count < MAX_OPEN_PRO_EXCEPTIONAL:
+                        is_exceptional = True
+                    else:
+                        print(f"  ⏭️ {user_id[:8]} dolu ({open_count}) — {symbol} atlandı")
+                        continue
+
+                stop_price = round(price * (1 - STOP_PCT), 10)
+
+                with balance_lock:
+                    fresh = supabase.table("demo_portfolios").select("crypto_balance") \
+                        .eq("user_id", user_id).limit(1).execute()
+                    balance = fresh.data[0]["crypto_balance"] if fresh.data else 0
+
+                    invest, strength = calc_dynamic_investment(balance, ch1m, vol_mult, dual_confirmed)
+                    if invest < 5 or balance < invest:
+                        print(f"  ⏭️ {user_id[:8]} bakiye yetersiz (${balance:.0f} < ${invest:.0f})")
+                        continue
+
+                    supabase.table("demo_trades").insert({
+                        "user_id": user_id,
+                        "symbol": symbol,
+                        "market": "CRYPTO",
+                        "signal_id": signal_id,
+                        "buy_price": price,
+                        "buy_date": datetime.now(timezone.utc).isoformat(),
+                        "quantity": round(invest / price, 6),
+                        "status": "open",
+                        "signal_layer": "MOMENTUM_V3",
+                        "entry_conviction": "CRITICAL",
+                        "stop_price": stop_price,
+                        "current_price": price,
+                        "peak_price": price,
+                        "entry_reason": f"V3 anlık yakalama (güç:{strength}): ch1m:{ch1m}% vol:{vol_mult}x | {' + '.join(confirmed_by)}",
+                        "is_exceptional": is_exceptional,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }).execute()
+
+                    supabase.table("demo_portfolios").update({
+                        "crypto_balance": round(balance - invest, 2)
+                    }).eq("user_id", user_id).execute()
+
+                tag = "🌟" if is_exceptional else "✅"
+                print(f"  {tag} BOT ALIM: {user_id[:8]} → {symbol} ${invest:.0f} (güç:{strength}) | Stop:{stop_price:.8f}")
+            except Exception as e:
+                print(f"⚠️ bot_buy_sticky {user_id[:8]}: {e}")
+            time.sleep(0.1)
+    except Exception as e:
+        print(f"❌ bot_buy_sticky: {e}")
 
 
 # ── YAPIŞKAN MOD ──────────────────────────────────────────────────
@@ -208,8 +350,43 @@ def enter_sticky(symbol, price, ch1m, vol_mult, confirmed_by):
         symbol=symbol,
         extra={"mode": "sticky_entry"}
     )
-    log_signal(symbol, price, ch1m, vol_mult, "entry", konfirm)
+    signal_id = log_signal(symbol, price, ch1m, vol_mult, "entry", konfirm)
+    bot_buy_sticky(symbol, price, signal_id, ch1m, vol_mult, confirmed_by)
     print(f"\n🎯⚡ ANINDA YAKALANDI: {symbol} @ ${price:.6f} | ch1m:{ch1m}% vol:{vol_mult}x | {konfirm}")
+
+
+def sell_sticky_positions(symbol, exit_price, exit_reason):
+    """Yapışkan mod çıkışında demo_trades'teki gerçek pozisyonları kapatır."""
+    try:
+        trades = supabase.table("demo_trades").select("*") \
+            .eq("symbol", symbol).eq("market", "CRYPTO").eq("status", "open") \
+            .eq("signal_layer", "MOMENTUM_V3").execute()
+        if not trades.data:
+            return
+        for trade in trades.data:
+            try:
+                pl = (exit_price - float(trade["buy_price"])) * float(trade["quantity"])
+                supabase.table("demo_trades").update({
+                    "sell_price": exit_price,
+                    "sell_date": datetime.now(timezone.utc).isoformat(),
+                    "status": "closed",
+                    "profit_loss": round(pl, 2),
+                    "exit_reason": exit_reason,
+                }).eq("id", trade["id"]).execute()
+
+                with balance_lock:
+                    port = supabase.table("demo_portfolios").select("crypto_balance") \
+                        .eq("user_id", trade["user_id"]).limit(1).execute()
+                    if port.data:
+                        new_bal = port.data[0]["crypto_balance"] + (float(trade["quantity"]) * exit_price)
+                        supabase.table("demo_portfolios").update({
+                            "crypto_balance": round(new_bal, 2)
+                        }).eq("user_id", trade["user_id"]).execute()
+                print(f"  💰 KAPANDI: {trade['user_id'][:8]} → {symbol} | ${pl:.2f}")
+            except Exception as e:
+                print(f"⚠️ sell_sticky {trade.get('id')}: {e}")
+    except Exception as e:
+        print(f"❌ sell_sticky_positions: {e}")
 
 
 def update_sticky_loop():
@@ -250,12 +427,14 @@ def update_sticky_loop():
                         symbol=symbol, extra={"mode": "sticky_exit"}
                     )
                     print(f"🔴 {symbol} ÇIKIŞ: -{drawdown:.1f}% zirveden | K/Z:{gain:+.1f}%")
+                    sell_sticky_positions(symbol, price, f"Trailing stop (zirveden -%{STICKY_EXIT_DRAWDOWN:.0f})")
                     with sticky_lock:
                         sticky_coins.pop(symbol, None)
                     continue
 
                 if hold_hours >= STICKY_MAX_HOLD_H:
                     send_push(title=f"⏰ {symbol} — 48s doldu", body=f"K/Z: {gain:+.1f}%", symbol=symbol)
+                    sell_sticky_positions(symbol, price, "48 saat doldu — zaman aşımı")
                     with sticky_lock:
                         sticky_coins.pop(symbol, None)
                     continue
