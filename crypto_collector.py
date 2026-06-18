@@ -2342,20 +2342,15 @@ def scan_once(scan_count=0):
             time.sleep(0.2)
 
             # ── DİNAMİK KALİTE FİLTRESİ ─────────────────────────
-            # Statik liste yok — her taramada CMC + borsa verisinden otomatik
-            # BSB gibi coinler: CMC rank <500 + $10M mcap + güvenilir borsada
             mcap = coin.get("mcap", 0)
             cmc_rank = coin.get("cmc_rank", 9999)
-            in_trusted = symbol in trusted_symbols  # KuCoin/Huobi/Coinbase listeli
 
-            # Temel kalite eşiği
+            # Temel kalite eşiği — sadece mcap ve rank filtresi
             if mcap < 5_000_000:
                 continue  # $5M altı mcap — likidite yok
 
-            if not in_trusted:
-                # Güvenilir borsada listeli değil — çok sıkı
-                if mcap < 50_000_000 or cmc_rank > 300:
-                    continue
+            if mcap < 10_000_000 and cmc_rank > 1000:
+                continue  # Çok küçük ve bilinmez — manipülasyon riski
 
             # trusted_coins DB'de varsa ekstra bonus olarak kullan (engel değil)
             in_trusted_db = symbol in trusted_coins_db if trusted_coins_db else False
