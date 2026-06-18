@@ -1,4 +1,29 @@
 # -*- coding: utf-8 -*-
+"""
+ATLAS US KARTAL GÖZÜ — WHALE DETECTOR
+=======================================
+Son güncelleme: 19 Haziran 2026
+
+DEĞİŞİKLİK GÜNLÜĞÜ:
+[18 Haziran 2026]
+- Sabah push'tan bot alımı kaldırıldı — sadece bildirim, gerçek alım
+  13:30 UTC WebSocket açılınca canlı fiyattan yapılıyor
+- "ascending=" parametresi → "desc=" (Supabase kütüphane uyumu)
+- BASE_CAP 3→5, EXCEPTIONAL_CAP 2→3 (max 8 pozisyon)
+- Duplicate koruma: aynı sembolde açık pozisyon varsa tekrar alım yok
+
+[19 Haziran 2026]
+- KRİTİK FIX: on_open() artık DÖNEN PENCERE kullanıyor. Eskiden her
+  WebSocket (yeniden)bağlantısında SADECE active_symbols[:50] —yani
+  watchlist'in ilk 50 hissesi— izleniyordu. WebSocket sık sık kopup
+  yeniden bağlandığı için (rate limit, ağ hatası) bot SAATLERCE aynı
+  50 hisseyi görüyor, geri kalan 950+ hisseyi HİÇ görmüyordu. Bu yüzden
+  borsa 6.5 saat açıkken (18 Haziran 13:30-20:00 UTC) sıfır canlı
+  sinyal üretildi. Çözüm: her (yeniden)bağlantıda farklı 50'lik blok
+  abone olunuyor, tüm watchlist ~20 dakikada bir tam tur atıyor.
+- Watchlist filtresi gevşetildi: $1-20 + 500K hacim → $0.50+ + 100K hacim
+  (POWW gibi düşük hacimli ama hareketli hisseler artık watchlist'e giriyor)
+"""
 import os
 import json
 import time
@@ -37,6 +62,10 @@ LEARNING_MAX_BONUS = 6           # ±6 puan — CRITICAL eşiğini etkiler
 LEARNING_BASELINE_WINRATE = 0.50 # %50 beklenti — altında ceza, üstünde ödül
 OUTCOME_CHECK_HOURS = [24, 72, 168]   # 24s, 72s, 7g sonuç ölçümü
 
+# ── WEBSOCKET DÖNEN PENCERE — 19 Haz 2026 ──────────────────────────
+WS_WINDOW_SIZE = 50              # Finnhub WebSocket sembol limiti
+_ws_window_index = {"i": 0}      # Her (yeniden)bağlantıda ilerler
+
 try:
     if FIREBASE_SERVICE_ACCOUNT and not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
@@ -67,19 +96,8 @@ def log_activity(event_type, symbol=None, price=None, pnl=None, pnl_pct=None,
 
 
 # ============================================================
-# OTOMATİK ÖĞRENME SİSTEMİ (crypto_collector.py V12 ile aynı mantık)
+# OTOMATİK ÖĞRENME SİSTEMİ
 # ============================================================
-# Akış:
-# 1. Her bot alımında signal_outcomes'a kayıt atılır (record_signal_outcome)
-# 2. Her taramada check_signal_outcomes() 24s/72s/7g dolan kayıtların
-#    gerçek sonucunu ölçer (fiyat şu an ne oldu, kâr/zarar %)
-# 3. update_learning_weights() yeterli örnek (>=30) + istatistiksel
-#    anlamlılık (|z|>=1.96) varsa learning_weights tablosuna katsayı yazar
-# 4. premarket_conviction/process_live_signal bu katsayıyı okuyup
-#    ±LEARNING_MAX_BONUS uygular
-# Hiçbir adım manuel müdahale gerektirmez — sistem kendi kendine evrilir.
-# TR/US, signal_outcomes/learning_weights tablolarını market='BIST'/'US'
-# filtresiyle kripto ile aynı tablodan paylaşır — karışmazlar.
 
 def score_bucket(score):
     """RSI bucket'ının TR/US karşılığı — entry_score bandı."""
@@ -127,10 +145,7 @@ def _yf_last_price(symbol):
 
 
 def check_signal_outcomes(market="US", price_fetcher=None):
-    """
-    24s/72s/7g eşiklerini dolduran kayıtların gerçek sonucunu ölçer.
-    price_fetcher verilmezse yfinance kullanılır.
-    """
+    """24s/72s/7g eşiklerini dolduran kayıtların gerçek sonucunu ölçer."""
     if price_fetcher is None:
         price_fetcher = _yf_last_price
 
@@ -184,13 +199,7 @@ def check_signal_outcomes(market="US", price_fetcher=None):
 
 
 def update_learning_weights(market="US"):
-    """
-    KALE MİMARİSİ — US learning sistemi
-    layer + score_bucket kombinasyonu
-    - Min 10 örnek, z >= 1.65
-    - Kaybeden pattern 2x hızlı cezalandırılır
-    - %50 baseline
-    """
+    """KALE MİMARİSİ — US learning sistemi. layer + score_bucket kombinasyonu."""
     try:
         rows = supabase.table("signal_outcomes") \
             .select("layer, entry_score, pct_24h") \
@@ -224,7 +233,6 @@ def update_learning_weights(market="US"):
             if abs(z) < LEARNING_MIN_ABS_Z:
                 continue
 
-            # Asimetrik: kaybedende 2x hızlı öğren
             loss_multiplier = 2.0 if z < 0 else 1.0
             magnitude = min(abs(z) / 3.0, 1.0) * LEARNING_MAX_BONUS * loss_multiplier
             magnitude = min(magnitude, LEARNING_MAX_BONUS)
@@ -267,11 +275,7 @@ _learning_cache_us = {"data": {}, "ts": 0}
 
 
 def get_learning_bonus(layer, score, market="US"):
-    """
-    premarket_conviction/process_live_signal tarafından çağrılır.
-    learning_weights'ten önceden hesaplanmış katsayıyı okur.
-    10 dakika cache'lenir.
-    """
+    """learning_weights'ten önceden hesaplanmış katsayıyı okur. 10 dakika cache'lenir."""
     global _learning_cache_us
     now = time.time()
     if now - _learning_cache_us["ts"] > 600:
@@ -388,7 +392,9 @@ def refresh_watchlist_background():
                     try:
                         price = float(closes[sym])
                         vol = float(volumes[sym])
-                        if 1.0 <= price <= 20.0 and vol >= 500_000:
+                        # 19 Haz 2026: filtre gevşetildi $1-20+500K → $0.50+ + 100K
+                        # (POWW gibi düşük hacimli ama hareketli hisseler için)
+                        if price >= 0.50 and vol >= 100_000:
                             candidates.append(sym)
                             avg_volumes[sym] = vol
                             profile = {"name": "", "sector": "", "market_cap": 0, "country": "", "exchange": ""}
@@ -643,7 +649,6 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
         score += 1
         reasons.append(f"Dün +{trend_data['prev_change']}% pozitif")
 
-    # Layer ayrımı — sinyalin kaynağına göre
     if earnings:
         layer = "EARNINGS"
     elif catalyst:
@@ -651,7 +656,6 @@ def premarket_conviction(trend_data, catalyst, earnings, analyst, insider):
     else:
         layer = "TEKNIK"
 
-    # Öğrenme bonusu — geçmiş 24s sonuçlarına göre ±LEARNING_MAX_BONUS
     bonus = get_learning_bonus(layer, score, market="US")
     if bonus != 0:
         score += bonus
@@ -798,7 +802,7 @@ tracker = VolumeTracker()
 
 
 # ============================================================
-# BOT — SAVAŞ MİMARİSİ (Kripto V12 → US uyarlaması)
+# BOT — SAVAŞ MİMARİSİ
 # ============================================================
 
 def get_open_us_trades(user_id):
@@ -822,15 +826,14 @@ def calc_us_levels(price, trend_data):
     Stop: volatilite x1.5 (max %8), Hedef: volatilite x5 (max %20)"""
     daily_vol = abs(trend_data.get("5d_change", 0)) / 5 if trend_data else 2.0
     daily_vol = max(daily_vol, 1.5)
-    stop_pct   = min(daily_vol * 1.5, 8.0)   # max %8 aşağı
-    target_pct = min(daily_vol * 5.0, 20.0)  # max %20 yukarı
+    stop_pct   = min(daily_vol * 1.5, 8.0)
+    target_pct = min(daily_vol * 5.0, 20.0)
     stop   = price * (1 - stop_pct / 100)
     target = price * (1 + target_pct / 100)
     return round(stop, 2), round(target, 2)
 
 
 def bot_should_buy(price_change, volume_ratio, conviction):
-    # CRITICAL sinyal yeterli — premarket'te fiyat değişimi negatif olabilir
     return conviction == "CRITICAL"
 
 
@@ -840,8 +843,6 @@ def us_bot_should_sell(trade, current_price):
     change = ((current_price - buy_price) / buy_price) * 100
     peak_change = ((peak - buy_price) / buy_price) * 100
 
-    # ── AŞAMA 1: SABİT STOP (%8) — pozisyon henüz kâra geçmedi ──
-    # Peak henüz buy_price seviyesinde — sabit stop korur
     if peak_change < 2.0:
         stop = trade.get("stop_price") or buy_price * 0.92
         if current_price <= stop:
@@ -849,23 +850,17 @@ def us_bot_should_sell(trade, current_price):
             return True, "stop_loss", peak
         return False, "", peak
 
-    # ── AŞAMA 2: BREAKEVEN — peak %2+ üzerine çıktı ──
-    # Stop artık alış fiyatına çekildi (zarar yok garantisi)
     if peak_change < 5.0:
         if current_price <= buy_price:
             print(f"  ⚖️ BREAKEVEN STOP: tepe %{peak_change:.1f}, şimdi %{change:.1f}")
             return True, "breakeven", peak
         return False, "", peak
 
-    # ── AŞAMA 3: TRAİLİNG STOP — peak %5+ üzerine çıktı ──
-    # Tepeden %4 geri çekilince sat — fiyat ne kadar yükselirse
-    # stop da o kadar yukarı çekilir (kripto ile aynı mekanizma)
-    trailing_stop = peak * 0.96  # tepeden %4 aşağı
+    trailing_stop = peak * 0.96
     if current_price <= trailing_stop:
         print(f"  🔄 TRAİLİNG STOP (tepeden %4): tepe ${peak:.2f} → şimdi ${current_price:.2f} (%{change:.1f})")
         return True, "trailing_stop", peak
 
-    # ── ZOMBİ TEMİZLİĞİ — 48+ saat açık, kâr yok ──
     try:
         buy_date = trade.get("buy_date")
         if buy_date:
@@ -884,7 +879,6 @@ def us_bot_should_sell(trade, current_price):
 
 def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, score, reasons, trend_data, layer=None):
     try:
-        # ── MAKRO KONTROL ────────────────────────────────────────
         try:
             ms = supabase.table("market_status").select("us_status") \
                 .eq("id", 1).maybeSingle().execute()
@@ -896,7 +890,6 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, scor
         open_trades = get_open_us_trades(user_id)
         open_count = len(open_trades)
 
-        # Aynı sembolde açık pozisyon varsa tekrar alma
         open_symbols = [t.get("symbol") for t in open_trades]
         if symbol in open_symbols:
             print(f"  ⏭️ {symbol} zaten açık pozisyonda — tekrar alım yapılmıyor")
@@ -1173,7 +1166,7 @@ def run_premarket_scan():
 
 
 def send_morning_signals():
-    """Gece hazırlanan US sinyallerini 15:30 TR'de push ile gönder + bot alımı yap"""
+    """Gece hazırlanan US sinyallerini 15:30 TR'de push ile gönder — sadece bildirim"""
     try:
         since = (datetime.now(timezone.utc) - timedelta(hours=16)).isoformat()
         r = supabase.table("us_signals") \
@@ -1202,7 +1195,6 @@ def send_morning_signals():
             )
             score = signal.get("score") or 0
 
-            # Sadece CRITICAL sinyaller için bot alımı
             if conviction != "CRITICAL":
                 print(f"  ⏭️ {symbol} {conviction} — bot alımı yok, sadece push")
             
@@ -1226,7 +1218,6 @@ def send_morning_signals():
                 signal_id=signal_id
             )
 
-            # HIGH sinyalleri signal_outcomes'a kaydet — sonuç takibi için
             if conviction == "HIGH":
                 record_signal_outcome(signal_id, symbol, "PREMARKET", conviction, score, price, market="US")
                 print(f"  📊 {symbol} HIGH — signal_outcomes'a kaydedildi (bot almıyor)")
@@ -1246,7 +1237,7 @@ def send_morning_signals():
 def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
     if not is_market_open():
         return
-    if price < 1.0 or price > 20.0:
+    if price < 0.50:
         return
     if price_change < 0:
         return
@@ -1339,12 +1330,10 @@ def process_live_signal(symbol, signal_type, price, price_change, volume_ratio):
 
         trend_for_levels = get_5day_trend(symbol)
 
-        # HIGH sinyalleri de signal_outcomes'a kaydet — bot almasa bile takip et
         if conviction == "HIGH" and signal_id:
             record_signal_outcome(signal_id, symbol, layer, conviction, score, price, market="US")
             print(f"  📊 HIGH sinyal takibe alındı (bot almıyor, sonuç izleniyor)")
 
-        # Sadece CRITICAL sinyallerde bot alımı yap
         if conviction == "CRITICAL":
             bot_process_signal(
                 symbol, price, price_change, volume_ratio, conviction, signal_id,
@@ -1376,7 +1365,7 @@ def on_message(ws, message):
             symbol = trade.get("s")
             price = float(trade.get("p", 0))
             volume = float(trade.get("v", 0))
-            if not symbol or not price or price < 1.0 or price > 20.0:
+            if not symbol or not price or price < 0.50:
                 continue
             tracker.update(symbol, price, volume)
             if symbol in avg_volumes:
@@ -1395,8 +1384,33 @@ def on_message(ws, message):
 
 
 def on_open(ws):
-    symbols_to_sub = active_symbols[:50]
-    print(f"✅ WebSocket bağlandı. {len(symbols_to_sub)} hisse izleniyor...")
+    """
+    19 Haz 2026: DÖNEN PENCERE — her (yeniden)bağlantıda farklı 50'lik
+    blok abone olunuyor. Eskiden hep active_symbols[:50] kullanılıyordu;
+    WebSocket sık koptuğu için bot saatlerce aynı 50 hisseyi görüyor,
+    geri kalan watchlist'i hiç göremiyordu (18 Haziran'da 6.5 saat
+    boyunca sıfır canlı sinyal — bu yüzden).
+    """
+    global _ws_window_index
+    total = len(active_symbols)
+    if total == 0:
+        print("⚠️ active_symbols boş — abone olunamadı")
+        return
+
+    start = (_ws_window_index["i"] * WS_WINDOW_SIZE) % max(total, 1)
+    end = start + WS_WINDOW_SIZE
+
+    if end <= total:
+        symbols_to_sub = active_symbols[start:end]
+    else:
+        # Listenin sonuna geldi — başa sar
+        symbols_to_sub = active_symbols[start:] + active_symbols[:end - total]
+
+    _ws_window_index["i"] += 1
+    total_windows = (total // WS_WINDOW_SIZE) + 1
+
+    print(f"✅ WebSocket bağlandı. {len(symbols_to_sub)} hisse izleniyor... "
+          f"(pencere {_ws_window_index['i']}/{total_windows}, toplam {total} hisse)")
     for symbol in symbols_to_sub:
         ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
 
@@ -1413,7 +1427,6 @@ def on_error(ws, error):
 def on_close(ws, close_status_code, close_msg):
     print("🔌 Bağlantı kapandı, 10sn sonra yeniden bağlanacak...")
     time.sleep(10)
-    # Ana döngü yeniden bağlanacak — burada çağırma
 
 
 def connect_websocket():
@@ -1433,7 +1446,7 @@ def position_monitor_loop():
     while is_market_open():
         bot_check_open_positions()
         cycle += 1
-        if cycle % 40 == 0:  # ~10 dakikada bir
+        if cycle % 40 == 0:
             check_signal_outcomes(market="US")
             update_learning_weights(market="US")
         time.sleep(15)
@@ -1467,7 +1480,6 @@ def start():
     morning_push_sent = False
     morning_buys_done = False
 
-    # Pozisyon izleme thread'i — borsa saatlerinde 15sn'de bir çalışır
     import threading
     def _monitor_thread():
         while True:
@@ -1490,7 +1502,6 @@ def start():
 
             print(f"⏰ US döngü: {now_utc.strftime('%H:%M UTC')} | market_open={is_market_open()} | weekday={now_utc.weekday()}")
 
-            # ── Gece watchlist yenile ────────────────────────────
             if hour == 2 and minute < 5 and time.time() - last_watchlist_refresh > 3600:
                 refresh_watchlist_background()
                 last_watchlist_refresh = time.time()
@@ -1499,9 +1510,6 @@ def start():
                 morning_push_sent = False
                 morning_buys_done = False
 
-            # ============================================================
-            # GECE MODU: 20:00-12:29 UTC
-            # ============================================================
             if hour >= 20 or hour < 12:
                 if not night_scan_done:
                     print(f"\n🌙 US GECE MOTORU başlıyor... {now_utc.strftime('%H:%M UTC')}")
@@ -1517,9 +1525,6 @@ def start():
                     print(f"💤 US gece bekleniyor... {now_utc.strftime('%H:%M UTC')}")
                 time.sleep(600)
 
-            # ============================================================
-            # SABAH PUSH: 12:30-13:29 UTC
-            # ============================================================
             elif (hour == 12 and minute >= 30) or (hour == 13 and minute < 30):
                 if not morning_push_sent:
                     print(f"\n📱 US SABAH PUSH — {now_utc.strftime('%H:%M UTC')}")
@@ -1531,9 +1536,6 @@ def start():
                     night_scan_done = False
                 time.sleep(120)
 
-            # ============================================================
-            # BORSA AÇIK: 13:30-20:00 UTC
-            # ============================================================
             elif is_market_open():
                 morning_push_sent = True
                 print(f"📡 US WebSocket bağlanıyor... ({len(active_symbols)} hisse)")
@@ -1543,9 +1545,6 @@ def start():
                     print(f"⚠️ WebSocket hatası: {e}")
                     time.sleep(30)
 
-            # ============================================================
-            # ARA DÖNEM
-            # ============================================================
             else:
                 if hour == 20 and minute < 5:
                     try:
