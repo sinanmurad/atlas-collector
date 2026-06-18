@@ -1517,8 +1517,8 @@ def send_morning_buys():
             reasons = [signal.get("description", "")]
             layer = "KAP" if signal_type == "kap_momentum" else "HACIM"
 
-            if conviction != "CRITICAL":
-                print(f"  ⏭️ {symbol} {conviction} — bot alımı yok (sadece CRITICAL)")
+            if conviction not in ("CRITICAL", "HIGH"):
+                print(f"  ⏭️ {symbol} {conviction} — bot alımı yok (sadece CRITICAL/HIGH)")
                 continue
 
             # Borsa açıldı — gerçek anlık fiyatı çek
