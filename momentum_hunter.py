@@ -20,6 +20,10 @@ DEĞİŞİKLİK GÜNLÜĞÜ:
   (%40) + çift borsa konfirmasyon bonusu (%20). Zayıf sinyal $50 taban
   alır, çok güçlü sinyal (yüksek ch1m + yüksek hacim + dual confirm)
   $200'e kadar çıkar. Bakiyenin %30'unu asla geçmez.
+- signal_type "momentum_v3_entry" yerine "momentum" olarak kaydediliyor
+  — Flutter'ın sinyal listesi muhtemelen tanıdık signal_type değerleri
+  bekliyor, yeni bir tip eklersek listede görünmeyebilir riski vardı.
+  V3 detayı zaten description alanında "MOMENTUM V3" olarak duruyor.
 
 HEDEF: SYN gibi coinleri %3-5'te yakala, sonuna kadar yapışkan takip et.
 Hiçbir tarama turu beklemeden — borsa hareket ettiği AN yakalanır.
@@ -222,7 +226,7 @@ def log_signal(symbol, price, ch1m, vol_mult, mode, detail=""):
         result = supabase.table("crypto_signals").insert({
             "symbol": symbol,
             "coin": symbol,
-            "signal_type": f"momentum_v3_{mode}",
+            "signal_type": "momentum",  # Flutter'ın tanıdığı standart tip — V3 detayı açıklamada
             "price": price,
             "description": f"⚡ MOMENTUM V3 {mode.upper()} | {symbol} | ${price} | ch1m:{ch1m}% | vol:{vol_mult}x | {detail}",
             "conviction": "CRITICAL",
