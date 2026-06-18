@@ -1224,19 +1224,10 @@ def send_morning_signals():
                 record_signal_outcome(signal_id, symbol, "PREMARKET", conviction, score, price, market="US")
                 print(f"  📊 {symbol} HIGH — signal_outcomes'a kaydedildi (bot almıyor)")
 
-            # CRITICAL ise bot alımı da yap
-            if conviction == "CRITICAL" and price > 0:
-                print(f"  🤖 {symbol} CRITICAL — bot alımı başlatılıyor...")
+            # Sabah push sadece bildirim — alım 13:30 UTC WebSocket açılınca olur
+            if conviction == "CRITICAL" and signal_id:
                 record_signal_outcome(signal_id, symbol, "PREMARKET", conviction, score, price, market="US")
-                bot_process_signal(
-                    symbol=symbol,
-                    price=price,
-                    price_change=value,
-                    volume_ratio=volume_ratio,
-                    conviction=conviction,
-                    signal_id=signal_id,
-                    score=score,
-                )
+                print(f"  📌 {symbol} CRITICAL — 13:30 UTC WebSocket'te alınacak")
 
             time.sleep(0.5)
 
