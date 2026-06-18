@@ -700,10 +700,10 @@ def close_confirmation_score(trade, tech, ob):
 def scam_check(symbol, price, ch1h, ch24h, vol_chg, tech):
     if price < 0.000001:
         return True, "Fiyat çok düşük"
-    if ch24h >= 300:
-        return True, "24s %300+ pump & dump"
-    if ch1h >= 6:
-        return True, "1s %6+ zaten geç"
+    if ch24h >= 500:
+        return True, "24s %500+ pump & dump"
+    if ch1h >= 15:
+        return True, "1s %15+ zaten geç"
     if not tech:
         return True, "Teknik veri yok"
     if tech.get("suspicious_volume"):
@@ -910,12 +910,12 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     elif ch1h <= 4:
         score += 3
         reasons.append(f"%{ch1h:.1f} — yukarı kırılım teyitli")
-    elif ch1h <= 6:
-        score += 1
-        reasons.append(f"%{ch1h:.1f} — hareket güçlü, dikkat")
-    else:
-        score -= 2
-        reasons.append(f"%{ch1h:.1f} — aşırı hareket, trene atlama riski")
+    elif ch1h <= 8:
+        score += 4
+        reasons.append(f"%{ch1h:.1f} — güçlü momentum")
+    elif ch1h <= 15:
+        score += 2
+        reasons.append(f"%{ch1h:.1f} — hızlı hareket, dikkat")
 
     if ch4h >= 10:
         score += 4
@@ -1828,7 +1828,7 @@ def parse_ai(text):
 def get_last_signal_time(symbol):
     try:
         r = supabase.table("crypto_signals").select("created_at") \
-            .eq("symbol", symbol).order("created_at", ascending=False) \
+            .eq("symbol", symbol).order("created_at", desc=True) \
             .limit(1).execute()
         if r.data:
             dt = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
@@ -2197,7 +2197,7 @@ def position_monitor_loop():
 # ============================================================
 
 def scan_once(scan_count=0):
-    print(f"\n🦅 KARTAL GÖZÜ V12 — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+    print(f"\n🦅 KARTAL GÖZÜ V13 — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     print("=" * 55)
 
     # ── ÖNCE izleme listesini kontrol et ───────────────────
@@ -2292,13 +2292,13 @@ def scan_once(scan_count=0):
             # Hızlı ön eleme
             if price <= 0:
                 continue
-            if ch1h >= 6 or ch1h < -3:
+            if ch1h >= 15 or ch1h < -5:  # Daha geniş aralık
                 continue
-            if ch4h < -8:
+            if ch4h < -10:
                 continue
-            if ch24h >= 200:
+            if ch24h >= 500:  # Sadece aşırı pompaları ele
                 continue
-            if ch7d >= 500:
+            if ch7d >= 1000:
                 continue
 
             # SEMBOL ÇAKIŞMASI SIKI MODU: CMC ile MEXC/Gate.io fiyatları
@@ -2319,8 +2319,7 @@ def scan_once(scan_count=0):
             # score_coin RSI/OBV ile karar versin, "SUREGEN" olarak etiketlensin.
             suregen_candidate = False
             if vol_chg < 20 and ch1h < 1.5:
-                if ch24h >= 8:
-                    # ch1h ve vol_chg sıfırsa veri yok — leveraged token veya likit değil
+                if ch24h >= 5:
                     if ch1h == 0.0 and vol_chg == 0.0:
                         continue
                     suregen_candidate = True
@@ -2411,7 +2410,7 @@ def scan_once(scan_count=0):
     if buy_candidates:
         best_buy = max(buy_candidates, key=lambda x: x["score"])
         if len(buy_candidates) > 1:
-            print(f"  ⚖️ {len(buy_candidates)} CRITICAL+BİRİKİM aday — "
+            print(f"  ⚖️ {len(buy_candidates)} CRITICAL aday — "
                   f"sadece {best_buy['symbol']} (score:{best_buy['score']}) alım yapıyor")
 
     # Sinyal kayıt — scored zaten CRITICAL/HIGH + score>=14 olarak filtrelendi
@@ -2433,8 +2432,8 @@ def scan_once(scan_count=0):
 # ============================================================
 
 def main():
-    print("🚀 Atlas Kripto Kartal Gözü — V12 Savaş Mimarisi")
-    print("📌 Trailing Stop: %8→breakeven→%4→%6 | Min tutma:4s | Max pozisyon:3+2 | Rotasyon:YOK")
+    print("🚀 Atlas Kripto Kartal Gözü — V13 Momentum Mimarisi")
+    print("📌 Trailing Stop: %8→breakeven→%4→%6 | Min tutma:4s | Max pozisyon:5+3 | BIRIKIM:YOK")
     print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
     if not CMC_API_KEY:
