@@ -1008,12 +1008,11 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         elif ratio <= 0.5 and ask_wall >= 20000:
             score -= 3
 
+
     if score < 6:
         if layer == "SUREGEN":
             print(f"  🔬 SUREGEN SONUÇ: {symbol} → ELENDİ (score={score} < 6)")
         return None
-
-    # ── OTOMATİK ÖĞRENME KATSAYISI ───────────────────────────
     learning_bonus = get_learning_bonus(layer, rsi, obv_trend, score=score)
     if learning_bonus != 0:
         score += learning_bonus
