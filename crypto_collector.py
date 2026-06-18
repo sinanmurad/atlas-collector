@@ -975,6 +975,10 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
         if cmc_rank > 2000:
             reasons.append(f"🚫 BIRIKIM RSI<30 + CMC rank #{cmc_rank} — bilinmez coin, elendi")
             return None
+        # Hacim yetersizse BIRIKIM sinyali güvenilmez — OXT gibi sahte dip
+        if vol_chg < 100:
+            reasons.append(f"🚫 BIRIKIM RSI<30 + hacim yetersiz (%{vol_chg:.0f}) — sahte dip, elendi")
+            return None
 
     if 0 < mcap < 5_000_000:
         score += 4
