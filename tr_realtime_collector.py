@@ -649,7 +649,7 @@ def get_kap_disclosures(symbol):
         r = supabase.table("disclosures") \
             .select("title, publish_date, disclosure_index") \
             .ilike("stock_codes", f"%{symbol}%") \
-            .order("disclosure_index", ascending=False) \
+            .order("disclosure_index", desc=True) \
             .limit(20) \
             .execute()
         if not r.data:
@@ -715,7 +715,7 @@ def get_last_signal_time(symbol):
         r = supabase.table("tr_signals") \
             .select("created_at") \
             .eq("symbol", symbol) \
-            .order("created_at", ascending=False) \
+            .order("created_at", desc=True) \
             .limit(1) \
             .execute()
         if r.data:
@@ -1455,7 +1455,7 @@ def send_morning_push_only():
         r = supabase.table("tr_signals") \
             .select("*") \
             .gte("created_at", since) \
-            .order("created_at", ascending=False) \
+            .order("created_at", desc=True) \
             .limit(5) \
             .execute()
 
@@ -1494,7 +1494,7 @@ def send_morning_buys():
         r = supabase.table("tr_signals") \
             .select("*") \
             .gte("created_at", since) \
-            .order("created_at", ascending=False) \
+            .order("created_at", desc=True) \
             .limit(5) \
             .execute()
 
