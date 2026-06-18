@@ -1516,7 +1516,7 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins, binance_tickers
         q = c.get("quote", {}).get("USD", {})
         symbol = c.get("symbol", "")
         price = float(q.get("price", 0) or 0)
-        if price <= 0 or price > 2.0:
+        if price <= 0:
             continue
         if is_stablecoin(symbol, price,
                          float(q.get("percent_change_1h", 0) or 0),
@@ -1546,7 +1546,7 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins, binance_tickers
             continue
         base = sym[:-4]
         price = float(t.get("lastPrice", 0) or 0)
-        if price <= 0 or price > 2.0:
+        if price <= 0:
             continue
         if is_stablecoin(base, price, 0, float(t.get("priceChangePercent", 0) or 0)):
             continue
@@ -1584,7 +1584,7 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins, binance_tickers
             continue
         base = pair[:-5]
         price = float(t.get("last", 0) or 0)
-        if price <= 0 or price > 2.0:
+        if price <= 0:
             continue
         if is_stablecoin(base, price, 0, float(t.get("change_percentage", 0) or 0)):
             continue
@@ -1615,7 +1615,7 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins, binance_tickers
             continue
         base = sym[:-4]
         price = float(t.get("lastPrice", 0) or 0)
-        if price <= 0 or price > 2.0:
+        if price <= 0:
             continue
         if is_stablecoin(base, price, 0, float(t.get("priceChangePercent", 0) or 0)):
             continue
@@ -1647,7 +1647,7 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins, binance_tickers
             continue
         base = sym[:-5]
         price = float(t.get("last", 0) or 0)
-        if price <= 0 or price > 2.0:
+        if price <= 0:
             continue
         if is_stablecoin(base, price, 0, float(t.get("changeRate", 0) or 0)):
             continue
@@ -1678,7 +1678,7 @@ def merge_exchange_data(mexc_tickers, gateio_tickers, cmc_coins, binance_tickers
             continue
         base = sym[:-4].upper()
         price = float(t.get("close", 0) or 0)
-        if price <= 0 or price > 2.0:
+        if price <= 0:
             continue
         if is_stablecoin(base, price, 0, 0):
             continue
@@ -2290,15 +2290,15 @@ def scan_once(scan_count=0):
             price = coin["price"]
 
             # Hızlı ön eleme
-            if price <= 0 or price > 2.0:
+            if price <= 0:
                 continue
             if ch1h >= 6 or ch1h < -3:
                 continue
             if ch4h < -8:
                 continue
-            if ch24h >= 100:
+            if ch24h >= 200:
                 continue
-            if ch7d >= 300:
+            if ch7d >= 500:
                 continue
 
             # SEMBOL ÇAKIŞMASI SIKI MODU: CMC ile MEXC/Gate.io fiyatları
@@ -2346,10 +2346,10 @@ def scan_once(scan_count=0):
             cmc_rank = coin.get("cmc_rank", 9999)
 
             # Temel kalite eşiği — sadece mcap ve rank filtresi
-            if mcap < 5_000_000:
-                continue  # $5M altı mcap — likidite yok
+            if mcap < 1_000_000:
+                continue  # $1M altı mcap — likidite yok
 
-            if mcap < 10_000_000 and cmc_rank > 1000:
+            if mcap < 5_000_000 and cmc_rank > 2000:
                 continue  # Çok küçük ve bilinmez — manipülasyon riski
 
             # trusted_coins DB'de varsa ekstra bonus olarak kullan (engel değil)
