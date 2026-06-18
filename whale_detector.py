@@ -895,6 +895,13 @@ def bot_buy(user_id, symbol, price, signal_id, is_pro, balance, conviction, scor
             pass
         open_trades = get_open_us_trades(user_id)
         open_count = len(open_trades)
+
+        # Aynı sembolde açık pozisyon varsa tekrar alma
+        open_symbols = [t.get("symbol") for t in open_trades]
+        if symbol in open_symbols:
+            print(f"  ⏭️ {symbol} zaten açık pozisyonda — tekrar alım yapılmıyor")
+            return False
+
         stop, target = calc_us_levels(price, trend_data)
         entry_reason = " | ".join(reasons[:3]) if reasons else conviction
         is_exceptional = False
