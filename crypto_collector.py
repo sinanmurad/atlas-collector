@@ -1,43 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-ATLAS KRİPTO KARTAL GÖZÜ — V12 SAVAŞ MİMARİSİ
-================================================
-HEDEF: Az sinyal, yüksek kalite. Gerçek dünya simülasyonu.
+ATLAS KRİPTO KARTAL GÖZÜ — V13 MOMENTUM MİMARİSİ
+==================================================
+Son güncelleme: 18 Haziran 2026
 
-3 KATMAN:
-1. SİNYAL LİSTESİ (Keşfet/anlık) — CRITICAL+HIGH, kullanıcı görür, push alır.
-   Bot kararını etkilemez, sadece bilgilendirme.
-2. BOT — sadece CRITICAL+BİRİKİM, tarama başına TEK aday (en yüksek skor).
-3. TRAILING STOP — coin yükseldikçe stop yukarı çekilir, sabit hedef YOK.
+HEDEF: SYN gibi güçlü momentum coinleri erken yakala, yapışkan takip et.
 
-KURALLAR:
-- Max 3 açık pozisyon (Pro: +2 istisna = max 5)
-- Tarama başına MAX 1 alım (en yüksek skorlu CRITICAL+BİRİKİM)
-- Trailing stop:
-    kâr <%3      → stop = giriş - %8 (sabit)
-    kâr %3-%8    → stop = giriş (breakeven)
-    kâr %8-%15   → stop = zirveden -%4
-    kâr >=%15    → stop = zirveden -%6
-- Min tutma: 4 saat (doğrulama katmanı çıkışları için — stop her zaman aktif)
-- Kapatma: stop/trailing HER ZAMAN aktif. Doğrulama katmanı ≥5 puan + 4 saat
-- Rotasyon: TAMAMEN KALDIRILDI
-- Push: Sadece AL ve SAT anında
+2 KATMAN (BIRIKIM KALDIRILDI):
+1. MOMENTUM — hacim spike + fiyat hareketi + çoklu borsa
+2. SUREGEN  — 24s %8+ yürümüş, momentum devam ediyor
 
-DOĞRULAMA KATMANI (4 saat sonrası, stop dışı çıkışlar için):
-- OBV 4h "down" geçti          → +3 puan
-- RSI giriş - 15+ düştü        → +2 puan
-- Order book giriş oranının
-  yarısına düştü               → +3 puan
-- Zirveden %7+ çekilme (kârda) → +2 puan
-- 4h hacim %70+ azaldı         → +1 puan
-- Kâr < %3                     → -3 puan (erken çıkışı engeller)
-Minimum: ≥5 puan VE tutma ≥4 saat
+CONVICTION EŞİKLERİ:
+- CRITICAL : score >= 16 → bot alır, push gönderilir
+- HIGH     : score >= 11 → push gönderilir, signal_outcomes'a kaydedilir
+- MEDIUM   : score >= 7  → sadece kaydedilir
+
+BOT KURALLARI:
+- Max 5 normal + 3 istisna = max 8 açık pozisyon
+- Aynı sembolde açık pozisyon varsa tekrar alma
+- VIX 25+ → alım durur (kripto)
+- VIX 30+ → alım durur (tüm platformlar)
+
+TRAILING STOP:
+- kâr <%2      → stop = giriş - %8 (sabit)
+- kâr %2-%5    → stop = giriş (breakeven)
+- kâr %5-%8    → stop = zirveden -%4
+- kâr >=%8     → stop = zirveden -%6
+- Min tutma: 4 saat
 
 VERİ KAYNAKLARI:
-- MEXC, Gate.io, Binance (teknik)
-- CMC Basic (hacim/mcap/momentum)
+- MEXC, Gate.io, KuCoin, Huobi, Coinbase (teknik + çoklu borsa konfirmasyon)
+- CMC (hacim/mcap/momentum)
 - Fear & Greed (alternative.me)
 - Order Book (MEXC depth)
+
+MİMARİ NOTLAR:
+- BIRIKIM (RSI<30 dip yakala) → %0 win rate → 18 Haziran 2026'da kaldırıldı
+- MOMENTUM Hunter (momentum_hunter.py) ayrı servis olarak çalışıyor
+- signal_outcomes tablosu: 24s/72s/7g sonuç takibi
+- learning_weights: min 10 örnek + z>=1.65 ile aktifleşir
 """
 
 import os
@@ -842,43 +843,17 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
             score += 1
 
     # ── OBV ──────────────────────────────────────────────────
-    if obv_div:
-        score += 8
-        layer = "BIRIKIM"
-        reasons.append("🐋 OBV bullish diverjans — whale sessizce birikiyor")
-    elif obv_trend == "up" and ch1h < 5:
-        if rsi and rsi > 70:
-            # RSI aşırı alımda — BIRIKIM değil MOMENTUM, skor düşük tut
-            score += 1
-            reasons.append("📈 OBV yükseliyor ama RSI yüksek — zayıf momentum")
-        elif rsi and rsi < 35:
-            # RSI satım bölgesinde + OBV up = gerçek birikim
-            score += 8
-            layer = "BIRIKIM"
-            reasons.append("🐋 OBV up + RSI düşük — güçlü birikim sinyali")
-        elif rsi and 35 <= rsi <= 55:
-            # Orta bölge — birikim ama teyit gerekli
-            score += 4
-            layer = "BIRIKIM"
-            reasons.append("🐋 OBV yükseliyor, fiyat sessiz — birikim")
-        else:
-            # RSI 55-70 arası — zayıf, sadece 2 puan
-            score += 2
-            reasons.append("📈 OBV yükseliyor — hafif alım baskısı")
-    elif obv_trend == "up":
+    if obv_trend == "up" and ch1h > 0:
         score += 3
         reasons.append("📈 OBV yükseliyor — alım baskısı")
     elif obv_trend == "down" and ch1h > 3:
         score -= 2
 
-    if obv_trend == "down":
-        layer = "MOMENTUM"
+    layer = "MOMENTUM"  # Artık tek layer MOMENTUM
 
     # ── HACİM ────────────────────────────────────────────────
     if vol_chg >= 1000:
         score += 7
-        if obv_trend != "down":
-            layer = "BIRIKIM"
         reasons.append(f"🔥 Hacim %{vol_chg:.0f} — olağandışı whale")
     elif vol_chg >= 500:
         score += 5
@@ -892,11 +867,9 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     elif vol_chg >= 50:
         score += 1
 
-    if vol_surge >= 3 and ch1h < 5:
+    if vol_surge >= 3:
         score += 3
-        if layer != "BIRIKIM" and obv_trend != "down":
-            layer = "BIRIKIM"
-        reasons.append(f"🐋 4s hacim {vol_surge:.1f}x — sessiz birikim")
+        reasons.append(f"🐋 4s hacim {vol_surge:.1f}x — güçlü momentum")
     elif vol_surge >= 2:
         score += 1
 
@@ -1050,35 +1023,22 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
     # 409 gerçek trade analizi sonucu:
     # BIRIKIM + RSI<30  → %27 win rate, ort +3.3% (KULLAN)
     # BIRIKIM + RSI30-50 → %13 win rate, ort +0.1% (HAYIR)
-    # BIRIKIM + RSI50-70 → %8  win rate, ort -3.2% (ASLA)
-    # BIRIKIM + RSI70+   → %5  win rate, ort -10%  (ASLA)
-    # CRITICAL sadece RSI<30 BIRIKIM'de anlamlı.
-    if layer == "BIRIKIM" and (rsi is None or rsi >= 30):
-        # RSI 30+ BIRIKIM sinyali tarihsel olarak zararda —
-        # CRITICAL'a izin verme, max HIGH'da bırak
-        if score >= 22:
-            score = 21  # CRITICAL eşiğinin hemen altı
-            reasons.append("⚠️ BIRIKIM RSI≥30 — CRITICAL engellendi (veri: %8 win rate)")
-
-    if score >= 22:
-        conviction = "CRITICAL"
-    elif score >= 14:
-        conviction = "HIGH"
-    elif score >= 9:
-        conviction = "MEDIUM"
-    else:
-        if layer == "SUREGEN":
-            print(f"  🔬 SUREGEN SONUÇ: {symbol} → ELENDİ (score={score} < 9)")
-        return None
-
-    # SUREGEN ve MOMENTUM için daha düşük CRITICAL eşiği
-    # BIRIKIM RSI<30 zaten sıkı filtreden geçiyor
-    if layer in ("SUREGEN", "MOMENTUM") and score >= 16:
+    # Artık sadece MOMENTUM ve SUREGEN — BIRIKIM yok
+    # MOMENTUM/SUREGEN score 16+ = CRITICAL
+    if score >= 16:
         conviction = "CRITICAL"
         if layer == "SUREGEN":
             reasons.append("🚀 SUREGEN CRITICAL — momentum gücü doğrulandı")
         else:
             reasons.append("⚡ MOMENTUM CRITICAL — güçlü trend yakalandı")
+    elif score >= 11:
+        conviction = "HIGH"
+    elif score >= 7:
+        conviction = "MEDIUM"
+    else:
+        if layer == "SUREGEN":
+            print(f"  🔬 SUREGEN SONUÇ: {symbol} → ELENDİ (score={score} < 7)")
+        return None
 
     if layer == "SUREGEN":
         print(f"  🔬 SUREGEN SONUÇ: {symbol} → SİNYAL! score={score} conviction={conviction}")
