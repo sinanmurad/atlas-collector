@@ -41,6 +41,13 @@ MİMARİ NOTLAR:
 - learning_weights: min 10 örnek + z>=1.65 ile aktifleşir
 
 DEĞİŞİKLİK GÜNLÜĞÜ (19 Haziran 2026):
+- KRİTİK SLOT HESAPLAMA HATASI DÜZELTİLDİ: _execute_buy() istisna kontrolünde
+  open_count (TOPLAM: normal+istisna) doğrudan max_normal (5) ile
+  karşılaştırılıyordu. 4 normal+3 istisna=7 pozisyonu olan kullanıcıda
+  7>=5 olduğu için yeni her coin istisna sayılıyor, istisna slotu da
+  dolu (3/3) olunca HİÇ alım yapılamıyordu (VELVET/NOICE/MAGMA/HIGH/BLUAI
+  kaçırıldı). normal_count = open_count - exceptional_count hesaplanıp
+  ona göre kontrol ediliyor artık.
 - trusted_coins/trusted_symbols filtresi tamamen kaldırıldı (sadece mcap+rank kontrolü kaldı)
 - Fiyat üst limiti ($2.0) kaldırıldı — VELVET ($0.55), IMU gibi coinler artık taranıyor
 - mcap alt limiti $5M → $1M düşürüldü
@@ -1999,15 +2006,16 @@ def _execute_buy(user_id, symbol, price, signal_id, conviction, layer,
         # Kapasite kontrolü
         max_normal = MAX_OPEN_PRO if is_pro else MAX_OPEN_FREE
         exceptional_count = sum(1 for t in open_list if t.get("is_exceptional"))
+        normal_count = open_count - exceptional_count
         is_exceptional = False
 
-        if open_count >= max_normal:
+        if normal_count >= max_normal:
             if is_pro and score >= 16 and exceptional_count < 3 and open_count < MAX_OPEN_PRO_EXCEPTIONAL:
                 is_exceptional = True
                 print(f"  🌟 İSTİSNAİ: {symbol} (score={score}) — slot {open_count+1}")
             else:
                 # Rotasyon YOK — doluysa geç
-                print(f"  ⏭️ {user_id} dolu ({open_count}/{max_normal}) — {symbol} atlandı")
+                print(f"  ⏭️ {user_id} dolu (normal:{normal_count} istisna:{exceptional_count}) — {symbol} atlandı")
                 return
 
         # Free kullanıcı aylık limit
