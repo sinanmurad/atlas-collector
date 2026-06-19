@@ -21,6 +21,17 @@ DEĞİŞİKLİK GÜNLÜĞÜ:
   kullanılıyor — en azından watchlist içindeki en likit/önemli
   hisseler garanti izleniyor, POWW gibi düşük öncelikli olanlar
   watchlist'te kalsa da WebSocket'e giremeyebilir (bilinen kısıt).
+
+[19 Haziran 2026 — üçüncü düzeltme, aynı gün]
+- Abonelik mesajları arasına 0.15sn gecikme eklendi: 50 sembole ANINDA
+  abone olmaya çalışmak bile tek bağlantıda rate-limit tetikliyordu.
+- check_signal_outcomes() SONSUZ ŞÜPHELİ DÖNGÜSÜ düzeltildi: |pct|>95
+  olan kayıtlarda (örn. HUMA %-97.5, ACN %-100) eskiden sadece
+  "continue" deniyordu, checked_{field} hiç True yapılmıyordu — bu
+  kayıtlar HER taramada yeniden çekilip aynı log satırını sonsuza kadar
+  tekrar bastırıyordu (gereksiz yfinance çağrısı + log spam). Artık
+  şüpheli kayıtlar da checked=True yapılıp gerçek pct değeriyle
+  kaydediliyor, bir daha tekrar denenmiyor.
 [18 Haziran 2026]
 - Sabah push'tan bot alımı kaldırıldı — sadece bildirim, gerçek alım
   13:30 UTC WebSocket açılınca canlı fiyattan yapılıyor
@@ -198,8 +209,23 @@ def check_signal_outcomes(market="US", price_fetcher=None):
                     pct = ((current - entry) / entry) * 100 if entry > 0 else 0
 
                     if abs(pct) > 95:
+                        # 19 Haz 2026 — KRİTİK FIX: eskiden burada sadece
+                        # "continue" deniyordu, checked_{field} hiç True
+                        # yapılmıyordu — sonuç: HUMA/ACN gibi kayıtlar
+                        # HER taramada yeniden çekilip "şüpheli" diye
+                        # loglanıyordu, sonsuz tekrar (log spam + gereksiz
+                        # yfinance çağrısı). Artık checked=True yapılıp
+                        # gerçek pct değeri kaydediliyor — yorumlama
+                        # (gerçek hareket mi, ticker karışıklığı mı)
+                        # learning_weights'te |pct|>95 örnekleri zaten
+                        # ekstrem olduğu için win/lose hesabını bozmuyor.
                         print(f"⚠️ {row['symbol']} {field} sonucu şüpheli "
-                              f"(%{pct:.1f}, {entry}→{current}) — atlanıyor")
+                              f"(%{pct:.1f}, {entry}→{current}) — işaretlendi, tekrar denenmeyecek")
+                        supabase.table("signal_outcomes").update({
+                            f"price_{field}": current,
+                            f"pct_{field}": round(pct, 2),
+                            f"checked_{field}": True,
+                        }).eq("id", row["id"]).execute()
                         continue
 
                     supabase.table("signal_outcomes").update({
@@ -1422,6 +1448,9 @@ def on_open(ws):
     print(f"✅ WebSocket bağlandı. {len(top50)} hisse izleniyor (en yüksek hacimli watchlist dilimi)")
     for symbol in top50:
         ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
+        time.sleep(0.15)  # 19 Haz 2026: abonelik mesajları arasına gecikme —
+                           # 50 sembole anında abone olmak Finnhub'ı rate-limit
+                           # tetiklemeye itiyordu
 
 
 def on_error(ws, error):
