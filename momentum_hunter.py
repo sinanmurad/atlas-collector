@@ -16,6 +16,15 @@ DEĞİŞİKLİK GÜNLÜĞÜ:
   ancak yeterince güçlüyse (ch1m*vol_mult >= 5.0) geçebiliyor. Sabit
   bir üst sınır yerine "daha güçlüsü geldiyse zayıfı çıkar" mantığı —
   liste gerçekten en güçlü sinyalleri tutsun diye.
+  → Sonuç doğrulandı: eşik sıkılaştırması sonrası 4 coin yapışkan modda
+    (O, ELIZAOS, ACP, AERO) — AERO vol:19.61x gerçek bir patlama,
+    eskiki sahte 3.0x'lerin aksine. ACP +%10 milestone'a ulaştı.
+- MEXC SÜREKLİ KOPMA SORUNU (fin=1 opcode=8 — sunucu close frame):
+  20'lik abonelik batch'i + 0.2sn çok agresifti, MEXC'in kabul ettiği
+  limiti aşıyor olabilirdi → 10'luk batch + 0.4sn'ye düşürüldü. Ayrıca
+  MEXC generic WebSocket ping'i yeterli saymayabilir diye uygulama
+  seviyesinde 15sn'de bir {"method":"PING"} mesajı eklendi
+  (_mexc_keepalive thread'i).
 [19 Haziran 2026 — ilk canlı test]
 - crypto_signals insert hatası düzeltildi: "coin" kolonu NOT NULL idi,
   sadece "symbol" gönderiliyordu → coin=symbol eklendi.
@@ -638,14 +647,28 @@ def mexc_on_open(ws):
         top_symbols = [t["symbol"] for t in usdt_pairs[:200]]
 
         params = [f"spot@public.deals.v3.api@{sym}" for sym in top_symbols]
-        # MEXC batch subscribe — max ~30 kanal/mesaj
-        for i in range(0, len(params), 20):
-            batch = params[i:i+20]
+        # 19 Haz 2026: "fin=1 opcode=8" (sunucu close frame) sürekli alınıyordu —
+        # 20'lik batch + 0.2sn çok agresifti. MEXC dokümantasyonu batch başına
+        # daha küçük sayı öneriyor; 10'a düşürüp gecikmeyi artırdık.
+        for i in range(0, len(params), 10):
+            batch = params[i:i+10]
             ws.send(json.dumps({"method": "SUBSCRIPTION", "params": batch}))
-            time.sleep(0.2)
+            time.sleep(0.4)
         print(f"  → MEXC: {len(top_symbols)} coin'e abone olundu")
     except Exception as e:
         print(f"⚠️ MEXC abone hatası: {e}")
+
+
+def _mexc_keepalive(ws):
+    """MEXC bazı durumlarda generic WS ping'i yeterli saymayıp uygulama
+    seviyesinde PING mesajı bekleyebilir — bağlantı sürekli sunucu
+    tarafından kapatılıyorsa (fin=1 opcode=8) bu genelde sebebidir."""
+    while True:
+        time.sleep(15)
+        try:
+            ws.send(json.dumps({"method": "PING"}))
+        except Exception:
+            break
 
 
 def run_mexc_ws():
@@ -658,6 +681,8 @@ def run_mexc_ws():
                 on_error=lambda ws, e: print(f"❌ MEXC WS hata: {e}"),
                 on_close=lambda ws, c, m: print("🔌 MEXC WS kapandı, yeniden bağlanıyor..."),
             )
+            keepalive_thread = threading.Thread(target=_mexc_keepalive, args=(ws,), daemon=True)
+            keepalive_thread.start()
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             print(f"⚠️ MEXC WS döngü hatası: {e}")
