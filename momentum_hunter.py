@@ -24,6 +24,17 @@ DEĞİŞİKLİK GÜNLÜĞÜ:
   — Flutter'ın sinyal listesi muhtemelen tanıdık signal_type değerleri
   bekliyor, yeni bir tip eklersek listede görünmeyebilir riski vardı.
   V3 detayı zaten description alanında "MOMENTUM V3" olarak duruyor.
+- KRİTİK SLOT HESAPLAMA HATASI DÜZELTİLDİ: bot_buy_sticky() istisna
+  kontrolünde open_count (TOPLAM pozisyon: normal+istisna) doğrudan
+  MAX_OPEN_PRO (5) ile karşılaştırılıyordu. 4 normal + 3 istisna = 7
+  açık pozisyonu olan kullanıcıda bu 7>=5 olduğu için her yeni coin
+  doğrudan istisna kategorisine düşüyor, istisna slotu da zaten dolu
+  (3/3) olduğu için HİÇBİR ALIM YAPILMIYORDU — VELVET, NOICE, MAGMA,
+  HIGH, BLUAI gibi 7+ sinyal art arda kaçırıldı. Düzeltme: normal_count
+  = open_count - exceptional_count hesaplanıp normal_count >= MAX_OPEN_PRO
+  kontrolü yapılıyor artık (4 normal pozisyonu olan kullanıcı 5. normal
+  slotu hâlâ kullanabilir). Aynı hata crypto_collector.py'de de
+  bulunup düzeltildi.
 
 HEDEF: SYN gibi coinleri %3-5'te yakala, sonuna kadar yapışkan takip et.
 Hiçbir tarama turu beklemeden — borsa hareket ettiği AN yakalanır.
@@ -279,13 +290,14 @@ def bot_buy_sticky(symbol, price, signal_id, ch1m, vol_mult, confirmed_by):
                     continue
 
                 exceptional_count = sum(1 for t in open_list if t.get("is_exceptional"))
+                normal_count = open_count - exceptional_count
                 is_exceptional = False
 
-                if open_count >= MAX_OPEN_PRO:
+                if normal_count >= MAX_OPEN_PRO:
                     if exceptional_count < 3 and open_count < MAX_OPEN_PRO_EXCEPTIONAL:
                         is_exceptional = True
                     else:
-                        print(f"  ⏭️ {user_id[:8]} dolu ({open_count}) — {symbol} atlandı")
+                        print(f"  ⏭️ {user_id[:8]} dolu (normal:{normal_count} istisna:{exceptional_count}) — {symbol} atlandı")
                         continue
 
                 stop_price = round(price * (1 - STOP_PCT), 10)
