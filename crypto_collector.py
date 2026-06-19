@@ -41,6 +41,25 @@ MİMARİ NOTLAR:
 - learning_weights: min 10 örnek + z>=1.65 ile aktifleşir
 
 DEĞİŞİKLİK GÜNLÜĞÜ (19 Haziran 2026):
+- DİP SIÇRAMASI CRITICAL İSTİSNASI EKLENDİ: READY vakası — RSI 16.6,
+  ch1h +%3.3, hacim -%3 ile HIGH kaldı (score 11-15 aralığı), bot
+  almadı. Coin sonraki 1 saatte +%24 yaptı. Artık RSI<20 VE ch1h>=3
+  ikisi birden varsa HIGH→CRITICAL yükseltiliyor (hacim negatif olsa
+  bile) — "tükenme" değil "dipten sıçrama başlangıcı" pattern'i.
+- KRİTİK EKSİK GİDERİLDİ — PUSH YOKTU: save_signal() hiçbir zaman push
+  göndermiyordu, push sadece bot_buy() içinde (CRITICAL + slot uygunsa)
+  gönderiliyordu. READY HIGH kaldığı için ne bot aldı ne de kullanıcıya
+  haber gitti — sistem doğru yakalamıştı ama kullanıcı görmedi. Artık
+  HIGH ve CRITICAL sinyaller bot alsın almasın HER ZAMAN push ediliyor;
+  asıl amaç botun her şeyi alması değil, kullanıcının güçlü sinyalleri
+  görüp kendi kararını verebilmesi.
+- ACİLİYET İŞARETLEMESİ EKLENDİ: CRITICAL sinyaller veya "dip sıçraması"
+  pattern'i (READY tipi, hızlı 1-saatlik hareketler) artık hem push
+  başlığında hem description'da "🔴 ACİL" öneki ile işaretleniyor, push
+  metni kullanıcıyı doğrudan "CMC'de kontrol et" diye yönlendiriyor.
+  Bot alamasa/almasa bile bu sinyaller kullanıcının gözünden kaçmasın
+  diye description alanına da aynı işaret kaydediliyor (Flutter tarafı
+  bu öneki kırmızı vurgu için kullanabilir, şema değişikliği gerekmedi).
 - KRİTİK SLOT HESAPLAMA HATASI DÜZELTİLDİ: _execute_buy() istisna kontrolünde
   open_count (TOPLAM: normal+istisna) doğrudan max_normal (5) ile
   karşılaştırılıyordu. 4 normal+3 istisna=7 pozisyonu olan kullanıcıda
@@ -1056,6 +1075,16 @@ def score_coin(symbol, name, price, ch1h, ch4h, ch24h, ch7d,
             reasons.append("⚡ MOMENTUM CRITICAL — güçlü trend yakalandı")
     elif score >= 11:
         conviction = "HIGH"
+        # 19 Haz 2026 — DİP SIÇRAMASI İSTİSNASI: RSI çok düşükken (<20)
+        # + fiyat zaten pozitif yöne dönmüşse (ch1h>=3), bu "tükenme"
+        # değil "dipten sıçrama başlangıcı" olabilir. Hacim henüz negatif
+        # olsa bile (henüz yeni başlamış, hacim verisi gecikmeli gelir).
+        # READY örneği: RSI 16.6, ch1h +3.3, vol -3% iken HIGH kaldı,
+        # bot almadı, coin sonraki 1 saatte +%24 yaptı. Bu pattern'i
+        # CRITICAL'a yükselt — sıkı şart: RSI<20 VE ch1h>=3 ikisi birden.
+        if rsi is not None and rsi < 20 and ch1h >= 3:
+            conviction = "CRITICAL"
+            reasons.append(f"🎯 DİP SIÇRAMASI: RSI {rsi} + ch1h %{ch1h:.1f} — CRITICAL'a yükseltildi")
     elif score >= 7:
         conviction = "MEDIUM"
     else:
@@ -1879,8 +1908,11 @@ def save_signal(s, fg, allow_buy=False):
         emoji = "🔥" if s["conviction"] == "CRITICAL" else "⚡" if s["conviction"] == "HIGH" else "🚀"
         le = "🐋" if s["layer"] == "BIRIKIM" else "📈"
 
+        is_urgent = s["conviction"] == "CRITICAL" or "DİP SIÇRAMASI" in " ".join(s.get("reasons", []))
+        urgent_prefix = "🔴 ACİL — " if is_urgent else ""
+
         desc = (
-            f"{emoji} {s['symbol']}/USDT | {ps} | "
+            f"{urgent_prefix}{emoji} {s['symbol']}/USDT | {ps} | "
             f"1s:%{s['ch1h']:+.1f} 4s:%{s['ch4h']:+.1f} | "
             f"Vol:%{s['vol_chg']:+.0f} | RSI:{s['rsi']} | "
             f"{le}{s['layer']} | {s['conviction']} | [{s.get('exchange','?')}]"
@@ -1915,6 +1947,34 @@ def save_signal(s, fg, allow_buy=False):
         log_activity("SINYAL", symbol=s["symbol"], price=price,
                       detail=f"Score:{s['score']} | RSI:{s['rsi']} | OBV:{s['obv_trend']}",
                       conviction=s["conviction"], layer=s["layer"])
+
+        # 19 Haz 2026 — KRİTİK EKSİK GİDERİLDİ: save_signal() hiçbir zaman
+        # push göndermiyordu, sadece DB'ye yazıyordu. Push sadece bot_buy()
+        # içinde (yani sadece CRITICAL + bot gerçekten alabildiğinde)
+        # gönderiliyordu. Sonuç: READY gibi HIGH sinyaller (veya CRITICAL
+        # olup slot doluluğundan alınamayanlar) kullanıcının hiç haberi
+        # olmadan sessizce DB'de kalıyordu — sistem doğru yakalıyordu ama
+        # kullanıcı göremiyordu. Artık HIGH ve CRITICAL sinyaller bot alıp
+        # almadığına bakılmaksızın HER ZAMAN push ediliyor; kullanıcı
+        # isterse manuel karar verebilsin.
+        #
+        # ACİLİYET VURGUSU: "dip sıçraması" pattern'i (RSI<20 + ch1h>=3,
+        # READY örneğindeki gibi 1 saatte %24 gidebilen tip) veya CRITICAL
+        # sinyaller 🔴 ile işaretlenip kullanıcıya CMC'de doğrulaması
+        # için açık çağrı yapılıyor — bot almasa/alamasa bile bu sinyaller
+        # gözden kaçmasın.
+        if s["conviction"] in ("CRITICAL", "HIGH"):
+            if is_urgent:
+                urgency_tag = "🔴 ACİL"
+                cta = f"CMC'de {s['symbol']} kontrol et — hızlı hareket ediyor!"
+            else:
+                urgency_tag = emoji
+                cta = f"{s['layer']} sinyali"
+            send_push(
+                title=f"{urgency_tag} {s['conviction']}: {s['symbol']}",
+                body=f"{ps} | 1s:%{s['ch1h']:+.1f} | RSI:{s['rsi']} | {cta}",
+                signal_id=sid,
+            )
 
         if allow_buy:
             bot_buy(s, sid)
