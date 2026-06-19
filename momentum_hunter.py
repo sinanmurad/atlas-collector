@@ -5,6 +5,17 @@ ATLAS MOMENTUM HUNTER V3 — Çoklu Borsa Gerçek Zamanlı Avcı
 Son güncelleme: 19 Haziran 2026
 
 DEĞİŞİKLİK GÜNLÜĞÜ:
+
+[19 Haziran 2026 — gürültü filtresi]
+- EŞİKLER SIKILAŞTIRILDI: ch1m %1.5→%2.5 (tek borsa), %1.0→%1.8 (çift
+  borsa), hacim çarpanı 2.5x→3.5x. Sebep: 274 coin izlenirken aynı anda
+  58 coin "yapışkan mod"daydı — bu artık bir güçlü-sinyal listesi değil,
+  gürültü filtresiydi (normal piyasa kıpırdanmaları bile tetikliyordu).
+- MAX_STICKY_COINS=15 KAPASİTE SINIRI EKLENDİ: Doluyken yeni aday,
+  mevcut en zayıf performanslı (en düşük güncel K/Z%) coin'in yerine
+  ancak yeterince güçlüyse (ch1m*vol_mult >= 5.0) geçebiliyor. Sabit
+  bir üst sınır yerine "daha güçlüsü geldiyse zayıfı çıkar" mantığı —
+  liste gerçekten en güçlü sinyalleri tutsun diye.
 [19 Haziran 2026 — ilk canlı test]
 - crypto_signals insert hatası düzeltildi: "coin" kolonu NOT NULL idi,
   sadece "symbol" gönderiliyordu → coin=symbol eklendi.
@@ -112,9 +123,13 @@ except Exception as e:
     print(f"⚠️ Firebase: {e}")
 
 # ── PARAMETRELER ──────────────────────────────────────────────────
-STICKY_CH1M_MIN      = 1.5    # %1.5+ 1 dakikalık değişim (tek borsa)
-STICKY_CH1M_DUAL      = 1.0   # %1.0+ yeterli (çift borsa konfirmasyonu varsa)
-STICKY_VOL_MULTIPLIER = 2.5   # Son 60sn hacim > önceki 60sn ort. x2.5
+STICKY_CH1M_MIN      = 2.5    # %2.5+ 1 dakikalık değişim (tek borsa) — eskiden 1.5, çok gevşekti
+STICKY_CH1M_DUAL      = 1.8   # %1.8+ yeterli (çift borsa konfirmasyonu varsa) — eskiden 1.0
+STICKY_VOL_MULTIPLIER = 3.5   # Son 60sn hacim > önceki 60sn ort. x3.5 — eskiden 2.5
+MAX_STICKY_COINS       = 15   # 19 Haz 2026: 58 coin aynı anda yapışkan moddaydı — bu bir
+                               # "güçlü sinyal" listesi değil gürültü filtresiydi. Üst sınır
+                               # eklendi; dolu olduğunda yeni aday sadece en zayıf performanslı
+                               # mevcut yapışkan coin'den daha güçlüyse onun yerine geçer.
 STICKY_PUSH_INTERVAL  = 600   # 10 dakikada bir periyodik push
 STICKY_EXIT_DRAWDOWN  = 8.0   # Peak'ten %8 → çıkış
 STICKY_MAX_HOLD_H     = 48
@@ -373,6 +388,30 @@ def enter_sticky(symbol, price, ch1m, vol_mult, confirmed_by):
     with sticky_lock:
         if symbol in sticky_coins:
             return
+
+        # 19 Haz 2026 — KAPASİTE KONTROLÜ: 58 coin aynı anda yapışkan
+        # moddaydı, bu sinyal kalitesini sulandırıyordu. Doluysa, yeni
+        # adayın girişteki momentumu (ch1m*vol_mult) en zayıf performans
+        # gösteren mevcut yapışkan coin'den (şu anki K/Z%) güçlü değilse
+        # reddedilir — sabit limit yerine "daha iyisi geldi, zayıfı çıkar"
+        # mantığı.
+        if len(sticky_coins) >= MAX_STICKY_COINS:
+            current_price = get_current_price(symbol)
+            weakest_symbol, weakest_pct = None, float("inf")
+            for sym, c in sticky_coins.items():
+                cp = get_current_price(sym)
+                if not cp:
+                    continue
+                pct = ((cp - c["entry_price"]) / c["entry_price"]) * 100
+                if pct < weakest_pct:
+                    weakest_pct, weakest_symbol = pct, sym
+            new_strength = ch1m * vol_mult
+            if weakest_symbol is None or new_strength < 5.0:
+                print(f"  ⏭️ Yapışkan mod dolu ({MAX_STICKY_COINS}) — {symbol} reddedildi (yetersiz güç)")
+                return
+            print(f"  🔄 Yapışkan mod dolu — en zayıf {weakest_symbol} (%{weakest_pct:.1f}) çıkarıldı, {symbol} giriyor")
+            sticky_coins.pop(weakest_symbol, None)
+
         now = time.time()
         sticky_coins[symbol] = {
             "entry_price": price,
@@ -383,9 +422,12 @@ def enter_sticky(symbol, price, ch1m, vol_mult, confirmed_by):
         }
 
     konfirm = " + ".join(confirmed_by)
+    # 19 Haz 2026 — crypto_collector.py ile tutarlılık: V3'ün her girişi
+    # zaten anlık/CRITICAL nitelikte olduğu için 🔴 ACİL vurgusu burada
+    # da uygulanıyor, kullanıcı READY tipi vakaları gözden kaçırmasın.
     send_push(
-        title=f"🎯 YAPIŞKAN MOD: {symbol}",
-        body=f"${price:.6f} | 1dk: +{ch1m}% | Hacim {vol_mult}x | {konfirm}",
+        title=f"🔴 ACİL — YAPIŞKAN MOD: {symbol}",
+        body=f"${price:.6f} | 1dk: +{ch1m}% | Hacim {vol_mult}x | CMC'de {symbol} kontrol et! | {konfirm}",
         symbol=symbol,
         extra={"mode": "sticky_entry"}
     )
