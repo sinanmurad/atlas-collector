@@ -20,6 +20,17 @@ DEĞİŞİKLİK GÜNLÜĞÜ:
   (%40) + çift borsa konfirmasyon bonusu (%20). Zayıf sinyal $50 taban
   alır, çok güçlü sinyal (yüksek ch1m + yüksek hacim + dual confirm)
   $200'e kadar çıkar. Bakiyenin %30'unu asla geçmez.
+- KRİTİK SAHTE HACİM BUGU DÜZELTİLDİ: compute_ch1m_and_vol() önceki
+  60sn'de hiç trade verisi yoksa (coin henüz 120sn'dir izleniyor,
+  2. pencereye geçmemiş) eskiden vol_mult=3.0 SABİT/SAHTE bir değer
+  döndürüyordu — bu "gerçek hacim artışı tespit edildi" anlamına
+  GELMİYORDU, sadece "yeterli geçmiş veri yok" durumuydu. Sonuç: hiç
+  gerçek hacim ölçümü olmadan coinler yapışkan moda giriyordu (ESPORTS
+  $0.043'ten alınmıştı, "vol:3.0x" yazıyordu ama bu rastgele/varsayılan
+  bir sayıydı, ölçülmüş bir değer değildi). Artık prev_60 boşsa veya
+  vol_prev<=0 ise vol_mult=None dönüyor, evaluate_symbol() zaten None
+  kontrolü yapıp sinyal üretmiyor — coin bir sonraki pencerede gerçek
+  ölçümle değerlendirilecek.
 - signal_type "momentum_v3_entry" yerine "momentum" olarak kaydediliyor
   — Flutter'ın sinyal listesi muhtemelen tanıdık signal_type değerleri
   bekliyor, yeni bir tip eklersek listede görünmeyebilir riski vardı.
@@ -184,10 +195,22 @@ def compute_ch1m_and_vol(symbol, exchange):
     ch1m = ((last_price - first_price) / first_price) * 100
 
     vol_last = sum(v for _, _, v in last_60)
-    vol_prev = sum(v for _, _, v in prev_60) if prev_60 else 0
 
-    vol_mult = (vol_last / vol_prev) if vol_prev > 0 else (3.0 if vol_last > 0 else 0)
+    # 19 Haz 2026 — KRİTİK FIX: prev_60 boşsa (coin'i henüz 120sn'dir
+    # izliyoruz, henüz 2. dakikaya geçmedi) eskiden 3.0x SABİT/SAHTE bir
+    # değer döndürülüyordu — bu "gerçek hacim artışı" değil, "yeterli
+    # veri yok" durumuydu. ESPORTS örneğinde tam bu yüzden hiçbir gerçek
+    # hacim ölçümü olmadan "vol:3.0x" ile yapışkan moda girilmiş olabilir.
+    # Artık yetersiz geçmiş varsa None dönüyoruz — sinyal üretilmiyor,
+    # coin bir sonraki 60sn'lik pencerede gerçek veriyle değerlendirilecek.
+    if not prev_60:
+        return round(ch1m, 3), None
 
+    vol_prev = sum(v for _, _, v in prev_60)
+    if vol_prev <= 0:
+        return round(ch1m, 3), None
+
+    vol_mult = vol_last / vol_prev
     return round(ch1m, 3), round(vol_mult, 2)
 
 
